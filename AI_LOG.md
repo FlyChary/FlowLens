@@ -247,3 +247,27 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - **发现的 memstat 读数虚高（WSL 环境假象）**：用户观察"内存用得多"。排查：`/healthz` 的 `memory_bytes` 报约 427 MB，但 flowlens 进程真实 RSS 仅约 109 MB。原因是 memstat 优先读 cgroup v2 `memory.current`，而 WSL 里该 cgroup 是整个 Ubuntu 发行版（36 个进程共享），不是 flowlens 本身；目标 Docker 容器里 cgroup 就等于服务，读数才准。未改 memstat（cgroup-first 是 T6b 定的决策，在目标容器里正确），记入 PROGRESS 未解决问题待用户决定是否要在非容器环境回退进程 RSS。
 - 测试：`tests/e2e/test_api.py` 新增 3 条 expect100 用例（大 body expect100 拒绝 413 且服务端未读体、被拒后新连接正常写入；小 body expect100 发 100 再 202；RawBudget 满 expect100 拒绝 503 且判断只读不改预算）；`_serve` 的 lingering_time 由 0 改 1（`LINGERING_TIME` 常量，与生产一致）。
 - 验证：`pytest -q` 197 passed, 5 deselected；`tools/bench_core.py 长尾` ~307 k 事件/秒（无回归，未动热路径）。WSL 与 Windows 各客户端对比数据见上。
+
+### 2026-10-17 T7 SSE 实时推送 + 前置小修（flowlens/api/stream.py、flowlens/api/app.py、flowlens/memstat.py、flowlens/__main__.py、tests/e2e/test_stream.py、tests/test_memstat.py、tools/exp/*）
+
+**前置小修（1~7）**：
+1. **memstat 读数选择**：只在"当前进程所在 cgroup 设了内存上限"时才用 cgroup，否则回退进程常驻集（statm）。新增 `memory_limit_bytes(root="/")`（v2 读 memory.max，"max"=无上限；v1 读 memory.limit_in_bytes，≥2^60=无上限；读不出返回 None）。`memory_bytes` 据此选择来源。这解决了 PROGRESS 里"WSL 读数虚高"的未解决问题——WSL 的 cgroup 是整个发行版（无上限）→ 回退 statm；评测容器 --memory 启动带上限 → 仍用 cgroup。/healthz 加 `memory_limit_bytes`（无上限为 null）。重写 test_memstat（v1/v2 有上限用 cgroup、无上限退回 statm 都覆盖）。
+2. **__main__.py** 用 argparse 支持 `--host`（默认 0.0.0.0）/ `--port`（默认 8080，Dockerfile 的 --port 8080 才生效）；`logging.basicConfig` 输出到 stdout（带时间、INFO），启动与 PYTHONHASHSEED 警告改用 logging。
+3. **AppKey**：app 上的键全改 `web.AppKey`（模块级常量，按身份比较，不能每次新建），消除全部 NotAppKeyWarning。同步改了 test_api.py 的键访问。
+4. **app.py 文档修正**："预留在整个请求处理完毕后释放"改为"读完请求体就释放"，并说明为什么安全（读体后紧接着在 IngestService 按解压后字节预留，中间不让出事件循环，进入处理阶段的请求数已由在途预留限住）。代码不变。
+5. **big5mb.bin 出库**：`git rm --cached` + 加 .gitignore；run_matrix.sh 运行时临时生成（5 MB 内容无所谓，服务端发体前就 413/503）。
+6. **NO_PROXY**：实验脚本设 `NO_PROXY=localhost,127.0.0.1`（curl 额外 `--noproxy '*'`），WSL autoProxy 不动，记入 PROGRESS 决策。
+7. **路径不一致**：T6c.md 的 WSL 路径 `/mnt/d/dhy/code/src` 改为 `/mnt/d/dhy/code/flowlens`（与 CLAUDE.md 一致）。
+
+**SSE（GET /v1/topk/stream）**（flowlens/api/stream.py：SubscriptionGroup + Subscriber + StreamManager，挂在 app 上 web.AppKey）：
+- **订阅组共享计算**：按 (by, window, k, interval) 分组，同组共用一个后台生产任务、同一份 payload。生产任务是"网格步进"协程：每个 interval 网格点产一帧（帧时刻 T=⌊now/interval⌋×interval），把 (T, payload) 塞进组里每个订阅者的最新帧队列。**同一组每秒最多重算一次**：生产者在"距上次计算 ≥ min_recompute(1.0s)"时才真调 topk，否则复用上次 payload（interval<1s 时同一秒的多个网格点共享一份计算、只更新帧时刻）。这解决了"几个 200ms/600s 的订阅占满回放 CPU"的问题。
+- **背压**：每个订阅者只有容量 1 的 asyncio.Queue（满则丢旧帧、dropped+1）+ 单帧写超时 5s 断开（写满内核缓冲后 5s 没写出去）。组上限 8、连接上限 256（在发出任何字节之前检查，超限 503+Retry-After 的普通 JSON 响应）。统计（组数/订阅者数/累计丢弃帧）经 /healthz 的 sse 字段暴露。
+- **断线重连（Last-Event-ID）**：用**单调游标**保证 id 连续、严格递增、不重不漏。`compute_next_tid` 算起始游标：合法 Last-Event-ID → 其**下一格**（已见帧不重发），受"最旧可算帧（窗口仍在保留期，否则 topk 抛 TooOld）"与"最近 30 帧"两个下限约束；格式不对/晚于当前 → 当前网格点（从实时帧开始）。pump 在首帧前把 [游标, 首帧) 逐帧用 topk 补发（帧间让出），之后逐帧跟随队列；慢客户端被丢的帧直接跳过（丢弃，不重算）。**踩过的坑**：初版把"已追平"的游标 clamp 到当前网格，导致重连重复交付已见帧；改为"已见帧从下一格开始 + 游标不后退"后修复。生产者对单帧计算异常做 try/except 跳过（与 Ticker 单拍一致）。
+- **data 与 /v1/topk 共用**：把 /v1/topk 构造响应 dict 的代码抽成 `stream.topk_data(ans)`，两处共用。
+- **连接断开检测**：实验确认 Windows proactor 下 `transport.is_closing()` 不可靠（断开后仍 False），可靠信号是 aiohttp 在客户端断开时**取消 handler（CancelledError）**；`_stream` 的 finally 调 `manager.leave`（最后一个订阅者离开时取消组的生产任务）。应用关闭时 `manager.close()`（on_shutdown）取消所有组任务（先快照再取消/等待，避免与 handler 的 leave 并发改 dict）。
+
+**测试（tests/e2e/test_stream.py，12 条）**：用真实时钟（FakeClock 静态，会让生产者"睡到的网格点"与实际时间脱节，所以引擎必须真实时钟）+ 真实 TCP 服务器 + aiohttp 测试客户端 readuntil 按空行切帧、自己解析。覆盖：帧格式（retry:3000 + id/event/data 三行、data 严格 JSON 且与 /v1/topk 同构）、id 严格递增且相邻差=interval、共享计算（同组同任务 + 稳态计算频率 1 订阅者 vs 2 订阅者相同）、计算频率（interval=200ms 时 2.5s 内 2~5 次，而非无限制的 ~12 次）、组/连接上限 503+Retry-After（JSON）、慢客户端队列 ≤1 帧 + 其他订阅者正常、Subscriber 丢帧单测（确定性）、Last-Event-ID 补发 id 连续、格式错/未来 id 忽略、心跳（调小周期收 : ping）、断开移除订阅者/最后一个离开释放组、应用关闭流结束。
+
+**踩过的坑（测试侧）**：aiohttp `ClientResponse.close()` 是**同步**的（`resp.close()` 返回 None，不能 `await`），`client.close()` 才是异步的——初版误 `await resp.close()` 全挂。慢客户端的"丢弃计数"在 loopback 上测不准（内核 socket 缓冲会吸收全部帧、write() 不阻塞、队列不堆积），所以 e2e 只断言队列 ≤1（结构性保证），丢弃计数用 Subscriber 的确定性单测验证。
+
+- 验证：`pytest -q` 217 passed, 5 deselected（新增 12 条 SSE e2e + 重写 8 条 memstat）、无警告；`tools/bench_core.py 长尾` ~277k 事件/秒（无回归，未动热路径）。本地 `python -m flowlens --port 8099` 实测：/healthz 有 sse + memory_limit_bytes 字段；curl -N 订阅 5s 见 retry + 连续帧（id 差=interval、重算限流可见）；带 Last-Event-ID 重连首帧 id = 上一帧 id + interval、id 连续。

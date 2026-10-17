@@ -24,6 +24,7 @@ cat > "$NORMAL" <<EOF
 EOF
 # --noproxy '*'：WSL 有系统级 HTTP 代理(127.0.0.1:7890)，必须绕过，
 # 否则 curl 走代理、测到的不是服务端真实 TCP 行为（代理会在大 body 转发时偶发 502）
+export NO_PROXY=localhost,127.0.0.1
 EXTRA=(--noproxy "*")
 [ "$MODE" = "noexpect" ] && EXTRA+=( -H "Expect:")
 

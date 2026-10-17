@@ -13,12 +13,13 @@
 | 性能专项（bounds.top_k、HeavyHitters.part） | 已审查通过，两处已重新冻结 |
 | T4 写入处理 + Ticker | 已审查通过 |
 | T5 查询 | 已审查通过 |
-| T6 HTTP 接口 | 进行中：T6b、T6c 已完成，等审查 |
-| T7 SSE、T8 降级、T9 驻留表、T10 工具与实验、T11 性能 | 未开始 |
+| T6 HTTP 接口 | 已审查通过 |
+| T7 SSE | 进行中：SSE + 前置小修已完成，等审查 |
+| T8 降级、T9 驻留表、T10 工具与实验、T11 性能 | 未开始 |
 
 ## 进行中
 
-T6c 已完成（Expect: 100-continue 拒绝路径 + WSL 对比实验 + 选定 lingering_time=1），汇报后停下等审查。
+T7 已完成（SSE `/v1/topk/stream` + 前置小修 1~7），`pytest -q` 217 通过、无警告，汇报后停下等审查。
 
 ## 已定的决策（不要改回去）
 
@@ -40,6 +41,14 @@ T6c 已完成（Expect: 100-continue 拒绝路径 + WSL 对比实验 + 选定 li
 - create_app(engine, ingest_service, query_service, *, tick_period) 的参数形式保留。
 - 测试不引入新依赖：异步测试用 asyncio.run 与 aiohttp.test_utils，不用 pytest-asyncio、pytest-aiohttp。
 - 慢测试标记 slow，默认 pytest -q 跳过；修改 bounds.py 或 sketch/heavy.py 后必须运行 pytest -q -m slow。
+- WSL 的代理来自 WSL 自动代理功能（autoProxy，把 Windows 代理设置同步进 WSL）。不修改它；实验脚本与以后的压测脚本里设置 `NO_PROXY=localhost,127.0.0.1`，curl 额外用 `--noproxy '*'`，保证客户端直连服务端、测到真实 TCP 行为（否则大 body 转发时代理偶发 502，污染结果）。
+- 内存读数只在"当前进程所在 cgroup 设了内存上限"时才用 cgroup，否则回退进程常驻集（statm）。cgroup v2 读 memory.max（"max"=无上限）、v1 读 memory.limit_in_bytes（≥2^60=无上限）。原因：WSL 里 cgroup 是整个发行版（读到 427 MB 而本进程才 109 MB），无上限判定避免 T8 降级控制器误判；评测容器 --memory 启动一定带上限，读数不受影响。/healthz 新增 memory_limit_bytes 字段（无上限为 null）。
+- SSE 订阅者按 (by, window, k, interval) 分订阅组，同组共用一个后台生产任务与同一份计算（计算量只随组数增长）。同一组每秒最多重新计算一次（min_recompute=1.0s，interval 小于 1s 时同一秒复用上次结果只更新帧时刻）。组上限 8、连接上限 256、心跳 15s、写超时 5s、重连最多补 30 帧，均为 StreamManager 构造参数（默认值即这些数字，测试可覆盖）。
+- SSE 帧时刻对齐 interval 网格 T=⌊now/interval⌋×interval，内容 = QueryService.topk(d, window, k, at=T)。/v1/topk 与 SSE 的响应 dict 共用 stream.topk_data（抽成一个函数、不写两份）。data 与 /v1/topk 完全同构。
+- SSE 断线重连用单调游标：Last-Event-ID 合法时游标 = 其下一格（已见帧不重发），受"最旧可算帧（窗口仍在保留期）"与"最近 30 帧"两个下限约束；首帧前把 [游标, 首帧) 逐帧补发（帧间让出），之后逐帧跟随队列，id 连续、严格递增、不重不漏。Last-Event-ID 格式不对/晚于当前/早于保留期 → 从实时帧开始。
+- SSE 背压：每个订阅者只有容量 1 的最新帧队列（满则丢旧帧、丢弃计数 +1）；单帧写超时 5s 断开。app 上的键统一用 web.AppKey（模块级常量，消除 NotAppKeyWarning）。
+- __main__.py 用 argparse 支持 --host（默认 0.0.0.0）/ --port（默认 8080），logging.basicConfig 输出到标准输出（带时间、INFO），启动与 PYTHONHASHSEED 警告改用 logging。
+- 实验用的大请求体 tools/exp/big5mb.bin 不入库（git rm --cached + .gitignore），实验脚本运行时临时生成。
 
 ## 未解决的问题
 
@@ -47,8 +56,8 @@ T6c 已完成（Expect: 100-continue 拒绝路径 + WSL 对比实验 + 选定 li
 2. 内存尚未在 256 MB 容器里实测，估算常驻约 195 MB 加写入路径。T9 实测。
 3. 吞吐：每批 5000 条约 20.5 万/秒，每批 1000 条约 16 万/秒，未计 HTTP 开销。T11 优化。
 4. T9 的字符串驻留表与冻结的 segtree.py 冲突，开始 T9 前由用户决定做法。
-5. `memory_bytes` 在 WSL 里读数虚高：WSL 的 cgroup v2 `memory.current` 统计整个 Ubuntu 发行版（36 个进程共享），flowlens 进程真实 RSS 仅约 109 MB，但 `/healthz` 报约 427 MB。目标 Docker 容器里 cgroup 就等于服务本身，读数才准，所以 WSL 的虚高是环境假象、非服务真实占用。是否要在非容器环境回退到进程 RSS 待用户决定（改 memstat 属 T6b 定的 cgroup-first 决策）。
+5. ~~`memory_bytes` 在 WSL 里读数虚高~~（T7 前置小修已解决）：memstat 现在只在"当前进程所在 cgroup 设了内存上限"时才用 cgroup 读数，否则回退进程常驻集（statm）。WSL 的 cgroup 无上限（整个发行版共享）→ 回退 statm，读数不再虚高；评测容器 --memory 启动带上限 → 仍用 cgroup，读数准确。
 
 ## 下一步
 
-T6c 汇报后停下等待审查；审查通过后进 T7 SSE。
+T7 汇报后停下等待审查；审查通过后进 T8 降级控制器。

@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+# 实验用的大请求体（>4 MB）：体积大、每次运行可临时生成，不入库
+tools/exp/big5mb.bin

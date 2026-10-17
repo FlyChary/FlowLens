@@ -11,7 +11,7 @@ curl 等客户端上传较大的请求体时，会先发送 Expect: 100-continue
 
 ## 二、在 Linux（WSL）上用真实客户端对比验证
 
-用户的机器没有安装 Docker，改用 WSL（Ubuntu）作为 Linux 环境，它的 TCP 行为与评测用的 Linux 容器一致。项目在 WSL 中的路径是 /mnt/d/dhy/code/src。你可以通过 wsl -e bash -lc "..." 执行 Linux 命令。
+用户的机器没有安装 Docker，改用 WSL（Ubuntu）作为 Linux 环境，它的 TCP 行为与评测用的 Linux 容器一致。项目在 WSL 中的路径是 /mnt/d/dhy/code/flowlens。你可以通过 wsl -e bash -lc "..." 执行 Linux 命令。
 
 准备：
 

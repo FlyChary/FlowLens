@@ -12,7 +12,12 @@ SSE（/v1/topk/stream）在 T7 实现。
 - 有 Content-Length：超过 4 MB 直接 413，不读请求体；否则先预留 Content-Length，
   预留失败 503 + Retry-After: 1；
 - 无 Content-Length（分块传输）：先预留 4 MB，边读边累计，超过 4 MB 立即 413；
-- 预留在整个请求处理完毕后释放（finally）。
+- 预留在**读完请求体**时就释放（`_read_raw_body` 的 finally），不是等整个请求处理
+  完。这样是安全的：读完请求体后紧接着就在 IngestService 里按**解压后字节数**另做
+  一份在途预留（ingest.py 的 Admission），两份预留之间没有让出事件循环（读体与
+  预留是同一个协程里连续执行），不存在"两份都没预留"的空窗；而"进入处理阶段的
+  请求数量"本身已由在途预留（按解压后字节）限住，原始体的额度在读取完的那一刻
+  已经不再被占用，可以立即释放给下一个请求。
 RawBudget 总上限 8 MB，即同一时刻所有在途请求体之和的上限。
 
 Expect: 100-continue：curl 等客户端上传大请求体时会先发 Expect 头等服务端同意
@@ -34,10 +39,14 @@ from aiohttp.http import HttpVersion11
 from ..engine import Engine
 from ..errors import FlowLensError, Overloaded, PayloadTooLarge
 from ..ingest import Admission, IngestService
-from ..memstat import memory_bytes
+from ..memstat import memory_bytes, memory_limit_bytes
 from ..query import QueryService
 from ..ticker import Ticker
 from .params import QueryParams
+from .stream import (DEFAULT_HEARTBEAT_SEC, DEFAULT_MAX_GROUPS,
+                     DEFAULT_MAX_SUBSCRIBERS, DEFAULT_MIN_RECOMPUTE_SEC,
+                     DEFAULT_WRITE_TIMEOUT_SEC, StreamManager, compute_next_tid,
+                     pump, topk_data)
 
 log = logging.getLogger(__name__)
 
@@ -48,25 +57,46 @@ RAW_BUDGET_LIMIT = 8 * 1024 * 1024
 # 分块读取的块大小
 _READ_CHUNK = 256 * 1024
 
+# app 上的键统一用 web.AppKey（带类型标注，消除 NotAppKeyWarning）。
+# AppKey 按身份而非 (name, type) 比较，所以必须在模块级定义一次，处处复用同一对象。
+ingest_service_key = web.AppKey("ingest_service", IngestService)
+query_service_key = web.AppKey("query_service", QueryService)
+raw_budget_key = web.AppKey("raw_budget", Admission)
+ticker_key = web.AppKey("ticker", Ticker)
+ticker_task_key = web.AppKey("ticker_task", asyncio.Task)
+stream_manager_key = web.AppKey("stream_manager", StreamManager)
+
 
 def create_app(engine: Engine, ingest_service: IngestService,
                query_service: QueryService, *, tick_period: float = 1.0) -> web.Application:
     # client_max_size=0（不限制）：4 MB 上限由 _read_raw_body 自己执行，
     # 否则 aiohttp 会在 handler 之前以自己的 413 拒绝，RawBudget 预留就没机会了
     app = web.Application(client_max_size=0, middlewares=[_error_middleware])
-    app["ingest_service"] = ingest_service
-    app["query_service"] = query_service
+    app[ingest_service_key] = ingest_service
+    app[query_service_key] = query_service
     # RawBudget 由 app 持有（create_app 的参数形式保持不变）
-    app["raw_budget"] = Admission(limit=RAW_BUDGET_LIMIT)
+    app[raw_budget_key] = Admission(limit=RAW_BUDGET_LIMIT)
     # Expect: 100-continue 的超大请求在这一步拒绝，客户端不会发送请求体（见 _ingest_expect）
     app.router.add_post("/v1/ingest", _ingest, expect_handler=_ingest_expect)
     app.router.add_get("/v1/topk", _topk)
     app.router.add_get("/v1/stats", _stats)
     app.router.add_get("/healthz", _healthz)
+    app.router.add_get("/v1/topk/stream", _stream)
     ticker = Ticker(engine, period=tick_period)
-    app["ticker"] = ticker
+    app[ticker_key] = ticker
+    # SSE 订阅管理器：参数相同的订阅者共用计算，组数/连接数/计算频率都有上限（T7）
+    manager = StreamManager(
+        query_service,
+        max_groups=DEFAULT_MAX_GROUPS,
+        max_subscribers=DEFAULT_MAX_SUBSCRIBERS,
+        min_recompute=DEFAULT_MIN_RECOMPUTE_SEC,
+        heartbeat_period=DEFAULT_HEARTBEAT_SEC,
+        write_timeout=DEFAULT_WRITE_TIMEOUT_SEC,
+    )
+    app[stream_manager_key] = manager
     app.on_startup.append(_start_ticker)
     app.on_shutdown.append(_stop_ticker)
+    app.on_shutdown.append(_stop_stream)
     return app
 
 
@@ -139,7 +169,7 @@ async def _ingest_expect(request: web.Request) -> web.StreamResponse | None:
             # 超大：直接 413，客户端不会发送请求体
             return _json_response(
                 {"error": f"请求体超过 {MAX_RAW_BODY_BYTES} 字节"}, status=413)
-        budget: Admission = request.app["raw_budget"]
+        budget: Admission = request.app[raw_budget_key]
         # 分块传输（cl 为 None）在 expect 阶段无法判断预留量，一律先放行发 100，
         # 由 _read_raw_body 边读边核对 4MB 与预算。
         if cl is not None and not budget.can_reserve(cl):
@@ -193,8 +223,8 @@ async def _read_raw_body(request: web.Request, budget: Admission) -> bytes:
 # ---- 路由 ----
 
 async def _ingest(request: web.Request) -> web.Response:
-    svc = request.app["ingest_service"]
-    body = await _read_raw_body(request, request.app["raw_budget"])
+    svc = request.app[ingest_service_key]
+    body = await _read_raw_body(request, request.app[raw_budget_key])
     result = await svc.ingest(body, request.headers.get("Content-Encoding"))
     return _json_response({
         "accepted": result.accepted,
@@ -205,28 +235,16 @@ async def _ingest(request: web.Request) -> web.Response:
 
 
 async def _topk(request: web.Request) -> web.Response:
-    now_ms = request.app["query_service"].engine.clock.now_ms()
+    now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms)
-    qs = request.app["query_service"]
-    ans = await qs.topk(qp.by, qp.window_ms, qp.k, qp.at_ms)
-    return _json_response({
-        "window_ms": ans.window_ms,
-        "from": ans.from_ms,
-        "to": ans.to_ms,
-        "by": str(ans.dim),
-        "k": ans.k,
-        "final": ans.final,
-        "degraded": False,  # T8 降级控制器接入后替换
-        "unseen_upper": ans.unseen_upper,
-        "items": [{"key": it.key, "count": _fmt_num(it.count), "err": _fmt_num(it.err)}
-                  for it in ans.items],
-    })
+    ans = await request.app[query_service_key].topk(qp.by, qp.window_ms, qp.k, qp.at_ms)
+    return _json_response(topk_data(ans))
 
 
 async def _stats(request: web.Request) -> web.Response:
-    now_ms = request.app["query_service"].engine.clock.now_ms()
+    now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms, need_k=False, need_by=False)
-    s = await request.app["query_service"].stats(qp.window_ms)
+    s = await request.app[query_service_key].stats(qp.window_ms)
     return _json_response({
         "window_ms": s.window_ms,
         "from": s.from_ms,
@@ -240,33 +258,82 @@ async def _stats(request: web.Request) -> web.Response:
 
 
 async def _healthz(request: web.Request) -> web.Response:
-    c = request.app["query_service"].engine.counters
-    t = request.app["ticker"]
+    c = request.app[query_service_key].engine.counters
+    t = request.app[ticker_key]
+    mgr = request.app[stream_manager_key]
     return _json_response({
         "ok": True,
         "events_ingested": c.events_ingested,
         "memory_bytes": memory_bytes(),
+        "memory_limit_bytes": memory_limit_bytes(),  # 无上限时为 null
         "degraded": False,  # T8 降级控制器接入后替换
         "deduped": c.deduped,
         "late": c.late,
         "invalid": c.invalid,
         "tick_errors": t.error_count,
         "last_tick_ms": t.last_tick_duration_ms,
+        "sse": mgr.stats(),
     })
+
+
+# ---- SSE：GET /v1/topk/stream ----
+
+async def _stream(request: web.Request) -> web.StreamResponse:
+    """SSE 实时 Top-K 流：参数相同者共用计算，断线可按 Last-Event-ID 补帧。"""
+    engine = request.app[query_service_key].engine
+    now_ms = engine.clock.now_ms()
+    # 解析并校验 window/k/by/interval（非法参数走 400）
+    qp = QueryParams.from_request(request, now_ms)
+    manager = request.app[stream_manager_key]
+    # 上限检查放在发出任何字节之前：超限走 503 + Retry-After 的普通 JSON 响应
+    manager.check_limits()
+    by, window_ms, k, interval_ms = qp.by, qp.window_ms, qp.k, qp.interval_ms
+
+    # 订阅者要交付的起始帧时刻（Last-Event-ID 重连时从此补发，否则从实时帧开始）
+    next_tid = compute_next_tid(
+        request.headers.get(hdrs.LAST_EVENT_ID), now_ms, interval_ms, window_ms,
+        engine.cfg.retention_sec * 1000)
+
+    resp = web.StreamResponse()
+    resp.headers["Content-Type"] = "text/event-stream"
+    resp.headers["Cache-Control"] = "no-cache"
+    group, sub = manager.subscribe(by=by, window_ms=window_ms, k=k,
+                                   interval_ms=interval_ms, raw=request)
+    try:
+        await resp.prepare(request)
+        await resp.write(b"retry: 3000\n\n")
+        # pump 用单调游标 next_tid：先把 [next_tid, 首帧) 逐帧补发（断线重连），
+        # 再无缝跟随实时帧——id 连续、严格递增、不重复、不重叠。
+        await pump(resp, sub, group, next_tid=next_tid,
+                   heartbeat=manager.heartbeat_period,
+                   write_timeout=manager.write_timeout)
+    except asyncio.CancelledError:
+        raise  # 客户端断开 / 应用关闭：清理后照常取消（CancelledError 不被下面捕获）
+    except Exception:
+        # 写入超时（写满缓冲后 5 秒没写出去）或连接被重置：结束这个订阅者
+        log.info("SSE 流结束（写入超时或连接断开）")
+    finally:
+        manager.leave((by, window_ms, k, interval_ms), raw=request)
+    return resp
 
 
 # ---- 后台 ticker 生命周期 ----
 
 async def _start_ticker(app: web.Application) -> None:
-    app["ticker_task"] = asyncio.create_task(app["ticker"].run())
+    app[ticker_task_key] = asyncio.create_task(app[ticker_key].run())
 
 
 async def _stop_ticker(app: web.Application) -> None:
-    ticker, task = app["ticker"], app["ticker_task"]
+    ticker, task = app[ticker_key], app[ticker_task_key]
     ticker.stop()
     if not task.done():
         task.cancel()  # 等待窗口最多一个周期，取消让退出即时
     await asyncio.gather(task, return_exceptions=True)
+
+
+async def _stop_stream(app: web.Application) -> None:
+    # 应用关闭：结束所有 SSE 订阅组的生产任务（流本身的连接由 aiohttp 关连接时取消）
+    await app[stream_manager_key].close()
 
 
 def make_engine(clock=None) -> tuple[Engine, IngestService, QueryService]:

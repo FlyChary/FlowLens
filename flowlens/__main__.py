@@ -1,6 +1,8 @@
-"""启动入口：$env:PYTHONHASHSEED="0"; python -m flowlens，监听 :8080。"""
+"""启动入口：$env:PYTHONHASHSEED="0"; python -m flowlens --host 0.0.0.0 --port 8080。"""
 
+import argparse
 import asyncio
+import logging
 import os
 
 from aiohttp import web
@@ -8,14 +10,24 @@ from aiohttp import web
 from .api.app import create_app, make_engine
 from .timewin import Clock
 
+log = logging.getLogger("flowlens")
+
 
 def main() -> None:
+    # 日志输出到标准输出，带时间，级别 INFO（T7）
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    parser = argparse.ArgumentParser(description="FlowLens 实时流量分析服务")
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    parser.add_argument("--port", type=int, default=8080, help="监听端口（默认 8080）")
+    args = parser.parse_args()
+
     # CLAUDE.md 规则 5：字符串哈希依赖固定 PYTHONHASHSEED（任意非 random 的具体值），
     # 否则重启前后哈希不一致，落盘数据将来无法合并
     seed = os.environ.get("PYTHONHASHSEED")
     if not seed or seed == "random":
-        print("警告：PYTHONHASHSEED 未固定（或为 random），哈希结果每次启动不同，"
-              "落盘数据将来无法合并。请固定为具体值（推荐 0）。")
+        log.warning("PYTHONHASHSEED 未固定（或为 random），哈希结果每次启动不同，"
+                    "落盘数据将来无法合并。请固定为具体值（推荐 0）。")
 
     engine, ingest_service, query_service = make_engine(Clock())
     app = create_app(engine, ingest_service, query_service)
@@ -40,9 +52,9 @@ def main() -> None:
         lingering = float(os.environ.get("FLOWLENS_LINGERING_TIME", "1"))
         runner = web.AppRunner(app, auto_decompress=False, lingering_time=lingering)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", 8080)
+        site = web.TCPSite(runner, args.host, args.port)
         await site.start()
-        print("FlowLens 监听 :8080")
+        log.info("FlowLens 监听 %s:%d", args.host, args.port)
         # 保持运行直到收到中断
         try:
             await asyncio.Event().wait()
@@ -52,7 +64,7 @@ def main() -> None:
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        print("已停止")
+        log.info("已停止")
 
 
 if __name__ == "__main__":

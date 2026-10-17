@@ -20,7 +20,8 @@ import zlib
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from flowlens.api.app import create_app
+from flowlens.api.app import (create_app, ingest_service_key, query_service_key,
+                              raw_budget_key, ticker_key, ticker_task_key)
 from flowlens.config import Config
 from flowlens.engine import Engine
 from flowlens.ingest import Admission, IngestService
@@ -107,10 +108,14 @@ def test_healthz():
         assert body["ok"] is True
         assert body["events_ingested"] == 0
         # 全部字段
-        for f in ("memory_bytes", "degraded", "deduped", "late", "invalid",
-                  "tick_errors", "last_tick_ms"):
+        for f in ("memory_bytes", "memory_limit_bytes", "degraded", "deduped",
+                  "late", "invalid", "tick_errors", "last_tick_ms", "sse"):
             assert f in body, f"healthz 缺字段 {f}"
         assert isinstance(body["memory_bytes"], int)
+        # 没有内存上限时（如 Windows 开发机）memory_limit_bytes 为 null
+        assert body["memory_limit_bytes"] is None or isinstance(body["memory_limit_bytes"], int)
+        assert set(body["sse"]) == {"groups", "subscribers", "dropped_frames"}
+        assert body["sse"]["groups"] == 0 and body["sse"]["subscribers"] == 0
         assert body["tick_errors"] == 0
         assert body["last_tick_ms"] >= 0
     _serve(run)
@@ -255,7 +260,7 @@ def test_chunked_body_over_4mb_rejected():
 def test_raw_budget_full_503_and_retry_not_deduped():
     async def run(client, engine, clock, app):
         # 占满 RawBudget（8 MB），任何新请求都放不下 → 503
-        budget = app["raw_budget"]
+        budget = app[raw_budget_key]
         assert budget.try_reserve(budget.limit)
         evs = _evs(5, "/p", NOW - 100)
         r = await _post(client, "/v1/ingest", data=json.dumps(evs).encode())
@@ -285,7 +290,7 @@ def test_expect100_large_body_rejected_413_without_sending_body():
     calls = []
 
     async def run(client, engine, clock, app):
-        svc = app["ingest_service"]
+        svc = app[ingest_service_key]
         real = svc.ingest
 
         async def spy(body, enc):
@@ -330,7 +335,7 @@ def test_expect100_budget_full_rejected_503():
     """
 
     async def run(client, engine, clock, app):
-        budget = app["raw_budget"]
+        budget = app[raw_budget_key]
         assert budget.try_reserve(budget.limit)  # 占满
         try:
             big = b"x" * (1024 * 1024)  # 1 MB < 4 MB，能过大小检查但预留不下
@@ -406,7 +411,7 @@ def test_unexpected_error_500_with_log():
     async def run(client, engine, clock, app):
         import io
         # 让 stats 依赖抛一个意外异常 → 500 + {"error": "internal error"}
-        qs = app["query_service"]
+        qs = app[query_service_key]
         real_stats = qs.stats
 
         async def boom(window_ms):
@@ -507,13 +512,13 @@ def test_ticker_stops_cleanly_on_shutdown():
         try:
             # tick_period=0.05：等用例期间跑几拍，确认后台任务确实在运行
             await asyncio.sleep(0.2)
-            assert app["ticker"].tick_count >= 1
+            assert app[ticker_key].tick_count >= 1
         finally:
             # client.close() 触发 on_shutdown：停 Ticker、取消并等待任务
             await client.close()
-        task = app["ticker_task"]
+        task = app[ticker_task_key]
         # 关闭后任务已结束（cancel 让退出即时），且不是"没跑就没了"
         assert task.done()
         assert task.cancelled()  # 用例还没跑满一个周期，走的是取消路径
-        assert app["ticker"].tick_count >= 1
+        assert app[ticker_key].tick_count >= 1
     asyncio.run(main())
