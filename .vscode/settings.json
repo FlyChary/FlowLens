@@ -1,0 +1,9 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "files.encoding": "utf8",
+    "files.autoGuessEncoding": true,
+    "terminal.integrated.env.windows": {
+        "PYTHONUTF8": "1"
+    }
+}

@@ -1,0 +1,22 @@
+[project]
+name = "flowlens"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "orjson>=3.9",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["flowlens", "flowlens.sketch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: 慢测试（等价性对照），日常 pytest -q 默认跳过，需显式 pytest -q -m slow 运行",
+]
