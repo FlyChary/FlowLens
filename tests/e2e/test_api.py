@@ -5,8 +5,10 @@
 时钟用 FakeClock 精确控制、不依赖墙钟，保证快照与回放断言确定。
 
 服务器参数与生产 __main__.py 保持一致：auto_decompress=False（gzip 交给
-decode_body 分块解压）、lingering_time=0（请求体没读完就返回响应时立即断开，
-Content-Length 超 4 MB 的 413 才能立即发出，客户端不必把几 MB 传完）。
+decode_body 分块解压）、lingering_time=1（请求体没读完就返回响应时，服务端最多
+读 1 秒把剩余体读完再关连接；413/503 响应本身在关连接前就发出，不受影响。定为 1
+而非 0 的原因见 docs/PROGRESS.md"已定的决策"：0 时"不发 Expect 直接灌大请求体"
+的客户端偶发收到 RST 而非 413）。
 """
 
 import asyncio
@@ -26,6 +28,8 @@ from flowlens.query import QueryService
 from flowlens.timewin import FakeClock
 
 NOW = 1_735_689_600_000
+# 与生产 __main__.py 一致（见 docs/PROGRESS.md 决策），不要写死成 0
+LINGERING_TIME = 1
 
 
 def _gzip(data: bytes) -> bytes:
@@ -47,7 +51,7 @@ def _serve(run, tick_period: float = 1000.0):
         server = TestServer(app)
         client = TestClient(server)
         # TestClient.start_server 不转发参数，直接调 TestServer.start_server
-        await server.start_server(auto_decompress=False, lingering_time=0)
+        await server.start_server(auto_decompress=False, lingering_time=LINGERING_TIME)
         try:
             await run(client, engine, clock, app)
         finally:
@@ -68,10 +72,10 @@ def _strict_json(text: str):
 
 
 async def _post(client, url, *a, **kw):
-    """POST；连接被服务端关掉时（413/503 立即断连）换新连接重试。
+    """POST；连接被服务端关掉时（413/503 后断连）换新连接重试。
 
-    lingering_time=0 下，被拒绝的请求会让服务端立即关连接；aiohttp 客户端的连接
-    池可能把这条已死的连接复用给下一条请求，表现为 ConnectionResetError——不是
+    被拒绝的请求（413/503）处理完，服务端会关闭这条连接；aiohttp 客户端的连接
+    池可能把这条已关的连接复用给下一条请求，表现为 ConnectionResetError——不是
     服务端行为，重试即可。
     """
     from aiohttp.client_exceptions import ClientOSError
@@ -198,7 +202,7 @@ def test_content_length_over_4mb_rejected_without_reading():
         app = create_app(engine, svc, QueryService(engine), tick_period=1000.0)
         server = TestServer(app)
         client = TestClient(server)
-        await server.start_server(auto_decompress=False, lingering_time=0)
+        await server.start_server(auto_decompress=False, lingering_time=LINGERING_TIME)
         try:
             port = server.port
 
@@ -499,7 +503,7 @@ def test_ticker_stops_cleanly_on_shutdown():
                          QueryService(engine), tick_period=0.05)
         server = TestServer(app)
         client = TestClient(server)
-        await server.start_server(auto_decompress=False, lingering_time=0)
+        await server.start_server(auto_decompress=False, lingering_time=LINGERING_TIME)
         try:
             # tick_period=0.05：等用例期间跑几拍，确认后台任务确实在运行
             await asyncio.sleep(0.2)

@@ -1,0 +1,21 @@
+SUMMARY {"client": "aiohttp", "expect100": true, "n413": 20, "n_reset": 0, "other_errors": [], "median_ms": 1.06, "max_ms": 2.19, "follow_ok": 20}
+TRIAL {"trial": 0, "got_413": true, "error": null, "dt_ms": 2.19, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 1, "got_413": true, "error": null, "dt_ms": 1.35, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 2, "got_413": true, "error": null, "dt_ms": 1.02, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 3, "got_413": true, "error": null, "dt_ms": 1.06, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 4, "got_413": true, "error": null, "dt_ms": 1.15, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 5, "got_413": true, "error": null, "dt_ms": 1.07, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 6, "got_413": true, "error": null, "dt_ms": 0.99, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 7, "got_413": true, "error": null, "dt_ms": 1.02, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 8, "got_413": true, "error": null, "dt_ms": 1.02, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 9, "got_413": true, "error": null, "dt_ms": 1.22, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 10, "got_413": true, "error": null, "dt_ms": 1.17, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 11, "got_413": true, "error": null, "dt_ms": 0.97, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 12, "got_413": true, "error": null, "dt_ms": 1.06, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 13, "got_413": true, "error": null, "dt_ms": 1.05, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 14, "got_413": true, "error": null, "dt_ms": 1.0, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 15, "got_413": true, "error": null, "dt_ms": 1.05, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 16, "got_413": true, "error": null, "dt_ms": 1.08, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 17, "got_413": true, "error": null, "dt_ms": 1.05, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 18, "got_413": true, "error": null, "dt_ms": 1.38, "follow_ok": true, "follow_status": 202}
+TRIAL {"trial": 19, "got_413": true, "error": null, "dt_ms": 1.13, "follow_ok": true, "follow_status": 202}
