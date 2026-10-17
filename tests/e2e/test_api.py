@@ -268,6 +268,79 @@ def test_raw_budget_full_503_and_retry_not_deduped():
     _serve(run)
 
 
+# ---- Expect: 100-continue 的拒绝路径 ----
+
+def test_expect100_large_body_rejected_413_without_sending_body():
+    """curl 式客户端（expect100=True）发 5 MB：expect 阶段直接 413。
+
+    断言三件事：
+    - 客户端稳定收到 413（而非连接被重置）；
+    - 服务端根本没读请求体（IngestService 从未被调用，spy）；
+    - 被拒后用新连接发正常写入请求能成功（连接可复用，不残留坏状态）。
+    """
+    calls = []
+
+    async def run(client, engine, clock, app):
+        svc = app["ingest_service"]
+        real = svc.ingest
+
+        async def spy(body, enc):
+            calls.append(len(body))
+            return await real(body, enc)
+        svc.ingest = spy
+        try:
+            big = b"x" * (5 * 1024 * 1024)  # 5 MB > 4 MB
+            for _ in range(5):  # 多打几次，确认稳定收到 413 而非 RST
+                r = await _post(client, "/v1/ingest", data=big, expect100=True)
+                assert r.status == 413, r.status
+                assert "error" in _strict_json(await r.text())
+            assert calls == []  # 服务端从未读请求体
+            # 被拒后换新连接发正常请求应成功
+            evs = _evs(5, "/exp", NOW - 100)
+            r2 = await _post(client, "/v1/ingest",
+                              data=json.dumps(evs).encode())
+            assert r2.status == 202
+            assert (await r2.json())["accepted"] == 5
+        finally:
+            svc.ingest = real
+    _serve(run)
+
+
+def test_expect100_small_body_accepted():
+    """小请求 + expect100=True：服务端应发 100 Continue 再正常处理（走 202）。"""
+
+    async def run(client, engine, clock, app):
+        evs = _evs(10, "/exp-ok", NOW - 100)
+        r = await _post(client, "/v1/ingest",
+                        data=json.dumps(evs).encode(), expect100=True)
+        assert r.status == 202
+        assert (await r.json())["accepted"] == 10
+    _serve(run)
+
+
+def test_expect100_budget_full_rejected_503():
+    """RawBudget 满 + expect100=True：expect 阶段直接 503 + Retry-After，不读体。
+
+    判断用的是只读的 can_reserve（不预留），所以被拒后预算占用不变、无需释放；
+    手动占满预算来触发。
+    """
+
+    async def run(client, engine, clock, app):
+        budget = app["raw_budget"]
+        assert budget.try_reserve(budget.limit)  # 占满
+        try:
+            big = b"x" * (1024 * 1024)  # 1 MB < 4 MB，能过大小检查但预留不下
+            r = await _post(client, "/v1/ingest", data=big, expect100=True)
+            assert r.status == 503
+            assert r.headers.get("Retry-After") == "1"
+            assert "error" in _strict_json(await r.text())
+            # 判断是只读的：预算占用没被 expect 阶段改动（仍是占满时的 limit）
+            assert budget.pending == budget.limit
+        finally:
+            budget.release(budget.limit)
+    _serve(run)
+
+
 # ---- topk / stats 参数校验 ----
 
 def test_topk_param_errors():

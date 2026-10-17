@@ -95,9 +95,17 @@ class Admission:
         """占用率 pending / limit，降级控制器（T8）要用。"""
         return self._pending / self.limit if self.limit else 0.0
 
+    def can_reserve(self, n: int) -> bool:
+        """能否再预留 n 字节（只读判断，不改状态）。
+
+        Expect: 100-continue 的拒绝路径在发请求体之前就要用这个判断（不能真的
+        预留，否则请求被拒后没有对应的释放点）；真正的预留仍是 try_reserve。
+        """
+        return self._pending + n <= self.limit
+
     def try_reserve(self, n: int) -> bool:
         """预留 n 字节；放不下返回 False（调用方应整体拒绝，不写任何去重状态）。"""
-        if self._pending + n > self.limit:
+        if not self.can_reserve(n):
             return False
         self._pending += n
         return True

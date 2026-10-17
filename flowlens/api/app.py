@@ -48,10 +48,6 @@ RAW_BUDGET_LIMIT = 8 * 1024 * 1024
 # 分块读取的块大小
 _READ_CHUNK = 256 * 1024
 
-# 请求级状态键（web.RequestKey，避免字符串键的告警）：expect_handler 把
-# Expect 请求的判定结果存进来，_read_raw_body 读取（见 _ingest_expect）
-_INGEST_EXPECT = web.RequestKey("ingest_expect")
-
 
 def create_app(engine: Engine, ingest_service: IngestService,
                query_service: QueryService, *, tick_period: float = 1.0) -> web.Application:
@@ -62,7 +58,8 @@ def create_app(engine: Engine, ingest_service: IngestService,
     app["query_service"] = query_service
     # RawBudget 由 app 持有（create_app 的参数形式保持不变）
     app["raw_budget"] = Admission(limit=RAW_BUDGET_LIMIT)
-    app.router.add_post("/v1/ingest", _ingest)
+    # Expect: 100-continue 的超大请求在这一步拒绝，客户端不会发送请求体（见 _ingest_expect）
+    app.router.add_post("/v1/ingest", _ingest, expect_handler=_ingest_expect)
     app.router.add_get("/v1/topk", _topk)
     app.router.add_get("/v1/stats", _stats)
     app.router.add_get("/healthz", _healthz)
@@ -110,6 +107,49 @@ async def _error_middleware(request: web.Request, handler):
         # 未预期的异常：记完整日志，返回 500
         log.exception("处理请求 %s %s 出未预期异常", request.method, request.path)
         return _json_response({"error": "internal error"}, status=500)
+
+
+# ---- Expect: 100-continue 的拒绝路径（超大请求在发请求体之前拒绝）----
+
+# 显式发 100 Continue 的报文（照 aiohttp 默认实现；返回 None 时 aiohttp 不会代发）
+_HUNDRED_CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
+
+
+async def _ingest_expect(request: web.Request) -> web.StreamResponse | None:
+    """/v1/ingest 的 expect_handler：在客户端发送请求体之前就做出拒绝决定。
+
+    curl 等客户端上传大请求体时会先发送 `Expect: 100-continue` 头等服务端同意再
+    发体。在这一步拒绝，客户端根本不会发送请求体，连接上也不会有没读完的字节，
+    避免 lingering_time=0 下"关连接时收缓冲区还有数据 → 客户端收到 RST 而非 413"。
+
+    返回值约定（aiohttp）：返回 StreamResponse 则直接作为最终响应、handler 不再
+    执行；返回 None 则表示"同意"，需要自己显式发 100 Continue（aiohttp 不代发）。
+    本函数在错误中间件之前执行，所以必须自己构造 JSON 响应、不能靠抛异常。
+
+    与真正预留的分工：这里只做**只读判断**（can_reserve），不预留。
+    - 判断不过 → 返回 413/503，handler 不执行、_read_raw_body 不运行，无需释放；
+    - 判断通过 → 发 100，随后 _read_raw_body 里 try_reserve 真正预留、finally 释放。
+    预算的借还始终只有 _read_raw_body 一个 owner，不会双重预留，也不会"判了但没
+    释放"。判断与 _read_raw_body 的 4MB/预算检查逐条一致，故结论不会分叉。
+    """
+    expect = request.headers.get(hdrs.EXPECT, "")
+    if request.version == HttpVersion11 and expect.lower() == "100-continue":
+        cl = request.content_length
+        if cl is not None and cl > MAX_RAW_BODY_BYTES:
+            # 超大：直接 413，客户端不会发送请求体
+            return _json_response(
+                {"error": f"请求体超过 {MAX_RAW_BODY_BYTES} 字节"}, status=413)
+        budget: Admission = request.app["raw_budget"]
+        # 分块传输（cl 为 None）在 expect 阶段无法判断预留量，一律先放行发 100，
+        # 由 _read_raw_body 边读边核对 4MB 与预算。
+        if cl is not None and not budget.can_reserve(cl):
+            resp = _json_response({"error": "overloaded"}, status=503)
+            resp.headers["Retry-After"] = "1"
+            return resp
+        # 通过：显式发 100（照默认实现；发完重置 output_size，100 不计入响应体）
+        await request.writer.write(_HUNDRED_CONTINUE)
+        request.writer.output_size = 0
+    return None
 
 
 # ---- 请求体读取（RawBudget 预留 + 4 MB 上限）----
