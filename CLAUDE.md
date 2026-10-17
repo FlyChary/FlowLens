@@ -89,6 +89,7 @@ tests/                   单元测试；tests/e2e/ 端到端用例
 4. 时间一律用 epoch 毫秒；需要"现在"的地方注入 `timewin.Clock`，测试用 `FakeClock`。
 5. 启动时检查 `PYTHONHASHSEED` 已固定，未固定时打印警告。
 6. 注释、文档字符串、错误信息用中文，标识符用英文。
+7. 执行instructionsz2任务时，先建任务清单（计划），然后逐项执行
 
 ## 每个任务结束时
 
