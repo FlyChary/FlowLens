@@ -424,6 +424,161 @@ def test_disconnection_removes_subscriber_and_group():
     _serve(run)
 
 
+# ---- T7b：新订阅者立即收到最近一帧 ----
+
+def test_new_subscriber_immediate_frame():
+    """interval=60s：第二个订阅者加入已有组后 1 秒内收到第一帧（不用等下个网格点）。
+
+    第一帧是组里已有的最近一帧（立即补发），id 仍在 60s 网格上；之后照常跟随实时帧。
+    """
+    async def run(client, engine, app):
+        await _ingest(client, _evs(50, _now_ms()))
+        url = "/v1/topk/stream?window=60s&k=10&by=url&interval=60s"
+        first = await _open_stream(client, url)
+        await _read_block(first)  # retry
+        await _read_block(first)  # 首个数据帧（组里第一帧）
+        # 等组里已有"最近一帧"
+        r2 = await _open_stream(client, url)
+        t0 = time.monotonic()
+        b = parse_block(await _read_block(r2))  # retry
+        assert b["kind"] == "retry"
+        f = parse_block(await _read_block(r2))
+        wait = time.monotonic() - t0
+        assert f["kind"] == "event", f
+        assert wait < 1.0, f"第二订阅者 {wait:.2f}s 才收到第一帧"
+        assert int(f["id"]) % 60_000 == 0  # id 在 60s 网格上
+        first.close()
+        r2.close()
+    _serve(run)
+
+
+# ---- T7b：补帧不重算 —— 同组大量订阅者同时带 Last-Event-ID 重连，后台 topk 调用
+#      次数不随订阅者数增加（优先用组里保留的最近 30 帧）----
+
+def test_catchup_no_recompute_across_subscribers():
+    """同组 10 个订阅者同时带 Last-Event-ID 重连，后台 topk 次数不随订阅者数增长。
+
+    常驻读者保持组存活并让生产者把帧填进组缓存（最近 30 帧）。用较早一帧的 id 作
+    Last-Event-ID 让 10 个订阅者重连，缺口里的帧都已在缓存里 → 补发走缓存、不重算；
+    若无缓存，10 个订阅者各自重算缺口（≥30 帧/人）→ 次数会随订阅者数线性放大。
+    """
+    async def run(client, engine, app):
+        await _ingest(client, _evs(50, _now_ms()))
+        qs = app[query_service_key]
+        calls = 0
+        real = qs.topk
+
+        async def spy(d, window_ms, k, at_ms=None):
+            nonlocal calls
+            calls += 1
+            return await real(d, window_ms, k, at_ms)
+        qs.topk = spy
+        url = "/v1/topk/stream?window=60s&k=10&by=url&interval=2s"
+        # 常驻读者：保持组存活，让生产者产帧并填进组缓存；记下较早一帧的 id 当重连起点
+        reader = await _open_stream(client, url)
+        await _read_block(reader)  # retry
+        ids = []
+        t0 = time.monotonic()
+        while len(ids) < 4 and time.monotonic() - t0 < 12:
+            f = parse_block(await _read_block(reader))
+            if f["kind"] == "event":
+                ids.append(int(f["id"]))
+        assert len(ids) == 4, f"常驻读者没读到 4 帧: {ids}"
+        old_id = ids[0]  # 用最早一帧的 id：重连缺口 = [old_id+2s, 当前)，都在缓存里
+        calls = 0
+        reconnects = [await _open_stream(
+            client, url, headers={"Last-Event-ID": str(old_id)})
+            for _ in range(10)]
+        # 等每个重连者都补完缺口并收到一帧实时帧
+        got = [0] * 10
+        t0 = time.monotonic()
+        while min(got) < 1 and time.monotonic() - t0 < 10:
+            for i, r in enumerate(reconnects):
+                try:
+                    f = parse_block(await asyncio.wait_for(
+                        _read_block(r), timeout=0.3))
+                    if f["kind"] == "event":
+                        got[i] = 1
+                except asyncio.TimeoutError:
+                    pass
+        assert min(got) == 1, f"有重连者没收到帧: {got}"
+        for r in reconnects:
+            r.close()
+        # 补发走缓存：后台 topk 只有生产者自己的"每组每秒至多一次"，不随订阅者数
+        # 线性放大（无缓存时 10 人各补 ~3 帧 → ≥30 次；有缓存 → 仅生产者的数次）。
+        assert calls < 16, f"补帧重算次数 {calls} 随订阅者数增长"
+        reader.close()
+    _serve(run)
+
+
+# ---- T7b：Last-Event-ID 不在当前 interval 网格上时，起始游标向上对齐网格 ----
+
+def test_last_event_id_off_grid_aligned():
+    """Last-Event-ID 与当前 interval 网格不对齐（如客户端换了 interval）时，
+    起始游标向上对齐到网格，补帧与实时帧的 id 都落在网格上。"""
+    async def run(client, engine, app):
+        await _ingest(client, _evs(50, _now_ms()))
+        url = "/v1/topk/stream?window=60s&k=10&by=url&interval=1s"
+        # 用一个不在 1s 网格上的 Last-Event-ID（模拟换了 interval：上次 500ms 的 id）
+        raw = await _open_stream(client, url, headers={"Last-Event-ID": "1234567890123"})
+        await _read_block(raw)  # retry
+        f = parse_block(await _read_block(raw))
+        assert f["kind"] == "event"
+        # 起始 id 向上对齐到 1s 网格：id 是 1000 的整数倍
+        assert int(f["id"]) % 1000 == 0, f["id"]
+        # 且晚于 Last-Event-ID（不重发已见的帧）
+        assert int(f["id"]) > 1234567890123, f["id"]
+        raw.close()
+    _serve(run)
+
+
+# ---- T7b：interval>1s 时每一帧都重新计算，帧的 data.to 应等于 id ----
+
+def test_recompute_when_interval_gt_1s():
+    async def run(client, engine, app):
+        await _ingest(client, _evs(50, _now_ms()))
+        url = "/v1/topk/stream?window=60s&k=10&by=url&interval=1500ms"
+        resp = await _open_stream(client, url)
+        try:
+            await _read_block(resp)  # retry
+            for _ in range(3):
+                f = parse_block(await _read_block(resp))
+                assert f["kind"] == "event"
+                body = _strict_json(f["data"])
+                # interval=1500ms > 1s：每一帧都应重新计算，data.to 等于 id
+                assert body["to"] == int(f["id"]), (body["to"], f["id"])
+                assert body["to"] - body["from"] == 60_000
+        finally:
+            resp.close()
+    _serve(run)
+
+
+# ---- T7b：应用关闭时所有流立即正常结束（多个活跃订阅者，2 秒内完成）----
+
+def test_shutdown_ends_all_streams_fast():
+    async def main():
+        engine = Engine(Config(), Clock())
+        qs = QueryService(engine)
+        app = create_app(engine, IngestService(engine, Admission()), qs,
+                         tick_period=1000.0)
+        server = TestServer(app)
+        client = TestClient(server)
+        await server.start_server()
+        url = "/v1/topk/stream?window=60s&k=10&by=url&interval=2s"
+        # 3 个活跃订阅者
+        conns = [await client.get(url) for _ in range(3)]
+        for c in conns:
+            assert c.status == 200
+        assert app[stream_manager_key].subscriber_count() == 3
+        # 关闭应用：清理应在 2 秒内完成（不再靠 aiohttp 的 60s 强制取消）
+        t0 = time.monotonic()
+        await client.close()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 2.0, f"关闭耗时 {elapsed:.2f}s（应 <2s）"
+        assert len(app[stream_manager_key].groups) == 0
+    asyncio.run(main())
+
+
 # ---- 应用关闭时所有流都正常结束、订阅组任务都被取消 ----
 
 def test_app_shutdown_ends_streams():

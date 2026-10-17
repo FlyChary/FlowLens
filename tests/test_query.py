@@ -74,6 +74,36 @@ def test_too_old_raises():
     _run(main())
 
 
+def test_long_window_frames_never_too_old():
+    """window=600s 的帧（interval 为 1s/1.5s/5s/60s）在一分钟内各时刻都不抛 TooOld。
+
+    帧时刻 T 对齐到 interval 网格，往往比 now 早；区间起点 T − 600s 因此早于
+    now − 600s，但实际数据仍在（线段树保留到"最新定稿秒往前 600s"，最新定稿秒
+    约为 now − 60s）。旧口径会把长窗口帧大量误报 TooOld。
+    """
+    async def main():
+        qs = QueryService(_engine_with(None))
+        for interval in (1000, 1500, 5000, 60_000):
+            for off in range(0, 60_000, 5_000):  # 一分钟内各个时刻
+                now = NOW + off
+                qs.engine.clock.ms = now
+                t = (now // interval) * interval
+                await qs.topk(Dim.URL, 600_000, 10, t)  # 不应抛 TooOld
+    _run(main())
+
+
+def test_long_window_boundary_too_old():
+    """window=600s：at 为 60 秒前正常返回；起点早于 now − 660s 时 TooOld。"""
+    async def main():
+        qs = QueryService(_engine_with(None))
+        # at = now − 60s：起点 = now − 660s，恰在可用范围内
+        await qs.topk(Dim.URL, 600_000, 10, NOW - 60_000)
+        # at = now − 61s：起点 = now − 661s，早于可用范围 → TooOld
+        with pytest.raises(TooOld):
+            await qs.topk(Dim.URL, 600_000, 10, NOW - 61_000)
+    _run(main())
+
+
 def test_default_window_reads_snapshot():
     async def main():
         urls = [f"/x{i % 40}" for i in range(500)]

@@ -10,10 +10,11 @@ from flowlens.engine import Engine
 from flowlens.errors import TooOld
 from flowlens.hashing import key_hash, key_hashes
 from flowlens.model import EventBatch, parse_events
-from flowlens.timewin import FakeClock, split_range
+from flowlens.timewin import LATENESS_MS, FakeClock, split_range
 
 NOW = 1_735_689_600_000
 RETENTION = 600  # cfg.retention_sec
+LATE_SEC = LATENESS_MS // 1000  # 迟到上限（秒）
 
 
 def make_batch(eids, users, urls, ts, nbytes):
@@ -239,6 +240,28 @@ def test_too_old():
         eng.collect_parts(Dim.URL, split_range(NOW - (RETENTION + 100) * 1000, NOW - RETENTION * 1000))
     with pytest.raises(TooOld):
         eng.collect_stats(Dim.URL, split_range(NOW - (RETENTION + 100) * 1000, NOW - RETENTION * 1000))
+
+
+def test_retention_includes_lateness_margin():
+    # 保留期检查要与实际可用范围一致：最新定稿秒约 now − 迟到上限（60s），
+    # 所以起点在 now − retention − 迟到上限 之内时不应报 TooOld（长窗口查询
+    # 与普通查询的 at 对齐网格后普遍比 now 早 1 秒以内，区间起点普遍比 now 早
+    # window + 一点，旧口径 now − retention 会误报）。
+    eng, clock = new_engine()
+    # 边界内：起点 = now − retention − 迟到上限（可查，空数据不报错）
+    r_ok = split_range(NOW - (RETENTION + LATE_SEC) * 1000, NOW - (RETENTION + LATE_SEC) * 1000 + 1000)
+    assert eng.collect_parts(Dim.URL, r_ok) is not None
+    assert eng.collect_stats(Dim.URL, r_ok) is not None
+    # 边界外：起点再早 1 秒 → TooOld
+    r_old = split_range(NOW - (RETENTION + LATE_SEC + 1) * 1000, NOW - (RETENTION + LATE_SEC) * 1000)
+    with pytest.raises(TooOld):
+        eng.collect_parts(Dim.URL, r_old)
+    with pytest.raises(TooOld):
+        eng.collect_stats(Dim.URL, r_old)
+    # window=600s 的普通查询：at 为 1 秒前（对齐网格的常见情形）起点 = now − 601s，
+    # 在 now − 660s 之内 → 不报 TooOld
+    r_600 = split_range(NOW - 1000 - 600_000, NOW - 1000)
+    assert eng.collect_parts(Dim.URL, r_600) is not None
 
 
 def test_empty_tree_no_error():

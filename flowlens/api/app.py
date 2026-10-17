@@ -289,10 +289,10 @@ async def _stream(request: web.Request) -> web.StreamResponse:
     manager.check_limits()
     by, window_ms, k, interval_ms = qp.by, qp.window_ms, qp.k, qp.interval_ms
 
+    last_id = request.headers.get(hdrs.LAST_EVENT_ID)
     # 订阅者要交付的起始帧时刻（Last-Event-ID 重连时从此补发，否则从实时帧开始）
-    next_tid = compute_next_tid(
-        request.headers.get(hdrs.LAST_EVENT_ID), now_ms, interval_ms, window_ms,
-        engine.cfg.retention_sec * 1000)
+    next_tid = compute_next_tid(last_id, now_ms, interval_ms, window_ms,
+                                engine.cfg.retention_sec * 1000)
 
     resp = web.StreamResponse()
     resp.headers["Content-Type"] = "text/event-stream"
@@ -302,11 +302,13 @@ async def _stream(request: web.Request) -> web.StreamResponse:
     try:
         await resp.prepare(request)
         await resp.write(b"retry: 3000\n\n")
-        # pump 用单调游标 next_tid：先把 [next_tid, 首帧) 逐帧补发（断线重连），
-        # 再无缝跟随实时帧——id 连续、严格递增、不重复、不重叠。
-        await pump(resp, sub, group, next_tid=next_tid,
+        # pump 用单调游标 next_tid：先把 [next_tid, 首帧) 逐帧补发（断线重连，优先用
+        # 组缓存、不重算），再无缝跟随实时帧——id 连续、严格递增、不重复、不重叠。
+        # 新订阅者（没有 Last-Event-ID）若组里已有最近一帧，pump 会先立即补发它。
+        await pump(resp, sub, group, next_tid=next_tid, immediate=last_id is None,
                    heartbeat=manager.heartbeat_period,
-                   write_timeout=manager.write_timeout)
+                   write_timeout=manager.write_timeout,
+                   compute_lock=manager.compute_lock)
     except asyncio.CancelledError:
         raise  # 客户端断开 / 应用关闭：清理后照常取消（CancelledError 不被下面捕获）
     except Exception:

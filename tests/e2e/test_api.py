@@ -498,6 +498,27 @@ def test_topk_with_at_replays():
     _serve(run)
 
 
+def test_topk_long_window_retention_boundary():
+    """window=600s：at 为 60 秒前正常返回；起点早于 now − 660s 时 422。"""
+    async def run(client, engine, clock, app):
+        await _post(client, "/v1/ingest", data=json.dumps(_evs(20, "/x", NOW - 1000)).encode())
+        # at = now − 60s：起点 = now − 660s，恰在可用范围内（最新定稿秒约 now − 60s）
+        r = await _get(client, "/v1/topk",
+                             params={"window": "600s", "k": "10", "by": "url",
+                                     "at": str(NOW - 60_000)})
+        assert r.status == 200, (r.status, await r.text())
+        t = _strict_json(await r.text())
+        assert t["window_ms"] == 600_000 and t["to"] == NOW - 60_000
+        assert t["from"] == NOW - 600_000 - 60_000
+        # at = now − 61s：起点 = now − 661s，早于可用范围 → 422 TooOld
+        r = await _get(client, "/v1/topk",
+                             params={"window": "600s", "k": "10", "by": "url",
+                                     "at": str(NOW - 61_000)})
+        assert r.status == 422, r.status
+        assert "error" in _strict_json(await r.text())
+    _serve(run)
+
+
 # ---- 应用关闭时 Ticker 正常结束 ----
 
 def test_ticker_stops_cleanly_on_shutdown():

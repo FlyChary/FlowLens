@@ -20,7 +20,8 @@ from .model import EventBatch
 from .ring import Bucket, Ring
 from .segtree import Cover, LeafInput, Tree
 from .sketch import Stats
-from .timewin import ACCEPT, LATE, FUTURE, Clock, Range, classify, sec, split_range
+from .timewin import (ACCEPT, LATENESS_MS, LATE, FUTURE, Clock, Range, classify,
+                      sec, split_range)
 
 
 @dataclass(frozen=True)
@@ -245,12 +246,20 @@ class Engine:
 
     # ---- 组装某维度某时间区间（唯一入口）----
     def _plan(self, d: Dim, r: Range) -> _Plan:
-        """保留期检查 + 时间划分。collect_parts / collect_stats 共用，不各自判断。"""
+        """保留期检查 + 时间划分。collect_parts / collect_stats 共用，不各自判断。
+
+        保留期检查要与实际可用范围一致：线段树保留的是"最新定稿秒往前
+        retention_sec 秒"，而最新定稿秒约为 now − 迟到上限（LATENESS_MS // 1000），
+        所以区间起点早于 now − retention_sec − 迟到上限（秒）时才真的查不到数据、
+        抛 TooOld。若只按 now − retention_sec 判断，window=600s 的查询（起点比 at
+        早 600s，而 at 对齐网格后往往比 now 早）会大量误报 TooOld：SSE 长窗口帧
+        与普通查询都会受影响。
+        """
         now_sec = sec(self.clock.now_ms())
         m = r.start
         if r.edges:
             m = min(m, min(e.sec for e in r.edges))
-        if m < now_sec - self.cfg.retention_sec:
+        if m < now_sec - self.cfg.retention_sec - LATENESS_MS // 1000:
             raise TooOld("区间早于保留期")
         next_ = self.ring.next
         # 环内整秒：[max(start, next), stop) 里有数据的秒桶

@@ -271,3 +271,23 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 **踩过的坑（测试侧）**：aiohttp `ClientResponse.close()` 是**同步**的（`resp.close()` 返回 None，不能 `await`），`client.close()` 才是异步的——初版误 `await resp.close()` 全挂。慢客户端的"丢弃计数"在 loopback 上测不准（内核 socket 缓冲会吸收全部帧、write() 不阻塞、队列不堆积），所以 e2e 只断言队列 ≤1（结构性保证），丢弃计数用 Subscriber 的确定性单测验证。
 
 - 验证：`pytest -q` 217 passed, 5 deselected（新增 12 条 SSE e2e + 重写 8 条 memstat）、无警告；`tools/bench_core.py 长尾` ~277k 事件/秒（无回归，未动热路径）。本地 `python -m flowlens --port 8099` 实测：/healthz 有 sse + memory_limit_bytes 字段；curl -N 订阅 5s 见 retry + 连续帧（id 差=interval、重算限流可见）；带 Last-Event-ID 重连首帧 id = 上一帧 id + interval、id 连续。
+
+### 2026-10-17 T7b SSE 修正与 T7 收尾补做（flowlens/engine.py、flowlens/api/stream.py、flowlens/api/app.py、tests/e2e/test_stream.py、tests/test_engine.py、tests/test_query.py、tests/e2e/test_api.py、docs/*）
+
+**一、长窗口帧 TooOld 修复**（`engine._plan`）：保留期检查由 `m < now_sec − retention_sec` 改为 `m < now_sec − retention_sec − LATENESS_MS//1000`（用 `timewin.LATENESS_MS` 常量，不写死），并在文档字符串里说明原因。原因：线段树保留"最新定稿秒往前 retention_sec"，最新定稿秒约 now−60s（迟到上限），所以实际能查到 now−660s 的数据；旧口径让 window=600s 的 SSE 帧（起点 T−600s，T 对齐网格后往往早于 now）与普通查询（at 对齐网格后比 now 早）大量误报 TooOld。
+
+**二、补帧不重算**（`stream.py`）：`SubscriptionGroup` 加 `frames = deque(maxlen=30)` 存 (帧时刻, payload)，生产者每产一帧先 `append` 再下发。补帧抽成 `_catchup`：优先取 `frames` 里落在缺口内的帧（同组共享、不重算），不在缓存里的帧（通常只有被 30 帧缓存挤出的最老一帧）才现场 `topk`，并用 `StreamManager` 上的全局 `asyncio.Semaphore(1)`（`compute_lock`）串行化，多个订阅者（甚至不同组）同时重连时不会并发打满回放。
+
+**三、新订阅者立即收帧**：`pump` 加 `immediate` 参数；`immediate=True`（无 Last-Event-ID）且组里已有最近一帧时，先把该帧补发出去、游标推到它之后，再照常吃实时帧——id 仍连续、严格递增。
+
+**四、关闭时立即结束所有流**：新增模块级结束标记 `STOP`。`Subscriber.stop()` 向队列放 `STOP`（满则先丢一帧再放）；`StreamManager.close()` 先给每个订阅者 `stop()`，再取消生产任务。`pump` 取到 `STOP` 立即 return，SSE 处理函数正常退出（不等 aiohttp 的 60 秒强制取消，也不靠关连接时的 CancelledError）。
+
+**五、两处小修**：(1) `compute_next_tid` 的起始游标从 `last_id + interval` 改为向上对齐网格（`-((last_id+interval)//-interval)*interval`），客户端换了 interval 时补帧与实时帧都落在网格上；保留期下限口径同步改成 now−retention−迟到上限。（2）帧计算节流由墙钟（`t0 − last_compute ≥ min_recompute`）改为**按帧时刻**（`g − last_compute_g ≥ min_recompute`）：interval ≥ 1s 时每帧间隔都 ≥ min_recompute，保证每帧必重算、`data.to == id`；interval < 1s 时同秒多帧仍复用一份计算。这是修复一个真 bug——原墙钟口径下生产者跑慢时（本帧与上帧的墙钟间隔 < 1s）1500ms 网格会错误地复用上一份结果，导致 data.to 早于 id。
+
+**六、T7 收尾补做**：PROGRESS"已定的决策"追加 hash(str(k)) 保留、hll 分段版保留、内存读数保持 memory.current 不扣页缓存、SSE 60s 帧暂走回放（同时记入未解决问题）；任务顺序更新为 T7 → T8 → T10 → T9 → T11 → 收尾。
+
+**测试**（新增 7 条）：`test_engine.py` 加保留期含迟到余量的边界；`test_query.py` 加 window=600s 各 interval 各时刻帧不抛 TooOld、at=60s 前正常/at=61s 前 422；`test_api.py` 加 /v1/topk 长窗口 422 边界；`test_stream.py` 加新订阅者 1s 内收帧、同组 10 订阅者同时重连 topk 调用次数不随订阅者数增长、Last-Event-ID 不在网格上时对齐、interval=1500ms 每帧 data.to==id、关闭时 3 个活跃订阅者 2s 内流正常结束。
+
+**与指令不一致 / 说明**：无实质偏离。"帧计算节流改按帧时刻"是执行第 5 节"验证重算节流"时发现原墙钟口径无法满足"interval>1s 每帧重算"而做的必要修正（行为更正确、与指令意图一致），已记入 PROGRESS 决策。基准表以 T7b 提交号标注；各项持平或好于上一版，无劣化 10% 以上。
+
+**验证**：`pytest -q` 226 passed, 5 deselected、无警告；`pytest -q -m slow` 5 passed（未动 bounds/heavy，输出不变）；bench_core 长尾 ~30.5 万/s、bench_model ~1.36 μs/条、bench_engine 1000 条 ~4.72 μs/条、5000 条 ~4.20 μs/条，均持平或好于上一版。本地 `python -m flowlens --port 8091` 实测：create_app 在事件循环外创建 StreamManager（其 `asyncio.Semaphore` 3.11 构造不绑 loop）正常启动，curl -N 见 retry + 连续帧（data.to==id、间隔=interval）。
