@@ -93,6 +93,10 @@ tests/                   单元测试；tests/e2e/ 端到端用例
 
 ## 每个任务结束时
 
-- `pytest -q` 通过；涉及热路径的改动跑一次 `tools/bench_core.py`，吞吐不能明显下降；
-- **两个平台都要跑全量 `pytest -q`**：Windows（本机）之外，还必须在 WSL 中跑一次全量测试（评测在 Linux 上进行，两边结果都必须全部通过，汇报时分别给出）。WSL 项目路径 `/mnt/d/dhy/code/flowlens`，用 T6c 建的虚拟环境 `/home/user/flowlens-venv`（缺依赖先 `pip install -e ".[dev]"`）：`wsl -e bash -lc 'cd /mnt/d/dhy/code/flowlens && PYTHONHASHSEED=0 /home/user/flowlens-venv/bin/python -m pytest -q'`。
+评测在 Docker 镜像（Linux、Python 3.12）中运行，它是唯一的标准环境。收尾检查按需进行，不做重复的全量运行：
+
+- **必须**：`docker build --target test .`，在镜像的 Python 3.12 上运行全部快测试，必须全部通过。在 WSL 中执行（例如 `wsl -e bash -lc 'cd /mnt/d/dhy/code/flowlens && docker build --target test .'`），网络慢时可加 `--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`
+- **Windows**：开发过程中按需运行与改动相关的测试，不要求每个任务都跑全量。如果发现只在 Windows 上失败的测试，在汇报中说明，但不阻塞收尾
+- **慢测试**（`pytest -q -m slow`）：只有改动涉及 bounds.py、sketch/heavy.py、pyproject.toml、Dockerfile、constraints.txt、flowlens/__main__.py 时才运行（可以在 Docker 测试阶段或 Windows 上运行）
+- **性能基准**：只有改动涉及写入或查询的热路径（model.py、engine.py、ingest.py、query.py、hashing.py 等）时才运行，每项运行一次；比 docs/PROGRESS.md 中上一次的数字差 10% 以上时，再运行 3 次取中位数并分析原因。没有触及热路径的任务，在汇报中写明"未触及热路径，未跑基准"
 - 在 AI_LOG.md 末尾追加几行：做了什么、AI 给的方案哪里被修改或否决、为什么。
