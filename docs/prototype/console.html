@@ -306,7 +306,7 @@ svg .ink { fill: var(--ink); }
       <p class="hint">真实值来自离线精确解：压测时存档发出的每一条事件，回放时对同一区间计算精确答案。拖动回放滑块，下面的内容会切换到那一刻。</p>
       <div class="cmp">
         <div>
-          <h3>此刻的 Top-10（最近 60 秒，按 URL）</h3>
+          <h3 id="cmpTopTitle">此刻的 Top-10（最近 60 秒，按 URL）</h3>
           <div class="keyline"><span><i style="background:var(--write);opacity:.35;height:8px"></i>服务的估计值</span><span><i style="background:var(--write);height:8px"></i>服务给出的 [下界, 上界]</span><span><i style="background:var(--read);width:3px;height:12px;vertical-align:-2px"></i>真实值</span></div>
           <svg id="cmpTop" viewBox="0 0 640 300" role="img" aria-label="Top-10 估计值与真实值对比"></svg>
         </div>
@@ -359,18 +359,24 @@ svg .ink { fill: var(--ink); }
 
     <section class="lower">
       <div class="panel">
-        <h2>实时热点</h2>
+        <div class="treehead">
+          <h2 style="margin:0">实时热点</h2>
+          <div class="seg" role="group" aria-label="热点维度" id="bySeg">
+            <button data-by="url" aria-pressed="true">URL</button>
+            <button data-by="user" aria-pressed="false">用户</button>
+          </div>
+        </div>
         <p class="hint" id="topkHint">通过 SSE 订阅：最近 60 秒，按 URL，前 10 名。</p>
         <table class="topk">
-          <thead><tr><th>#</th><th>URL</th><th>次数</th><th>误差</th><th style="width:28%"></th></tr></thead>
+          <thead><tr><th>#</th><th id="thKey">URL</th><th>次数</th><th>误差</th><th style="width:28%"></th></tr></thead>
           <tbody id="topkBody"></tbody>
         </table>
       </div>
       <div class="panel">
         <h2>统计与结果</h2>
         <div class="stats">
-          <div class="kpi"><b id="kUsers">0</b>去重用户数（60 秒）</div>
-          <div class="kpi"><b id="kP95b">0</b>p95 响应字节</div>
+          <div class="kpi"><b id="kUsers">0</b>去重用户数（60 秒）<br>误差约 ±0.8%（HLL，2¹⁴ 个寄存器）</div>
+          <div class="kpi"><b id="kP95b">0</b>字节数 p95（60 秒，单位：字节）<br>误差约 ±1%（DDSketch）</div>
           <div class="kpi"><b id="kSse">0</b>SSE 订阅组 / 订阅者</div>
           <div class="kpi"><b id="kIngested">0</b>累计写入事件</div>
         </div>
@@ -553,20 +559,34 @@ function windowTopK(frameSec) {
   let E = 0;
   for (let s = frameSec - WIN; s < frameSec; s++) { const sl = S.slots.get(s); if (sl) E += sl.events; }
   const d = S.dist;
-  const rows = [];
-  for (let r = 1; r <= 10; r++) {
-    if (d === 'rnd') rows.push({ k: '/r/x' + Math.floor(Math.random() * 9e6), c: 1, e: 0 });
-    else if (d === 'uni') { const c = Math.max(1, Math.round(E / KEYSPACE * rnd(1.6, 2.4))); rows.push({ k: keyOf(r * 977, frameSec), c, e: Math.max(1, Math.round(c * 0.3)) }); }
-    else { const c = Math.round(E * pz(r) * rnd(0.985, 1.015)); rows.push({ k: keyOf(r, frameSec), c, e: Math.max(0, Math.round(c * 0.002 + rnd(0, 3))) }); }
-  }
-  // 模拟离线精确解：Count-Min 只会高估，真实值落在 [估计 − 误差, 估计] 内
-  for (const row of rows) { row.lo = Math.max(0, row.c - row.e); row.t = Math.round(row.lo + (row.c - row.lo) * Math.random()); }
-  rows.sort((a, b) => b.c - a.c || a.k.localeCompare(b.k));
-  const missing = d === 'uni' && Math.random() < 0.5 ? [{ k: keyOf(4321, frameSec), t: rows[rows.length - 1].t + 1 }] : [];
+  // 同一套逻辑生成 url 与 user 两个维度的榜单：只是 key 的形式和热度分布不同
+  const makeRows = (key, p, space, rndKey, missKey) => {
+    const rows = [];
+    for (let r = 1; r <= 10; r++) {
+      if (d === 'rnd') rows.push({ k: rndKey(), c: 1, e: 0 });
+      else if (d === 'uni') { const c = Math.max(1, Math.round(E / space * rnd(1.6, 2.4))); rows.push({ k: key(r * 977), c, e: Math.max(1, Math.round(c * 0.3)) }); }
+      else { const c = Math.round(E * p(r) * rnd(0.985, 1.015)); rows.push({ k: key(r), c, e: Math.max(0, Math.round(c * 0.002 + rnd(0, 3))) }); }
+    }
+    // 模拟离线精确解：Count-Min 只会高估，真实值落在 [估计 − 误差, 估计] 内
+    for (const row of rows) { row.lo = Math.max(0, row.c - row.e); row.t = Math.round(row.lo + (row.c - row.lo) * Math.random()); }
+    rows.sort((a, b) => b.c - a.c || a.k.localeCompare(b.k));
+    const missing = d === 'uni' && Math.random() < 0.5 ? [{ k: missKey, t: rows[rows.length - 1].t + 1 }] : [];
+    return [rows, missing];
+  };
+  const [rows, missing] = makeRows(r => keyOf(r, frameSec), pz, KEYSPACE, () => '/r/x' + Math.floor(Math.random() * 9e6), keyOf(4321, frameSec));
+  const [rowsUser, missingUser] = makeRows(r => userOf(r, frameSec), pu, USERS, () => 'user_r' + Math.floor(Math.random() * 9e6), userOf(4321, frameSec));
   const usersTrue = S.dist === 'rnd' ? E : USERS * (1 - Math.exp(-E / USERS));
   const p95True = 10918 * rnd(0.997, 1.003);
-  return { rows, missing, users: usersTrue * rnd(0.993, 1.007), usersTrue, p95: p95True * rnd(0.993, 1.007), p95True, E };
+  return { rows, missing, rowsUser, missingUser, users: usersTrue * rnd(0.993, 1.007), usersTrue, p95: p95True * rnd(0.993, 1.007), p95True, E };
 }
+// 用户的活跃度也是长尾：少数重度用户（例如爬虫、轮询客户端）贡献大量请求
+const US = 0.9;
+let HU = 0; for (let r = 1; r <= USERS; r++) HU += Math.pow(r, -US);
+function pu(r) { return Math.pow(r, -US) / HU; }
+function userOf(rank, sec) { return 'user_' + String((rank * 104729 + Math.floor(sec / 120) * 17) % USERS).padStart(6, '0'); }
+let topBy = 'url';
+const rowsOf = tk => (topBy === 'user' ? tk.rowsUser : tk.rows);
+const missingOf = tk => (topBy === 'user' ? tk.missingUser : tk.missing) || [];
 
 function recordFrame(m) {
   const slots = [];
@@ -899,7 +919,8 @@ function lineChart(id, frames, series, opt) {
 const pct = v => (v >= 0 ? '+' : '−') + Math.abs(v * 100).toFixed(2) + '%';
 function renderCompare(frames) {
   const f = frames[frames.length - 1], tk = f.tk;
-  const rows = tk.rows.map(r => ({ ...r })), missing = tk.missing || [];
+  const rows = rowsOf(tk).map(r => ({ ...r })), missing = missingOf(tk);
+  document.getElementById('cmpTopTitle').textContent = `此刻的 Top-10（最近 60 秒，按${topBy === 'user' ? '用户' : ' URL'}）`;
   const all = rows.concat(missing.map(m => ({ k: m.k, t: m.t, miss: true })));
   const maxV = Math.max(1, ...all.map(r => Math.max(r.c || 0, r.t)));
   const RH = 26, KX = 0, BX = 230, BW = 330, EX = 640;
@@ -933,8 +954,8 @@ function renderCompare(frames) {
     `<div class="kpi"><b>${pct(ue)}</b>去重用户数</div>` +
     `<div class="kpi"><b>${pct(pe)}</b>p95</div>`;
   const short = v => v >= 1e5 ? (v / 1e4).toFixed(1) + '万' : Math.round(v).toLocaleString('zh-CN');
-  lineChart('cTop1', frames, [{ get: f => f.tk.rows[0].c, color: '--write', w: 1.6 }, { get: f => f.tk.rows[0].t, color: '--read', w: 1.6 }],
-    { fmt: short, zoom: true, noCaption: true, band: { lo: f => f.tk.rows[0].lo, hi: f => f.tk.rows[0].c, color: '--write' } });
+  lineChart('cTop1', frames, [{ get: f => rowsOf(f.tk)[0].c, color: '--write', w: 1.6 }, { get: f => rowsOf(f.tk)[0].t, color: '--read', w: 1.6 }],
+    { fmt: short, zoom: true, noCaption: true, band: { lo: f => rowsOf(f.tk)[0].lo, hi: f => rowsOf(f.tk)[0].c, color: '--write' } });
   lineChart('cUsers', frames, [{ get: f => f.tk.users, color: '--write', w: 1.6 }, { get: f => f.tk.usersTrue, color: '--read', w: 1.6 }],
     { fmt: short, zoom: true, noCaption: true });
   lineChart('cP95', frames, [{ get: f => f.tk.p95, color: '--write', w: 1.6 }, { get: f => f.tk.p95True, color: '--read', w: 1.6 }],
@@ -965,15 +986,16 @@ function renderPanels(frames) {
   const lv = document.getElementById('levels').children;
   for (let i = 0; i < 5; i++) lv[i].classList.toggle('on', i === m.level);
   document.getElementById('levelDesc').textContent = LEVEL_DESC[m.level] + (m.weight > 1 ? `（采样率 1/${m.weight}）` : '');
-  // 热点
-  const tk = f.tk, maxC = Math.max(1, ...tk.rows.map(r => r.c));
-  document.getElementById('topkBody').innerHTML = tk.rows.map((r, i) =>
+  // 热点（按当前选中的维度：URL 或用户）
+  const tk = f.tk, rows = rowsOf(tk), maxC = Math.max(1, ...rows.map(r => r.c));
+  document.getElementById('topkBody').innerHTML = rows.map((r, i) =>
     `<tr><td>${i + 1}</td><td class="key">${r.k}</td><td class="num">${fmt(r.c)}</td><td class="num">±${fmt(r.e)}</td><td><div class="bar"><i style="width:${(r.c / maxC * 100).toFixed(1)}%"></i></div></td></tr>`).join('');
-  document.getElementById('topkHint').textContent = m.level >= 2
-    ? `通过 SSE 订阅：最近 60 秒，按 URL，前 10 名。当前处于 ${m.level} 级降级，结果按 1/${m.weight} 采样估算。`
-    : '通过 SSE 订阅：最近 60 秒，按 URL，前 10 名。';
+  const byName = topBy === 'user' ? '用户' : ' URL';
+  document.getElementById('thKey').textContent = topBy === 'user' ? '用户' : 'URL';
+  document.getElementById('topkHint').textContent = `通过 SSE 订阅（by=${topBy}）：最近 60 秒，按${byName}，前 10 名。` +
+    (m.level >= 2 ? `当前处于 ${m.level} 级降级，结果按 1/${m.weight} 采样估算。` : '');
   document.getElementById('kUsers').textContent = fmt(tk.users);
-  document.getElementById('kP95b').textContent = fmt(tk.p95);
+  document.getElementById('kP95b').textContent = Math.round(tk.p95).toLocaleString('zh-CN');
   document.getElementById('kSse').textContent = `${f.sse[0]} / ${f.sse[1]}`;
   document.getElementById('kIngested').textContent = fmt(f.ingested);
 }
@@ -1101,6 +1123,12 @@ $('qBtn').addEventListener('click', () => {
   draw();
 });
 $('qClear').addEventListener('click', () => { query = null; draw(); });
+$('bySeg').addEventListener('click', ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  topBy = b.dataset.by;
+  [...$('bySeg').children].forEach(x => x.setAttribute('aria-pressed', x === b));
+  draw();
+});
 // 回放播放：按“模拟速度”逐帧前进，到最新一帧自动暂停
 let playing = false, playTimer = null;
 function setPlaying(p) {
