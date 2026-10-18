@@ -17,11 +17,28 @@
 | T7 SSE + T7b 修正 | 已审查通过 |
 | T8 过载降级 | 已完成，等审查 |
 | T8b 测试与运行环境解耦、Linux 验证 | 已完成，等审查 |
-| T9 驻留表、T10 工具与实验、T11 性能 | 未开始 |
+| T9 驻留表 | 未开始 |
+| T10a 压测工具、离线精确解、边界用例 | 已完成，等审查 |
+| T10b 实验场景与端到端粗测 | 未开始 |
+| T10c 调试接口与控制台页面 | 未开始 |
+| T11 性能 | 未开始 |
 
 ## 进行中
 
-T8b 已完成，汇报后停下等审查。T8b 内容（按 docs/instructions/T8b.md）：
+T10a 已完成（按 docs/instructions/T10a.md），汇报后停下等审查。T10a 内容：
+
+1. **事件生成 `tools/flowgen.py`**（可导入模块 + CLI）：三种确定性分布（长尾 Zipf s=1.1/0.9、均匀、全随机不重复）；URL/用户用整数编号表示，`key_of(i)` 是归一化 URL（`/api/item/x{i}`，末尾 `x{i}` 以字母开头、不命中 {id} 归一化规则），`raw_url(key, rng)` 只加 query 与 fragment（归一化整体剥掉）→ `normalize_url(raw)==key`（压测数据因此既测 URL 归一化、又让离线精确解按编号分组与服务按 key 分组对上同一个划分）；bytes 对数正态（p95≈10 KB）；迟到 61.5~119.5s、未来 5.5~30s、正常 0~3s，都避开 60s/5s 判定边界 ±0.5s（"服务按收到时刻、精确解按发送时刻"两口径结论一致）；可配迟到/未来/跨批重复/批内重复/非法比例；`ArchiveWriter` 只存被接受（202）批次的整数列（npz）、多 worker 按 shard 写、`finalize_archive` 合并 meta.json。
+2. **发送器 `tools/loadgen.py`**：多进程（spawn）× 每进程 C 并发连接（aiohttp `trust_env=False` 避开 WSL 自动代理）；总速率平均分给各进程、按"理想发送时刻"发批（有界队列背压）；503 按 Retry-After 重发同一批、重试次数可配；每秒一行 JSON（发送/接受/拒绝/错误 + 延迟 p50/p95/p99，按"发起时刻"归秒、每批只计一次）、结束一行汇总（含客户端 CPU 占比，判断压测工具是否成瓶颈）。
+3. **离线精确解 `tools/exact.py`**：读存档按服务规则求"被接受集合"（去非法/未来、按 **sent_ms** 判迟到、event_id 去重保留首次）；按 ts 排序建索引，任意毫秒区间 `[from,to)` 查 topk（并列按 key 字典序）、distinct_users、quantile_bytes；`compare()` 算召回（并列不算错）、计数相对误差、真实值是否落 [lower,upper]。**分位数口径**：按秩取值、目标秩 R=⌊q(n−1)⌋+1（1 起算）= numpy `quantile(x,q,method="lower")`，与 `sketch.DDSketch.quantile` 的秩定义完全一致（DDSketch 在同一秩上返回桶代表值，精确解返回该秩真实值——位置相同、取值精度不同）。
+4. **边界用例 `tools/boundary_cases.py`**（18 条，题目自测脚本）：`tests/e2e/test_boundaries.py`（进程内 TestServer）与 `tools/selftest.py`（对运行中服务 --url、打印表格、任一项失败退出码非 0）共用同一套 `CASES` 与 `Target` 抽象。
+5. **工具自测 `tests/test_tools.py`**：生成确定性、分布形状（长尾前 10 占比 >30% vs 均匀 <6%）、全随机不重复、`raw_url` 归一化、时间戳避边界、存档往返、精确解对照最朴素逐条实现（含毫秒边界）、compare 召回并列口径、发送器 503 重试+存档+逐秒/汇总 JSON 格式。
+6. **`/v1/stats` 支持 `at`**（`query.py`/`app.py`）：原 `/v1/stats` 只收 window、默认恒读快照；改为与 `/v1/topk` 同口径——不带 `at` 且 60s 读快照，带 `at`（或非 60s）走回放合并概要、at 早于保留期同样 422、第 1 级同样暂停。原因：边界用例"区间无数据 p95 为 null"需对"已运行"的服务指向一个无数据的过去区间（见 DESIGN_TODO #16）。
+
+**WSL 三步实跑**（端口用 9000——本机 WSL2 的 80xx 段 bind 报 98 被保留，9000/12345 可用）：服务启动（healthz ok、内存读数 ~105 MB）→ loadgen 4 进程 ×8 并发、2 万/秒长尾 60s、gzip、存档 → **120 万条 100% 接受、0 拒绝 0 错误、接受速率 19670/秒、客户端 CPU 48%、延迟 p50 73ms/p95 132ms/p99 151ms** → selftest **18/18 通过** → exact.py 最近 60s 精确 Top-10 与 `/v1/topk`（同 at）对比：**召回 1.000、平均相对误差 0.18%、最大 0.27%、真实值全部落在 [lower,upper] 内**（如 x0 精确 171371 vs 服务 171133）。
+
+**验证（两平台均全过）**：Windows `pytest -q` **263 passed, 5 deselected**、`-m slow` **5 passed**；WSL（Python 3.14）`pytest -q` **262 passed, 1 skipped**（1 skip=仅 Windows 的 memstat 真实读数）, 5 deselected、`-m slow` **5 passed**。
+
+T8b 已完成（按 docs/instructions/T8b.md）：
 1. **测试与真实内存解耦**（`create_app` 加 `memory_reader` 参数）：`create_app(..., memory_reader=None)`，默认 `memstat`；Ticker 喂控制器的值、`/healthz` 与 `/v1/stats` 的 `memory_bytes`/`memory_limit_bytes` 统一从这一个 reader 读（挂在 `app[memory_reader_key]`）。`tests/e2e` 所有创建应用处传恒 `(0, None)` 的假读数（`_fake_memory_reader`）；新增 `tests/e2e/test_degrade.py::test_memory_reader_drives_levels` 用可控的 `MemFeed` 走"读数→Ticker→控制器"真实链路，端到端验证第 3/4 级的进入与退出。这是 28 个 Linux 失败的直接修复（见下）。
 2. **查清每个测试后内存增长 ~45 MB 的原因**：tracemalloc 逐测快照定位到**每个 e2e 测试的 Engine 没被释放**（去重 Bloom 33.5 + CMS 19.7 + HLL 1.1 ≈ 55 MB/个，逐测累积）。根因是 **aiohttp 的全局中间件缓存** `_cached_build_middleware`（`web_app.py` 的 `lru_cache(maxsize=1024)`）以 `(handler, match_info.apps)` 为键、`apps` 是**含 Application 的元组**，每个 `create_app` 都把那个 Application（连带 Engine）用强引用挂进进程级缓存。修复：`tests/e2e/conftest.py` 加 autouse fixture，每个 e2e 测试结束后 `cache_clear()`。验证：修复前 6 个测试 RSS 55→358 MB（+54.6 MB/测）、tracemalloc 存活分配 +54.6 MB/测；修复后 RSS 平台化在 ~121 MB、存活分配净增 ≈0 MB/测。生产单实例不受影响（只建一个 app、缓存就一条）。
 3. **Windows 内存读数**（`memstat.py`）：cgroup 与 statm 全缺时，Windows 用 ctypes 调 psapi 的 `GetProcessMemoryInfo` 读 `WorkingSetSize`（结构体延迟定义、缓存；`GetCurrentProcess` 声明 `restype=c_void_p`、`GetProcessMemoryInfo` 声明 `argtypes` 否则伪句柄被截断/溢出）。任何异常吞掉返回 0。补 `tests/test_memstat.py` 两条（跨平台 mock + 仅 Windows 的真实读数，非 Windows 跳过）。**踩坑**：初版 `GetCurrentProcess` 不声明 restype，ctypes 把 64 位伪句柄 `0xFFFF…FF` 截断成 32 位有符号 `-1`，`GetProcessMemoryInfo` 静默失败返回 0；声明 `restype=c_void_p` 后才拿到真实值。
@@ -89,24 +106,34 @@ T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 - 每个任务结束都必须在 WSL（Linux）跑全量 `pytest -q`（T8b 起）：评测在 Linux 上进行，Windows 与 Linux 两边结果都必须全过、汇报时分别给出。WSL 项目路径 `/mnt/d/dhy/code/flowlens`、用 `/home/user/flowlens-venv`（T6c 建，缺依赖先 `pip install -e ".[dev]"`）。此条已写入 CLAUDE.md"每个任务结束时"。
 - Windows 内存读数（T8b）：memstat 在 cgroup 与 statm 都读不到时（纯 Windows 开发机），用 ctypes 调 psapi 的 `GetProcessMemoryInfo` 读本进程 `WorkingSetSize`，让本地 `/healthz` 显示真实值、内存相关的降级逻辑在本地也能真正触发（此前 Windows 上 `memory_bytes()` 恒 0，第 3/4 级逻辑本地一次没跑过）。任何异常吞掉返回 0、不抛。`GetCurrentProcess` 必须声明 `restype=c_void_p`、`GetProcessMemoryInfo` 必须声明 `argtypes`，否则 64 位伪句柄 `0xFFFF…FF` 被截断/溢出、调用静默失败返回 0。
 - e2e 测试后清 aiohttp 全局中间件缓存（T8b，`tests/e2e/conftest.py` autouse fixture）：aiohttp 的 `_cached_build_middleware`（`web_app.py`，`lru_cache(maxsize=1024)`）以 `(handler, match_info.apps)` 为键、`apps` 是含 `Application` 的元组，每个 `create_app` 都把那个 Application（连带 Engine ≈55 MB）用**强引用**挂进这个进程级缓存。全量 pytest 在同一进程逐个跑 e2e（各自 create_app）时逐测累积 ~55 MB（到第 4 个就超 256 MB×0.9，把控制器打进第 4 级）。fixture 在每个 e2e 测试结束后 `cache_clear()`。生产单实例不受影响（只建一个 app、缓存就一条）。
+- 压测工具与精确解的口径（T10a）：事件用**整数编号**表示（URL `key_of(i)=/api/item/x{i}`、用户 `user_of(i)=u{i}`），存档只存整数列、字符串可由编号按 `KEY_RULE_VERSION` 重建——存档体积与事件数线性、与字符串长度无关。发送的原始 URL 只在 key 上加 **query 与 fragment**（归一化整体剥掉），保证 `normalize_url(raw)==key`：压测数据既覆盖 URL 归一化路径，又让"离线精确解按编号分组"与"服务按归一化 key 分组"落到**同一个划分**（否则精确解与服务对不上、无法验证召回）。时间戳避开判定边界 ±0.5s（迟到 61.5~119.5s、未来 5.5~30s），使"服务按收到时刻、精确解按发送时刻"两口径结论一致。
+- 离线精确解的**迟到判定按 `sent_ms`**（该批发送时刻，`ts < sent_ms − 60s`），不是存档读取时刻（T10a）：精确解离线重放、无法知道服务真实收到时刻，用发送时刻是它所能拿到的最接近值；因时间戳已避开边界 ±0.5s、收-发延迟远小于余量，与服务按收到时刻判定的结论一致。记入 DESIGN_TODO #18。
+- 精确解 `quantile_bytes` 的分位数口径（T10a）：按秩取值，目标秩 R=⌊q·(n−1)⌋+1（1 起算）= numpy `quantile(x, q, method="lower")`，与 `sketch.DDSketch.quantile`（目标排名 ⌊1+q(n−1)⌋）**同一套秩定义**。DDSketch 在同一秩上返回的是**桶代表值**（相对误差 ≤ α），精确解返回该秩的**真实值**——两者取"同一个位置"、比较的是取值精度而非位置。所以"服务 p95 ≈ 精确 p95"是同一秩上的近似关系。
+- `compare()` 的召回口径（T10a，沿用既有决策）：返回的 key 的**真实次数 ≥ 精确第 k 名的次数即算命中**（并列不算错），分母是服务返回条数；另算计数相对误差、真实值是否落在 `[lower,upper]`。
+- `/v1/stats` 支持 `at`（T10a）：与 `/v1/topk` 同口径——不带 `at` 且 window=60s 读快照；带 `at`（或非 60s）走回放合并概要，`at` 早于保留期同样 422、第 1 级降级同样暂停。原因：边界用例"区间无数据 approx_p95_bytes 为 null"需对**已运行**（默认窗口有数据）的服务指向一个无数据的过去区间，必须能用 `at` 回放（见 DESIGN_TODO #16）。`stats(window_ms, at_ms=None)`，`at_ms=None` 时行为与原来完全一致。
+- 边界用例 18 条、两种形式共用一套定义（T10a）：`tools/boundary_cases.py` 的 `CASES` + `Target` 抽象（进程内用 TestClient、远端用 ClientSession），`tests/e2e/test_boundaries.py` 与 `tools/selftest.py` 都调 `run_all(t)`。题目原列 14 条，实际补到 18 条（gzip、解压炸弹、SSE 重连、区间无数据 p95 为 null 等，见 DESIGN_TODO #17）。
+- 多 worker 的 event_id 互不冲突（T10a）：每个 worker 用不相交的序号区间（`seq_offset = wid × SEQ_STRIDE`，SEQ_STRIDE=10⁸），event_id=`e{seq}` 全局唯一；worker 随机种子 = `seed + wid`。存档按 shard 写、`finalize_archive` 把各 shard 文件按 (shard,seq) 排序合并——同一 worker 内按发送序、跨 worker 的 id 不冲突，"保留第一次出现"去重直接按此序。
+- 本机 WSL2 的 80xx 端口段 bind 报 errno 98（被保留，`ss` 里也看不到占用者），9000/12345 等可用（T10a 实测）：实验脚本端口改用 9000。这不是服务问题，是开发机 WSL2 环境特性；评测容器 `--memory` 启动走 8080 不受影响。
 
 ## 基准数据
 
 各任务结束时重跑全部测试与性能基准并追加一列（以后每个任务都一样）。每项各跑 3 次取中位（单次波动大）。"上一版"为 T6c 前后对照；"T7b"为提交 `d2d5c8e`；"T8"、"T8b"分别为对应任务结束时的本机（T8b 机器）中位数。
 
-| 项目 | 上一版（T6c 前后） | T7b | T8（中位数） | T8b（本次，Windows 中位数） |
-|---|---|---|---|---|
-| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected | 247 passed, 5 deselected | 250 passed, 5 deselected（WSL：249 passed, 1 skipped, 5 deselected） |
-| pytest -q -m slow | 5 passed | 5 passed | 5 passed | 5 passed（Windows 与 WSL 均 5 passed） |
-| bench_core 长尾 | 约 20 万～30 万 事件/秒（波动大） | 约 30.5 万/秒（波动上沿） | 约 22.6 万/秒（218/236/226） | 约 18.5 万/秒（197/185/185） |
-| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 | 约 2.22 μs/条（2.15/2.22/2.22） | 约 1.87 μs/条（1.87/1.92/1.76） |
-| bench_engine 每批 1000 条合计 | 约 6.3 μs/条 | 约 4.72 μs/条 | 约 6.10 μs/条（5.84/6.10/8.27） | 约 5.84 μs/条（5.84/5.85/5.57） |
-| bench_engine 每批 5000 条合计 | 约 4.9 μs/条 | 约 4.20 μs/条 | 约 5.39 μs/条（4.65/5.39/6.64） | 约 4.65 μs/条（4.58/4.79/4.65） |
-| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms | 中位约 23 ms，最大约 44 ms（一次 93 s 为调度停顿） | 中位约 25 ms（25.9/25.0/22.5），最大约 73 ms |
-| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms | 中位约 58 ms，最大约 82 ms | 中位约 52 ms（52.3/52.3/51.5），最大约 76 ms |
-| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms | 中位约 105 ms，最大约 135 ms | 中位约 116 ms（116/118/106），最大约 187 ms |
+| 项目 | 上一版（T6c 前后） | T7b | T8（中位数） | T8b（本次，Windows 中位数） | T10a（本次，Windows 中位数） |
+|---|---|---|---|---|---|
+| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected | 247 passed, 5 deselected | 250 passed, 5 deselected（WSL：249 passed, 1 skipped, 5 deselected） | 263 passed, 5 deselected（WSL：262 passed, 1 skipped, 5 deselected） |
+| pytest -q -m slow | 5 passed | 5 passed | 5 passed | 5 passed（Windows 与 WSL 均 5 passed） | 5 passed（Windows 与 WSL 均 5 passed） |
+| bench_core 长尾 | 约 20 万～30 万 事件/秒（波动大） | 约 30.5 万/秒（波动上沿） | 约 22.6 万/秒（218/236/226） | 约 18.5 万/秒（197/185/185） | 约 26.4 万/秒（282/264/243） |
+| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 | 约 2.22 μs/条（2.15/2.22/2.22） | 约 1.87 μs/条（1.87/1.92/1.76） | 约 1.45 μs/条（1.49/1.45/1.41） |
+| bench_engine 每批 1000 条合计 | 约 6.3 μs/条 | 约 4.72 μs/条 | 约 6.10 μs/条（5.84/6.10/8.27） | 约 5.84 μs/条（5.84/5.85/5.57） | 约 5.01 μs/条（5.01/4.83/5.84） |
+| bench_engine 每批 5000 条合计 | 约 4.9 μs/条 | 约 4.20 μs/条 | 约 5.39 μs/条（4.65/5.39/6.64） | 约 4.65 μs/条（4.58/4.79/4.65） | 约 4.15 μs/条（4.15/4.55/3.75） |
+| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms | 中位约 23 ms，最大约 44 ms（一次 93 s 为调度停顿） | 中位约 25 ms（25.9/25.0/22.5），最大约 73 ms | 中位约 18.9 ms（18.1/18.9/19.8），最大约 37.7 ms |
+| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms | 中位约 58 ms，最大约 82 ms | 中位约 52 ms（52.3/52.3/51.5），最大约 76 ms | 中位约 48.0 ms（47.4/48.2/48.0），最大约 66.2 ms |
+| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms | 中位约 105 ms，最大约 135 ms | 中位约 116 ms（116/118/106），最大约 187 ms | 中位约 85.2 ms（85.8/84.6/85.2），最大约 113.1 ms |
 
 **性能对比必须同机对照**：T8b 列在本机（本次运行）采集，与 T8 列同一台机器，故可直接对比。T8b 相对 T8：`bench_core 长尾` 22.6→18.5 万/秒、`完整 tick` 105→116 ms、`单次定稿` 23→25 ms——**T8b 未触及任何热路径**（改动是内存读数来源、`create_app` 加一个 reader 参数、`ingest` 采样分支复用已算好的 event_id 哈希、`ingest.py` 加一条错误信息），正常路径（sample_weight=1）的写入/快照/定稿代码与 T8 完全相同，数值差异在本机单次波动范围内（长尾吞吐波动历来很大，见"上一版"列 20 万～30 万）。`bench_model` 1.87 vs T8 的 2.22、每批 1000/5000 合计 5.84/4.65 vs T8 的 6.10/5.39，T8b 持平或略快。**结论：T8b 未使任何路径变慢**。
+
+T10a 列与 T8b 列**同一台机器**（本机）采集。T10a 同样**未触及任何热路径**（改动是 `query.stats` 加一个 `at_ms` 参数、`app.py` 一处调用、`conftest` 加 `sys.path`、`test_api` 一处测试桩签名，其余全是 `tools/` 与 `tests/` 新增文件，不进入服务端运行路径），写入/解析/定稿/快照代码与 T8b 完全相同。T10a 列整体比 T8b 快（`bench_core` 18.5→26.4 万/秒、`完整 tick` 116→85 ms、`单次定稿` 25→18.9 ms），**这是本机单次/时段波动**（长尾吞吐历来 20 万～30 万摆动、`bench_model` 1.87→1.45），非 T10a 引入的优化。判读基准对比时应以"同一次采集内各指标是否自洽"为准，跨任务的机器/时段差不可当结论。**结论：T10a 未使任何路径变慢**。
 
 ## 未解决的问题
 
@@ -120,4 +147,4 @@ T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 
 ## 下一步
 
-T8b 汇报后停下等待审查；审查通过后按顺序执行：T10 工具与实验（含端到端压测，粗测吞吐与查询 p99 记入"基准数据"）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**以后每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。
+T10a 汇报后停下等待审查；审查通过后按顺序执行：T10b 实验场景与第一次端到端粗测（吞吐/查询 p99 记入"基准数据"）→ T10c 调试接口与控制台页面（界面参考 docs/prototype/console.html）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。

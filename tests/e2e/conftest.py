@@ -15,8 +15,16 @@ create_app），测试结束 AppRunner 关掉，但 Application 仍被这个缓�
 """
 
 import gc
+import sys
+from pathlib import Path
 
 import pytest
+
+# tools/ 不在包路径里（压测工具按脚本运行）；e2e 的边界用例与工具共用
+# tools/boundary_cases.py（T10a），这里把 tools/ 加进 sys.path
+_TOOLS = Path(__file__).resolve().parent.parent.parent / "tools"
+if str(_TOOLS) not in sys.path:
+    sys.path.insert(0, str(_TOOLS))
 
 # 指向 aiohttp 的私有名；用 getattr 守卫，将来 aiohttp 改名时不会让 e2e 全挂
 _MW_CACHE_ATTR = "_cached_build_middleware"

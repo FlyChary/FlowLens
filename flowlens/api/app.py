@@ -316,7 +316,7 @@ async def _stats(request: web.Request) -> web.Response:
     ctrl = request.app[degrade_controller_key]
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms, need_k=False, need_by=False)
-    s = await request.app[query_service_key].stats(qp.window_ms)
+    s = await request.app[query_service_key].stats(qp.window_ms, qp.at_ms)
     mem_bytes, _ = request.app[memory_reader_key]()
     return _json_response({
         "window_ms": s.window_ms,

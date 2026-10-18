@@ -134,21 +134,26 @@ class QueryService:
             self._cache_put((d, from_ms, to_ms, k), res)
         return res
 
-    async def stats(self, window_ms: int) -> StatsAnswer:
-        """统计查询：默认窗口读快照，其他窗口现场合并概要。"""
+    async def stats(self, window_ms: int, at_ms: int | None = None) -> StatsAnswer:
+        """统计查询：默认窗口（不带 at、60 秒）读快照，其他走回放合并概要。"""
         self._check_window(window_ms)
         now = self.engine.clock.now_ms()
 
-        if window_ms == DEFAULT_WINDOW_MS:
+        if at_ms is None and window_ms == DEFAULT_WINDOW_MS:
             snap = self.engine.snapshot
             return StatsAnswer(window_ms, snap.from_ms, snap.to_ms,
                                snap.distinct_users, snap.p95_bytes)
 
-        # 非 60 秒窗口 = 回放（现场合并概要）。第 1 级降级时暂停，返回 503。
+        # 带 at 或非 60 秒窗口 = 回放（现场合并概要）。第 1 级降级时暂停，返回 503。
         if self.controller.replay_paused:
             raise Overloaded("统计查询在降级期间暂停", retry_after=1)
 
-        to_ms = sec(now) * 1000
+        if at_ms is None:
+            to_ms = sec(now) * 1000
+        else:
+            if at_ms > now:
+                raise BadRequest("at 晚于当前时间")
+            to_ms = at_ms
         from_ms = to_ms - window_ms
         r = split_range(from_ms, to_ms)
         distinct_users = self.engine.collect_stats(Dim.USER, r).hll.estimate()

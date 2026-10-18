@@ -426,7 +426,7 @@ def test_unexpected_error_500_with_log():
         qs = app[query_service_key]
         real_stats = qs.stats
 
-        async def boom(window_ms):
+        async def boom(window_ms, at_ms=None):
             raise RuntimeError("test: 故意抛的意外异常 boom-marker")
         qs.stats = boom
         buf = io.StringIO()
