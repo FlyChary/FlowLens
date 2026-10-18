@@ -35,55 +35,76 @@ Windows 与 WSL 两边全量 `pytest -q` 均通过。
    （pyproject 的 packages 漏了 flowlens.api，`pip install .` 会缺 api 子包）。
    单独装 numpy/orjson/aiohttp 三个 wheel，再 `COPY flowlens ./flowlens`，
    `python -m flowlens` 在 `CWD=/app` 下直接 import。基础镜像保持 `python:3.12-slim`。
+   （**B1b 已更新**：`packages` 漏包改自动发现修复（#15），Dockerfile 回到
+   `pip install -c constraints.txt .`、装完删源码，见 #16。）
 8. **容器优雅停机靠镜像内的信号转发 init**：`CMD ["python", "/app/entrypoint.py"]`。
    `entrypoint.py` 起 `python -m flowlens` 为子进程，把自己（PID 1）收到的
    SIGTERM/SIGINT 转成子进程的 SIGINT——因为 `__main__.py` 的优雅关闭
    （`runner.cleanup()` → 立即结束所有流）挂在 `KeyboardInterrupt`（SIGINT），
    而 `docker stop` 发的是 SIGTERM。`__main__.py` 不在本支线改动范围，故用 init
-   包装在镜像层解决（见下）。
+   包装在镜像层解决（见下）。（**B1b 已更新**：`__main__.py` 现处理 SIGTERM，
+   去掉本 init，CMD 改回 `python -m flowlens`，见 #14。）
 9. **`entrypoint.py` 用 base64 内嵌进 Dockerfile**：本环境的 docker 是经典构建器
    （非 BuildKit），Dockerfile heredoc 会静默生成 0 字节文件；base64 blob +
    `base64 -d` + `py_compile` 校验，兼容经典构建器，且坏 blob 会直接让构建失败。
-   脚本明文见"AI 使用记录"。
+   脚本明文见"AI 使用记录"。（**B1b 已随 init 一并删除。**）
 10. **非 root 运行**：`useradd --uid 10001 appuser`，`USER appuser`。`chown /app`
     给 appuser。
 11. **HEALTHCHECK 用 Python 标准库**：镜像无 curl，`urllib.request` 请求
     `/healthz`，200 则健康。
 12. **run.sh 幂等**：venv 与依赖装过一次就用 marker 文件跳过重装（`pyproject.toml`
-    变新才重装）；`FLOWLENS_PORT`/`FLOWLENS_HOST`/`FLOWLENS_VENV` 可覆盖；
-    固定 `PYTHONHASHSEED=0`。
+    或 `constraints.txt` 变新才重装）；`FLOWLENS_PORT`/`FLOWLENS_HOST`/`FLOWLENS_VENV`
+    可覆盖；固定 `PYTHONHASHSEED=0`；用 `pip install -c constraints.txt .` 安装。
+
+## B1b 追加的决策（B1b 任务）
+
+13. **依赖版本由 `constraints.txt` 固定**：`aiohttp` 不同版本的行为差异已两次影响本
+    项目（中间件写法、传输层自动解压），评测方构建必须装到测试过的版本。`constraints.txt`
+    写入 WSL 测试环境 `numpy`/`orjson`/`aiohttp` 及其全部间接依赖的确切版本（`pip freeze`
+    去掉 flowlens 本身与开发包）；Dockerfile 与 run.sh 都用 `pip install -c constraints.txt .`
+    安装；`pyproject.toml` 的依赖保留版本范围、不写死（constraints 负责固定）。
+14. **`docker stop` 的退出方式（B1b）**：`__main__.py` 不再 `asyncio.Event().wait()`
+    永远等下去，改为等待一个停止事件；在支持的平台用 `loop.add_signal_handler` 为
+    SIGTERM 与 SIGINT 注册处理器、收到即置位停止事件，随后照常 `runner.cleanup()` 并
+    记录收到的信号（退出原因）。Windows 不支持 `add_signal_handler`，保留 Ctrl+C
+    （KeyboardInterrupt）路径、不报错。因此 Docker CMD 直接用 `python -m flowlens`，
+    PID 1 就是服务进程，不再需要 B1 的信号转发 init。
+15. **`pyproject.toml` 的包列表改自动发现**：`[tool.setuptools.packages.find]` +
+    `include = ["flowlens*"]`，不再手工列举，避免再漏子包；`tests/test_packaging.py`
+    （slow）用真实 `pip wheel .` 构建后与源码 `.py` 清单比对守护。
+16. **Dockerfile 装完删源码**：`pip install .` 后 `rm -rf /app/flowlens /app/pyproject.toml`，
+    运行时从 site-packages import、与 CWD 无关，真正"不依赖源码目录"（B1b 第六节从
+    /tmp 验证）。非 root 用户、HEALTHCHECK、`.dockerignore` 沿用 B1。
+17. **Dockerfile 的 `ARG PIP_INDEX_URL`**：默认为空；有值时传 `--index-url` 给 pip，
+    不在镜像里写死任何国内源或代理地址（构建方可用 `--build-arg` 指定，B1b 第六节用
+    清华源加速构建）。
 
 ## 未解决的问题
 
-1. **`pyproject.toml` 的 `packages` 漏了 `flowlens.api`**（主线文件，本支线不能改）。
-   现状 `packages = ["flowlens", "flowlens.sketch"]`，漏了 `flowlens.api`。本地
-   `pip install -e .`（可编辑安装）不依赖这个列表所以没暴露；但真实 `pip install .`
-   （Docker、以及任何非 editable 安装）会把 `flowlens.api` 整包丢掉，容器起不来
-   （`ModuleNotFoundError: No module named 'flowlens.api'`）。**建议主线把
-   `flowlens.api` 加进 `packages`**（或改用 `find:` 自动发现）。在修好之前，B1 的
-   Dockerfile 用"装依赖 + 拷源码"绕开。
-2. **应用不处理 SIGTERM，`docker stop` 会等满宽限期再 SIGKILL**（本支线已用镜像内
-   init 规避，但这是 `__main__.py` 的固有行为）。实证：镜像里 PID 1 是服务进程时，
-   `docker stop` 发 SIGTERM 被忽略（连"纯 `python -c sleep` 当 PID 1"也一样挂满
-   10s 后被 SIGKILL、exit 137）；同一应用在 WSL 上作为普通子进程收到 SIGTERM 则
-   0.26s 内退出。根因：`__main__.py` 只 `except KeyboardInterrupt`（SIGINT）。
-   **建议主线在 `__main__.py` 给 SIGTERM 装处理器（转 KeyboardInterrupt / 走
-   `runner.cleanup`）**，这样 Docker 的 CMD 就能直接用 `python -m flowlens`，
-   去掉 B1 的 init 包装。目前 B1 在镜像层解决，不影响正确性。
+1. **~~`pyproject.toml` 的 `packages` 漏了 `flowlens.api`~~**（B1b 已修复）。
+   改为自动发现 `[tool.setuptools.packages.find] include = ["flowlens*"]`，`pip install .`
+   会装出全部子包（`tests/test_packaging.py` 用真实 `pip wheel .` 构建后比对源码 .py 清单
+   守护）。Dockerfile 因此回到 `pip install -c constraints.txt .`。
+2. **~~应用不处理 SIGTERM，`docker stop` 会等满宽限期再 SIGKILL~~**（B1b 已修复）。
+   `__main__.py` 现在用 `loop.add_signal_handler` 为 SIGTERM/SIGINT 注册处理器、置位
+   停止事件后照常 `runner.cleanup()`；Windows 走 Ctrl+C（KeyboardInterrupt）路径。
+   Docker CMD 改回 `python -m flowlens`，去掉 B1 的信号转发 init（`tests/e2e/test_signals.py`
+   用真实子进程 + SIGTERM 守护）。
 3. **容器空闲内存读数偏低/偏高取决于宿主**：WSL 里容器 `memory_bytes` 读到的是
    cgroup `memory.current`（含页缓存），本容器空闲约 88–115 MB。评测以
    `--memory` 是否超限判定，口径正确，无需处理。仅记录。
 
 ## 设计文档待改项
 
-1. **`DESIGN.md`（或对应运维章节）补"容器部署与信号处理"**：说明容器 PID 1 需要
-   转发/处理 SIGTERM 才能优雅停机；`__main__.py` 增加 SIGTERM → 优雅关闭后，
-   Dockerfile 的 `CMD` 可改回 `python -m flowlens`。
+1. **`DESIGN.md`（或对应运维章节）补"容器部署与信号处理"**：说明容器 PID 1 是服务
+   进程、`__main__.py` 已处理 SIGTERM/SIGINT（B1b 已修，见"已定的决策"#14），
+   `docker stop` 干净退出；Dockerfile 的 `CMD` 为 `python -m flowlens`。
 2. **`DESIGN.md` 补调试接口契约**：`GET /debug/structure`（`FLOWLENS_DEBUG=1` 门控）
    的字段与语义（活跃环秒桶、线段树各层节点/构建中、`_plan` 拆分），供控制台
    "内部结构"视图对接。
-3. **`DESIGN.md` / 打包说明**：`pyproject.toml` 的 `packages` 需要包含
-   `flowlens.api`（见"未解决的问题"#1），否则非 editable 安装缺子包。
+3. **`DESIGN.md` / 打包说明**：`pyproject.toml` 的包列表用 `packages.find`
+   （`include = ["flowlens*"]`）自动发现全部子包（B1b 已修，见"已定的决策"#15）；
+   运行时依赖由 `constraints.txt` 固定版本（见"已定的决策"#13）。
 
 ## AI 使用记录
 

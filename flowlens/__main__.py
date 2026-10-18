@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 
 from aiohttp import web
 
@@ -55,16 +56,44 @@ def main() -> None:
         site = web.TCPSite(runner, args.host, args.port)
         await site.start()
         log.info("FlowLens 监听 %s:%d", args.host, args.port)
-        # 保持运行直到收到中断
+        # 优雅停机：等待一个停止事件，而不是 asyncio.Event().wait() 永远等下去。
+        # 在支持 loop.add_signal_handler 的平台（POSIX）上，为 SIGTERM 与 SIGINT
+        # 注册处理器，收到即置位停止事件；随后照常 runner.cleanup()，并记录收到的
+        # 信号（即退出原因）。这样 docker stop 的 SIGTERM 也能干净退出（退出码 0）。
+        #
+        # Windows 不支持 add_signal_handler（会抛 NotImplementedError），保留 Ctrl+C
+        # （KeyboardInterrupt）路径，不能因此报错——注册失败就退回那条路径。
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _on_signal(signum: int) -> None:
+            log.info("收到信号 %s，停止服务", signal.Signals(signum).name)
+            stop.set()
+
+        registered: list[signal.Signals] = []
+        if hasattr(signal, "SIGTERM"):
+            for _sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(_sig, _on_signal, _sig)
+                    registered.append(_sig)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    log.warning("无法注册信号处理器 %s（平台不支持或非主线程），"
+                                "Ctrl+C 仍可停止", signal.Signals(_sig).name)
         try:
-            await asyncio.Event().wait()
+            await stop.wait()
         finally:
+            for _sig in registered:
+                try:
+                    loop.remove_signal_handler(_sig)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    pass
             await runner.cleanup()
 
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        log.info("已停止")
+        # Windows：add_signal_handler 不可用，Ctrl+C 走这条路径
+        log.info("收到 Ctrl+C（KeyboardInterrupt），停止服务")
 
 
 if __name__ == "__main__":

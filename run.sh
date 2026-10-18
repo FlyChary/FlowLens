@@ -31,11 +31,13 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
 fi
 
 # 依赖变化或从未装过时安装。这里简单判断 marker 文件，缺失则安装。
+# 用 constraints.txt 固定运行时依赖到评测测试过的确切版本（aiohttp 等库不同版本的
+# 行为差异已两次影响本项目）。marker 的 mtime 判断同时覆盖 pyproject 与 constraints。
 MARKER="$VENV_DIR/.flowlens-deps"
-if [ ! -f "$MARKER" ] || [ "pyproject.toml" -nt "$MARKER" ]; then
-    echo "安装依赖（numpy、orjson、aiohttp）..."
+if [ ! -f "$MARKER" ] || [ "pyproject.toml" -nt "$MARKER" ] || [ "constraints.txt" -nt "$MARKER" ]; then
+    echo "安装依赖（numpy、orjson、aiohttp，固定版本）..."
     "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-    "$VENV_DIR/bin/pip" install .
+    "$VENV_DIR/bin/pip" install -c constraints.txt .
     : > "$MARKER"
 fi
 
