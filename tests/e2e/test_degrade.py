@@ -18,7 +18,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from flowlens.api.app import (create_app, degrade_controller_key,
                               ingest_service_key, query_service_key,
-                              raw_budget_key, stream_manager_key)
+                              raw_budget_key, stream_manager_key, ticker_key)
 from flowlens.config import Config
 from flowlens.dims import Dim
 from flowlens.engine import Engine
@@ -39,12 +39,38 @@ def _strict_json(text: str):
     return json.loads(text, parse_constant=_reject)
 
 
-def _serve(run, tick_period: float = 1000.0):
+def _fake_memory_reader() -> tuple[int, int | None]:
+    """测试用假内存读数（T8b）：恒 (0, None)，与真实内存解耦（见 test_api.py 同名函数）。"""
+    return 0, None
+
+
+class MemFeed:
+    """可控制内存读数的假 reader（T8b）：测试随时改 .mem / .limit，Ticker 每拍读到当前值。
+
+    用来端到端验证"内存读数 → Ticker → 降级控制器"这条链路：先喂低值，再喂超过
+    阈值的值，观察第 3、4 级的进入与退出（Windows 上 memstat 读不到真实内存，这条
+    链路本地一次都没真正跑过，见 docs/instructions/T8b.md 背景）。
+    """
+
+    def __init__(self, mem: int = 0, limit: int | None = None):
+        self.mem = mem
+        self.limit = limit
+        self.calls = 0
+
+    def __call__(self) -> tuple[int, int | None]:
+        self.calls += 1
+        return self.mem, self.limit
+
+
+def _serve(run, tick_period: float = 1000.0,
+           memory_reader=None):
     async def main():
         clock = FakeClock(NOW)
         engine = Engine(Config(), clock)
         app = create_app(engine, IngestService(engine, Admission()),
-                         QueryService(engine), tick_period=tick_period)
+                         QueryService(engine), tick_period=tick_period,
+                         memory_reader=memory_reader if memory_reader is not None
+                         else _fake_memory_reader)
         server = TestServer(app)
         client = TestClient(server)
         await server.start_server(auto_decompress=False, lingering_time=LINGERING_TIME)
@@ -314,3 +340,76 @@ def test_level4_reject_ingest_before_body_and_retry_ok():
         finally:
             ctrl.pin(None)
     _serve(run)
+
+
+# ---- 内存读数驱动：假 reader 控制读数，走 Ticker → 控制器的真实链路 ----
+# （不用 pin：验证的是"读数变化如何推动级别"，而不是固定级别后的动作）
+
+def test_memory_reader_drives_levels():
+    """内存读数超过/回落阈值时，Ticker 每拍喂给控制器，级别相应进入/退出。
+
+    链路：memory_reader() → Ticker._update_degrade → controller.update → 级别。
+    先喂 0.8×limit（第 3 级）、再喂 0.95×limit（第 4 级）、再喂 0（退出），
+    每一档都验证副作用（预算收紧/恢复、拒写）与 /healthz 的 degrade 字段。
+    """
+    feed = MemFeed(mem=0, limit=256 * MB)
+
+    async def run(client, engine, clock, app):
+        ctrl = app[degrade_controller_key]
+        raw_budget = app[raw_budget_key]
+        admission = app[ingest_service_key].admission
+        ticker = app[ticker_key]
+
+        # Ticker 确实在跑（周期 0.1s）：等到至少一拍
+        for _ in range(50):
+            if ticker.tick_count >= 1:
+                break
+            await asyncio.sleep(0.02)
+        assert ticker.tick_count >= 1
+        # 初始：内存 0 → 不降级
+        assert ctrl.level == 0
+
+        # 第 3 级：内存升到 0.8 × 256MB（> 0.78）
+        feed.mem = int(0.8 * 256 * MB)
+        for _ in range(50):
+            if ctrl.level >= 3:
+                break
+            await asyncio.sleep(0.02)
+        assert ctrl.level == 3, ctrl.level
+        assert admission.limit == 2 * MB and raw_budget.limit == 4 * MB
+        assert ctrl.tighten_budgets
+        assert not ctrl.reject_ingest
+
+        # 第 4 级：内存再升到 0.95 × 256MB（> 0.90）
+        feed.mem = int(0.95 * 256 * MB)
+        for _ in range(50):
+            if ctrl.level >= 4:
+                break
+            await asyncio.sleep(0.02)
+        assert ctrl.level == 4, ctrl.level
+        assert ctrl.reject_ingest
+        # 第 4 级拒写：读体之前 503
+        evs = [{"event_id": "e0", "user_id": "u", "url": "/x",
+                "ts": NOW - 1000, "bytes": 100}]
+        r = await _post(client, "/v1/ingest", data=json.dumps(evs).encode())
+        assert r.status == 503
+        assert r.headers.get("Retry-After") == "1"
+
+        # 退出：内存回落到 0 → 全部退出
+        feed.mem = 0
+        for _ in range(50):
+            if ctrl.level == 0:
+                break
+            await asyncio.sleep(0.02)
+        assert ctrl.level == 0, ctrl.level
+        assert admission.limit == 4 * MB and raw_budget.limit == 8 * MB
+        # 退出后写入恢复
+        r = await _post(client, "/v1/ingest", data=json.dumps(evs).encode())
+        assert r.status == 202
+        # 内存读数确实来自 feed（被 Ticker 调过、/healthz 与 degrade 字段一致）
+        assert feed.calls > 0
+        r = await _get(client, "/healthz")
+        hz = await r.json()
+        assert hz["degrade"]["memory_bytes"] == 0
+        assert hz["memory_bytes"] == 0  # 来自 memory_reader，不是 memstat 真实值
+    _serve(run, tick_period=0.1, memory_reader=feed)

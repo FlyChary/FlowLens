@@ -31,6 +31,7 @@ _read_raw_body 里 try_reserve、finally release，预算借还是单一 owner�
 
 import asyncio
 import logging
+from typing import Callable
 
 import orjson
 from aiohttp import hdrs, web
@@ -71,10 +72,18 @@ ticker_key = web.AppKey("ticker", Ticker)
 ticker_task_key = web.AppKey("ticker_task", asyncio.Task)
 stream_manager_key = web.AppKey("stream_manager", StreamManager)
 degrade_controller_key = web.AppKey("degrade_controller", DegradeController)
+memory_reader_key = web.AppKey("memory_reader", Callable)
+
+
+def _default_memory_reader() -> tuple[int, int | None]:
+    """默认内存读数：memstat（cgroup / statm / Windows WorkingSet）。"""
+    return memory_bytes(), memory_limit_bytes()
 
 
 def create_app(engine: Engine, ingest_service: IngestService,
-               query_service: QueryService, *, tick_period: float = 1.0) -> web.Application:
+               query_service: QueryService, *, tick_period: float = 1.0,
+               memory_reader: Callable[[], tuple[int, int | None]] | None = None
+               ) -> web.Application:
     # client_max_size=0（不限制）：4 MB 上限由 _read_raw_body 自己执行，
     # 否则 aiohttp 会在 handler 之前以自己的 413 拒绝，RawBudget 预留就没机会了
     app = web.Application(client_max_size=0, middlewares=[_error_middleware])
@@ -89,6 +98,10 @@ def create_app(engine: Engine, ingest_service: IngestService,
     engine.controller = controller
     query_service.controller = controller
     app[degrade_controller_key] = controller
+    # 内存读数（T8b）：Ticker 喂控制器的值与 /healthz、/v1/stats 的 memory_bytes /
+    # memory_limit_bytes 都统一从这一个 reader 读。默认是 memstat 的两个函数；
+    # 测试注入假读数（如恒 (0, None)），让测试与运行环境的真实内存解耦。
+    app[memory_reader_key] = memory_reader if memory_reader is not None else _default_memory_reader
     # 级别变化副作用（收紧/恢复预算、进入第 3 级清缓存）：只在实际变化时回调一次
     controller.on_change = _make_degrade_change_hook(app)
     # Expect: 100-continue 的超大请求在这一步拒绝，客户端不会发送请求体（见 _ingest_expect）
@@ -98,7 +111,8 @@ def create_app(engine: Engine, ingest_service: IngestService,
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/v1/topk/stream", _stream)
     ticker = Ticker(engine, period=tick_period, controller=controller,
-                    admission=ingest_service.admission)
+                    admission=ingest_service.admission,
+                    memory_reader=app[memory_reader_key])
     app[ticker_key] = ticker
     # SSE 订阅管理器：参数相同的订阅者共用计算，组数/连接数/计算频率都有上限（T7）
     manager = StreamManager(
@@ -303,6 +317,7 @@ async def _stats(request: web.Request) -> web.Response:
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms, need_k=False, need_by=False)
     s = await request.app[query_service_key].stats(qp.window_ms)
+    mem_bytes, _ = request.app[memory_reader_key]()
     return _json_response({
         "window_ms": s.window_ms,
         "from": s.from_ms,
@@ -310,7 +325,7 @@ async def _stats(request: web.Request) -> web.Response:
         "approx_distinct_users": int(round(s.distinct_users)),
         # 区间内没有数据时 p95 是 NaN：orjson 默认输出 null（不出现 NaN 字面量）
         "approx_p95_bytes": _fmt_num(s.p95_bytes) if s.p95_bytes == s.p95_bytes else None,
-        "memory_bytes": memory_bytes(),
+        "memory_bytes": mem_bytes,
         "degraded": ctrl.degraded,
     })
 
@@ -320,11 +335,12 @@ async def _healthz(request: web.Request) -> web.Response:
     t = request.app[ticker_key]
     mgr = request.app[stream_manager_key]
     ctrl = request.app[degrade_controller_key]
+    mem_bytes, mem_limit = request.app[memory_reader_key]()
     return _json_response({
         "ok": True,
         "events_ingested": c.events_ingested,
-        "memory_bytes": memory_bytes(),
-        "memory_limit_bytes": memory_limit_bytes(),  # 无上限时为 null
+        "memory_bytes": mem_bytes,
+        "memory_limit_bytes": mem_limit,  # 无上限时为 null
         "degraded": ctrl.degraded,
         "degrade": ctrl.status(),
         "deduped": c.deduped,

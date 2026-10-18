@@ -16,11 +16,21 @@
 | T6 HTTP 接口 | 已审查通过 |
 | T7 SSE + T7b 修正 | 已审查通过 |
 | T8 过载降级 | 已完成，等审查 |
+| T8b 测试与运行环境解耦、Linux 验证 | 已完成，等审查 |
 | T9 驻留表、T10 工具与实验、T11 性能 | 未开始 |
 
 ## 进行中
 
-T8 过载降级已完成，汇报后停下等审查。T8 内容：
+T8b 已完成，汇报后停下等审查。T8b 内容（按 docs/instructions/T8b.md）：
+1. **测试与真实内存解耦**（`create_app` 加 `memory_reader` 参数）：`create_app(..., memory_reader=None)`，默认 `memstat`；Ticker 喂控制器的值、`/healthz` 与 `/v1/stats` 的 `memory_bytes`/`memory_limit_bytes` 统一从这一个 reader 读（挂在 `app[memory_reader_key]`）。`tests/e2e` 所有创建应用处传恒 `(0, None)` 的假读数（`_fake_memory_reader`）；新增 `tests/e2e/test_degrade.py::test_memory_reader_drives_levels` 用可控的 `MemFeed` 走"读数→Ticker→控制器"真实链路，端到端验证第 3/4 级的进入与退出。这是 28 个 Linux 失败的直接修复（见下）。
+2. **查清每个测试后内存增长 ~45 MB 的原因**：tracemalloc 逐测快照定位到**每个 e2e 测试的 Engine 没被释放**（去重 Bloom 33.5 + CMS 19.7 + HLL 1.1 ≈ 55 MB/个，逐测累积）。根因是 **aiohttp 的全局中间件缓存** `_cached_build_middleware`（`web_app.py` 的 `lru_cache(maxsize=1024)`）以 `(handler, match_info.apps)` 为键、`apps` 是**含 Application 的元组**，每个 `create_app` 都把那个 Application（连带 Engine）用强引用挂进进程级缓存。修复：`tests/e2e/conftest.py` 加 autouse fixture，每个 e2e 测试结束后 `cache_clear()`。验证：修复前 6 个测试 RSS 55→358 MB（+54.6 MB/测）、tracemalloc 存活分配 +54.6 MB/测；修复后 RSS 平台化在 ~121 MB、存活分配净增 ≈0 MB/测。生产单实例不受影响（只建一个 app、缓存就一条）。
+3. **Windows 内存读数**（`memstat.py`）：cgroup 与 statm 全缺时，Windows 用 ctypes 调 psapi 的 `GetProcessMemoryInfo` 读 `WorkingSetSize`（结构体延迟定义、缓存；`GetCurrentProcess` 声明 `restype=c_void_p`、`GetProcessMemoryInfo` 声明 `argtypes` 否则伪句柄被截断/溢出）。任何异常吞掉返回 0。补 `tests/test_memstat.py` 两条（跨平台 mock + 仅 Windows 的真实读数，非 Windows 跳过）。**踩坑**：初版 `GetCurrentProcess` 不声明 restype，ctypes 把 64 位伪句柄 `0xFFFF…FF` 截断成 32 位有符号 `-1`，`GetProcessMemoryInfo` 静默失败返回 0；声明 `restype=c_void_p` 后才拿到真实值。
+4. **小修**：(a) `engine.ingest` 采样时不重算 event_id 哈希——去重时已算一次（`h_id_all`），采样按下标 `keep` 复用（`h_id = h_id_all[keep]`），这段只在降级时跑、降级因 CPU 紧张，省一次哈希；正常路径（w=1）语义不变。(b) 第 3 级把在途上限从 4 MB 降到 2 MB，这期间解压后 2~4 MB 的请求收到 503 而非 413（有意、暂时性），错误信息说明"降级期间单个请求的上限暂时为 2 MB"，记入 DESIGN_TODO #15。
+5. **每个任务必须在 Linux 上验证**：CLAUDE.md"每个任务结束时"加一条——除 Windows 外，还必须在 WSL 中跑全量 `pytest -q`（`/mnt/d/dhy/code/flowlens`、`/home/user/flowlens-venv`），两平台结果分别汇报。
+
+**背景（审查时在 Linux 实测）**：全量 pytest 在 Linux 上 28 个失败、Windows 全过。根因：Windows 上 `memstat.memory_bytes()` 恒返回 0，降级控制器从未因内存触发第 3/4 级（相关逻辑本地一次都没跑过）；Linux 上读到 pytest 进程的真实内存，逐测累积到第 4 个测试约 239 MB，超 256 MB × 0.9 → 服务进第 4 级、之后所有写入 503。第 1 项（memory_reader 注入）直接解耦；第 2 项（conftest 清 aiohttp 缓存）解决累积本身；两者叠加后 WSL 全量 249 passed, 1 skipped。
+
+T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 1. **降级控制器**（新建 `flowlens/degrade.py`）：纯逻辑、无 aiohttp 依赖。四级阈值滞回（每级独立活跃状态，当前级 = 所有活跃级中最高）；只读属性 level/degraded/sample_weight/replay_paused/sse_slowdown/tighten_budgets/reject_ingest + 最近输入值；级别变化记一行日志并触发 `on_change` 回调（副作用由 app 层注入，保持控制器纯逻辑）；`pin()` 供测试固定级别。
 2. **控制器驱动**：挂在 app 上（`web.AppKey`），**与 engine、QueryService 共享同一实例**（create_app 装配）；由 **Ticker 每拍结束后调一次 update**（喂 occupancy/tick 延迟/内存读数）——单写者、每秒一次正好对应"每秒更新一次"，且读到的是本拍刚产出的量，不用另起每秒任务。
 3. **第 1 级**：`QueryService.topk/stats` 的回放查询抛 Overloaded(503+Retry-After)（判断在 QueryService 内部，不写进 handler）；SSE 不暂停、只降频（组的 `min_recompute` 1s→5s，生产者每帧运行时读取）。
@@ -75,24 +85,28 @@ T8 过载降级已完成，汇报后停下等审查。T8 内容：
 - 第 2 级采样按 **event_id 的哈希**做确定性取舍（`h_id % w == 0` 保留，比例 1/w，与时间无关）：同一事件无论重试多少次、何时重试，取舍都一致，且与"这次是不是重复"解耦。采样只作用于两维 Top-K 名单与 url 维 DDSketch；HLL（user 维）与 event_id 去重始终全量。`engine.ingest` 的 `weight` 参数缺省读控制器 sample_weight、显式传参优先（基准/测试不受影响）；weight==1 走与 T7b 结构相同的写入路径，正常路径结果完全一致。
 - SSE 在降级时**只降频、不暂停**：生产者每帧运行时读 `recompute_interval_ms()`（第 1 级 1s→5s），帧照常按 interval 推送、复用结果；HTTP 回放查询才在第 1 级暂停（503）。SSE 计算走 `topk(..., from_stream=True)` 绕过"暂停回放"判断。
 - 采样期间（sample_weight > 1）Top-K 的上下界**不再是严格保证**（采样方差可能让加权估计偏离真实次数）；响应带 `sample_rate = 1/sample_weight`，/healthz 与 /v1/topk 的 `degraded` 为真实状态。
+- 测试与运行环境的真实内存解耦（T8b）：`create_app` 增加 `memory_reader: Callable[[], tuple[int, int|None]]` 参数，默认 memstat 的两个函数；Ticker 喂降级控制器的内存值、`/healthz` 与 `/v1/stats` 的 `memory_bytes`/`memory_limit_bytes` **统一从这一个 reader 读**（挂在 `app[memory_reader_key]`，并传给 Ticker）。`tests/e2e` 所有创建应用的地方传恒 `(0, None)` 的假读数；需要验证内存触发降级的测试传可控的假读数（`MemFeed`，测试随时改 `.mem`/`.limit`，Ticker 每拍读当前值）。原因：不注入时测试会读到 pytest 进程的真实内存，Linux 上逐测累积把服务打进第 4 级、所有写入 503（28 个 e2e 失败）。生产 `__main__` 不传，走默认 memstat。
+- 每个任务结束都必须在 WSL（Linux）跑全量 `pytest -q`（T8b 起）：评测在 Linux 上进行，Windows 与 Linux 两边结果都必须全过、汇报时分别给出。WSL 项目路径 `/mnt/d/dhy/code/flowlens`、用 `/home/user/flowlens-venv`（T6c 建，缺依赖先 `pip install -e ".[dev]"`）。此条已写入 CLAUDE.md"每个任务结束时"。
+- Windows 内存读数（T8b）：memstat 在 cgroup 与 statm 都读不到时（纯 Windows 开发机），用 ctypes 调 psapi 的 `GetProcessMemoryInfo` 读本进程 `WorkingSetSize`，让本地 `/healthz` 显示真实值、内存相关的降级逻辑在本地也能真正触发（此前 Windows 上 `memory_bytes()` 恒 0，第 3/4 级逻辑本地一次没跑过）。任何异常吞掉返回 0、不抛。`GetCurrentProcess` 必须声明 `restype=c_void_p`、`GetProcessMemoryInfo` 必须声明 `argtypes`，否则 64 位伪句柄 `0xFFFF…FF` 被截断/溢出、调用静默失败返回 0。
+- e2e 测试后清 aiohttp 全局中间件缓存（T8b，`tests/e2e/conftest.py` autouse fixture）：aiohttp 的 `_cached_build_middleware`（`web_app.py`，`lru_cache(maxsize=1024)`）以 `(handler, match_info.apps)` 为键、`apps` 是含 `Application` 的元组，每个 `create_app` 都把那个 Application（连带 Engine ≈55 MB）用**强引用**挂进这个进程级缓存。全量 pytest 在同一进程逐个跑 e2e（各自 create_app）时逐测累积 ~55 MB（到第 4 个就超 256 MB×0.9，把控制器打进第 4 级）。fixture 在每个 e2e 测试结束后 `cache_clear()`。生产单实例不受影响（只建一个 app、缓存就一条）。
 
 ## 基准数据
 
-各任务结束时重跑全部测试与性能基准并追加一行（以后每个任务都一样）。每项各跑 3 次取中位（单次波动大）。"上一版"为 T6c 前后对照；"T7b"为提交 `d2d5c8e`；"T8"为本次。
+各任务结束时重跑全部测试与性能基准并追加一列（以后每个任务都一样）。每项各跑 3 次取中位（单次波动大）。"上一版"为 T6c 前后对照；"T7b"为提交 `d2d5c8e`；"T8"、"T8b"分别为对应任务结束时的本机（T8b 机器）中位数。
 
-| 项目 | 上一版（T6c 前后） | T7b | T8（本次，中位数） |
-|---|---|---|---|
-| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected | 247 passed, 5 deselected |
-| pytest -q -m slow | 5 passed | 5 passed | 5 passed |
-| bench_core 长尾 | 约 20 万～30 万 事件/秒（波动大） | 约 30.5 万/秒（波动上沿） | 约 22.6 万/秒（218/236/226） |
-| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 | 约 2.22 μs/条（2.15/2.22/2.22） |
-| bench_engine 每批 1000 条合计 | 约 6.3 μs/条 | 约 4.72 μs/条 | 约 6.10 μs/条（5.84/6.10/8.27） |
-| bench_engine 每批 5000 条合计 | 约 4.9 μs/条 | 约 4.20 μs/条 | 约 5.39 μs/条（4.65/5.39/6.64） |
-| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms | 中位约 23 ms，最大约 44 ms（一次 93 s 为调度停顿） |
-| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms | 中位约 58 ms，最大约 82 ms |
-| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms | 中位约 105 ms，最大约 135 ms |
+| 项目 | 上一版（T6c 前后） | T7b | T8（中位数） | T8b（本次，Windows 中位数） |
+|---|---|---|---|---|
+| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected | 247 passed, 5 deselected | 250 passed, 5 deselected（WSL：249 passed, 1 skipped, 5 deselected） |
+| pytest -q -m slow | 5 passed | 5 passed | 5 passed | 5 passed（Windows 与 WSL 均 5 passed） |
+| bench_core 长尾 | 约 20 万～30 万 事件/秒（波动大） | 约 30.5 万/秒（波动上沿） | 约 22.6 万/秒（218/236/226） | 约 18.5 万/秒（197/185/185） |
+| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 | 约 2.22 μs/条（2.15/2.22/2.22） | 约 1.87 μs/条（1.87/1.92/1.76） |
+| bench_engine 每批 1000 条合计 | 约 6.3 μs/条 | 约 4.72 μs/条 | 约 6.10 μs/条（5.84/6.10/8.27） | 约 5.84 μs/条（5.84/5.85/5.57） |
+| bench_engine 每批 5000 条合计 | 约 4.9 μs/条 | 约 4.20 μs/条 | 约 5.39 μs/条（4.65/5.39/6.64） | 约 4.65 μs/条（4.58/4.79/4.65） |
+| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms | 中位约 23 ms，最大约 44 ms（一次 93 s 为调度停顿） | 中位约 25 ms（25.9/25.0/22.5），最大约 73 ms |
+| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms | 中位约 58 ms，最大约 82 ms | 中位约 52 ms（52.3/52.3/51.5），最大约 76 ms |
+| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms | 中位约 105 ms，最大约 135 ms | 中位约 116 ms（116/118/106），最大约 187 ms |
 
-**性能对比必须同机对照**：本机（本次运行）整体比 T7b 记录时那台机器**慢约 60%**——用同一份原始代码在本机重跑 `bench_model` 得 2.19 μs/条（T7b 记录 1.36），`bench_engine` 每批 1000 合计原始代码也是 ~5.9–6.3 μs/条。因此 T8 列相对 T7b 列的数值变大**全部是本机更慢，不是 T8 引入**。**同机对照（原始代码 vs T8，各 5 次中位）**：`engine.ingest` 每批 1000 条 3.44 → 3.29 μs、每批 5000 条 2.74 → 2.57 μs（T8 持平或略快）；`refresh_snapshot` 53.9 → 57.8 ms（快照路径 T8 未触及，差异在本机波动范围内）。结论：**T8 未使正常路径（sample_weight=1）变慢**。
+**性能对比必须同机对照**：T8b 列在本机（本次运行）采集，与 T8 列同一台机器，故可直接对比。T8b 相对 T8：`bench_core 长尾` 22.6→18.5 万/秒、`完整 tick` 105→116 ms、`单次定稿` 23→25 ms——**T8b 未触及任何热路径**（改动是内存读数来源、`create_app` 加一个 reader 参数、`ingest` 采样分支复用已算好的 event_id 哈希、`ingest.py` 加一条错误信息），正常路径（sample_weight=1）的写入/快照/定稿代码与 T8 完全相同，数值差异在本机单次波动范围内（长尾吞吐波动历来很大，见"上一版"列 20 万～30 万）。`bench_model` 1.87 vs T8 的 2.22、每批 1000/5000 合计 5.84/4.65 vs T8 的 6.10/5.39，T8b 持平或略快。**结论：T8b 未使任何路径变慢**。
 
 ## 未解决的问题
 
@@ -102,7 +116,8 @@ T8 过载降级已完成，汇报后停下等审查。T8 内容：
 4. T9 的字符串驻留表与冻结的 segtree.py 冲突，开始 T9 前由用户决定做法。
 5. ~~`memory_bytes` 在 WSL 里读数虚高~~（T7 前置小修已解决）：memstat 现在只在"当前进程所在 cgroup 设了内存上限"时才用 cgroup 读数，否则回退进程常驻集（statm）。WSL 的 cgroup 无上限（整个发行版共享）→ 回退 statm，读数不再虚高；评测容器 --memory 启动带上限 → 仍用 cgroup，读数准确。
 6. SSE 默认 60 秒窗口的帧目前走回放（collect_parts + top_k），没有复用刷新快照。是否改为复用快照，等 T10 压测看过 CPU 占用后在 T11 决定。
+7. ~~全量 pytest 逐测内存增长 ~45 MB（Linux 上把服务打进第 4 级）~~（T8b 已定位并解决）：根因是 **aiohttp 的全局中间件缓存** `_cached_build_middleware`（`web_app.py`，`lru_cache(maxsize=1024)`）以 `(handler, match_info.apps)` 为键、`apps` 是含 `Application` 的元组，把每个 e2e 测试的 Application（连带 Engine ≈55 MB）用强引用挂进进程级缓存，逐测累积（实测 +54.6 MB/测、6 个测试 55→358 MB）。tracemalloc 确认是**对象未释放**（非分配器未退还）。修复：`tests/e2e/conftest.py` autouse fixture 每测后 `cache_clear()`（修复后 RSS 平台化 ~121 MB、存活分配净增 ≈0）。**生产单实例不受影响**（只建一个 app、缓存就一条、长驻运行）。另：T8b 顺带修复了"Windows 上 `memory_bytes()` 恒 0"（改用 psapi WorkingSetSize），此前第 3/4 级内存降级逻辑在本地从未真正执行过。
 
 ## 下一步
 
-T8 汇报后停下等待审查；审查通过后按顺序执行：T10 工具与实验（含端到端压测，粗测吞吐与查询 p99 记入"基准数据"）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。
+T8b 汇报后停下等待审查；审查通过后按顺序执行：T10 工具与实验（含端到端压测，粗测吞吐与查询 p99 记入"基准数据"）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**以后每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。

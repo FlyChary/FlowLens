@@ -207,8 +207,12 @@ class Engine:
         if n:
             a_idx = np.flatnonzero(accept)
             a_ts = ts[a_idx]
-            dup, active = self.bloom.check_and_set(
-                key_hashes([batch.ids[i] for i in a_idx.tolist()]), a_ts)
+            # event_id 的哈希在去重时算一次；采样（w>1）还要按它取模判取舍，直接按下标
+            # 复用（见下面 h_id = h_id_all[keep]），不再重算——这段只在降级时跑，而
+            # 降级本身就因 CPU 紧张，重算浪费。同一批里同一 event_id 两次哈希结果相同
+            # （hash 是字符串的纯函数），复用不改变确定性采样语义。
+            h_id_all = key_hashes([batch.ids[i] for i in a_idx.tolist()])
+            dup, active = self.bloom.check_and_set(h_id_all, a_ts)
             # 干净划分：写进去的 = ~dup & active；没写进去的里，active 的算重复、
             # active 为 False 的（正常不会出现）算迟到
             deduped = int((dup & active).sum())
@@ -222,10 +226,10 @@ class Engine:
                 # dtype=object：定长字符串数组会把短串补 '\x00'，既改变哈希值，又比 object 慢约 7 倍
                 users = np.asarray(batch.users, dtype=object)[k_idx]
                 urls = np.asarray(batch.urls, dtype=object)[k_idx]
-                # 采样才需要 event_id 的哈希：按它取模判采样（确定性、与时间无关）——
-                # 同一事件（同 event_id）无论重试多少次、何时重试，取舍都一致；与
-                # "这次是不是重复"解耦，重试语义稳定。
-                h_id = key_hashes([batch.ids[i] for i in k_idx.tolist()]) if w > 1 else None
+                # 采样按 event_id 哈希取模判取舍（确定性、与时间无关）：同一事件无论
+                # 重试多少次、何时重试，取舍都一致；与"这次是不是重复"解耦。哈希直接
+                # 复用去重时算好的 h_id_all（按下标 keep 取子集），不再重算。
+                h_id = h_id_all[keep] if w > 1 else None
                 # 按秒分组：一次 argsort 排好秒号后按边界切片，而不是对每一秒做整批布尔掩码
                 order = np.argsort(a_ts2 // 1000, kind="stable")
                 a_ts2 = a_ts2[order]

@@ -33,6 +33,16 @@ NOW = 1_735_689_600_000
 LINGERING_TIME = 1
 
 
+def _fake_memory_reader() -> tuple[int, int | None]:
+    """测试用假内存读数（T8b）：恒 (0, None)，与运行环境的真实内存解耦。
+
+    不注入时 /healthz、/v1/stats 与降级控制器会读到测试进程（pytest）的真实内存，
+    Linux 上测试逐个跑会累积到超过 256 MB × 0.9，把服务打进第 4 级（写入全 503）。
+    需要验证内存触发降级的测试单独传可控的假读数（见 test_degrade.py）。
+    """
+    return 0, None
+
+
 def _gzip(data: bytes) -> bytes:
     c = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
     return c.compress(data) + c.flush()
@@ -48,7 +58,8 @@ def _serve(run, tick_period: float = 1000.0):
         clock = FakeClock(NOW)
         engine = Engine(Config(), clock)
         app = create_app(engine, IngestService(engine, Admission()),
-                         QueryService(engine), tick_period=tick_period)
+                         QueryService(engine), tick_period=tick_period,
+                         memory_reader=_fake_memory_reader)
         server = TestServer(app)
         client = TestClient(server)
         # TestClient.start_server 不转发参数，直接调 TestServer.start_server
@@ -111,9 +122,9 @@ def test_healthz():
         for f in ("memory_bytes", "memory_limit_bytes", "degraded", "deduped",
                   "late", "invalid", "tick_errors", "last_tick_ms", "sse"):
             assert f in body, f"healthz 缺字段 {f}"
-        assert isinstance(body["memory_bytes"], int)
-        # 没有内存上限时（如 Windows 开发机）memory_limit_bytes 为 null
-        assert body["memory_limit_bytes"] is None or isinstance(body["memory_limit_bytes"], int)
+        # 测试注入假内存读数 (0, None)（见 _fake_memory_reader）
+        assert body["memory_bytes"] == 0
+        assert body["memory_limit_bytes"] is None
         assert set(body["sse"]) == {"groups", "subscribers", "dropped_frames"}
         assert body["sse"]["groups"] == 0 and body["sse"]["subscribers"] == 0
         assert body["tick_errors"] == 0
@@ -204,7 +215,8 @@ def test_content_length_over_4mb_rejected_without_reading():
             return await real(body, enc)
 
         svc.ingest = spy
-        app = create_app(engine, svc, QueryService(engine), tick_period=1000.0)
+        app = create_app(engine, svc, QueryService(engine), tick_period=1000.0,
+                         memory_reader=_fake_memory_reader)
         server = TestServer(app)
         client = TestClient(server)
         await server.start_server(auto_decompress=False, lingering_time=LINGERING_TIME)
@@ -526,7 +538,8 @@ def test_ticker_stops_cleanly_on_shutdown():
         clock = FakeClock(NOW)
         engine = Engine(Config(), clock)
         app = create_app(engine, IngestService(engine, Admission()),
-                         QueryService(engine), tick_period=0.05)
+                         QueryService(engine), tick_period=0.05,
+                         memory_reader=_fake_memory_reader)
         server = TestServer(app)
         client = TestClient(server)
         await server.start_server(auto_decompress=False, lingering_time=LINGERING_TIME)

@@ -319,3 +319,33 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 **八、测试**：新增 `tests/test_degrade.py` 16 条（每级进入/退出、滞回区间内不变、多条件取最高级、sample_weight 随 occupancy/级别、内存上限 None 按 256 MB、阈值随上限比例缩放、日志、pin、on_change 只在实际变化时触发、status 字段）；新增 `tests/e2e/test_degrade.py` 5 条（第 1 级回放 503 + 默认查询照常 + SSE 降频 5s 仍推帧、第 2 级采样无偏 + HLL 全量 + 两独立引擎取舍一致 + 响应/SSE 帧带 degraded 与 sample_rate、第 3 级预算收紧与恢复 + 新订阅 503 + 已有订阅保持 + 两缓存清空、第 4 级拒写 + 重试不判重）。
 
 **验证**：`pytest -q` 247 passed, 5 deselected、无警告；`pytest -q -m slow` 5 passed（未动 bounds/heavy，输出不变）；bench_engine 正常路径同机对照持平或略快（见上）。本地 `python -m flowlens` 启动正常。
+
+### 2026-10-18 T8b 测试与运行环境解耦、Linux 上验证（api/app.py、ticker.py、engine.py、ingest.py、memstat.py、tests/e2e/*、tests/test_memstat.py、tests/e2e/conftest.py、CLAUDE.md、docs/*）
+
+**背景与教训（务必记住）**：审查时在 Linux 上实测，全量 pytest 有 **28 个测试失败、Windows 全过**。根因是**两个叠加的本地盲区**：
+1. **Windows 上 `memstat.memory_bytes()` 恒返回 0**（没有 cgroup、没有 `/proc`），降级控制器从未因内存触发第 3、4 级——**内存相关的降级逻辑在本地一次都没有真正执行过**，直到 Linux 才暴露。
+2. Linux 上读到的是 pytest 进程的真实内存，全量测试在同一进程逐个跑、每个 e2e 测试后常驻内存增长 ~45 MB（到第 4 个约 239 MB），超过 256 MB × 0.9 → 服务进第 4 级、之后**所有写入 503** → 28 个 e2e 失败。
+**教训**：测试若依赖运行环境的真实状态（内存、时钟），在不同平台会得到不同行为。凡是要在"评测平台（Linux）"上跑的逻辑，必须在本地（Windows）也能被真正触发到——要么注入假状态、要么让本地读数真实，二者至少占一个。
+
+**一、测试与真实内存解耦（`create_app` 加 `memory_reader`）**：`create_app(..., memory_reader=None)`，默认 `_default_memory_reader`（`memstat.memory_bytes()`/`memory_limit_bytes()`）；挂在 `app[memory_reader_key]` 并传给 Ticker。**Ticker 喂控制器的内存值、`/healthz` 与 `/v1/stats` 的 `memory_bytes`/`memory_limit_bytes` 统一从这一个 reader 读**（不再各处直接调 memstat）。`tests/e2e` 所有 `create_app` 传恒 `(0, None)` 的 `_fake_memory_reader`；新增 `tests/e2e/test_degrade.py::test_memory_reader_drives_levels` 用可控的 `MemFeed`（`.mem`/`.limit` 测试随时改、Ticker 每拍读当前值）走"读数→Ticker→控制器"真实链路，端到端验证第 3/4 级进入与退出（tick_period=0.1，不等墙钟 1 秒）。这是 28 个失败的直接修复。
+
+**二、查清每个测试后内存增长 ~45 MB 的原因（关键调查）**：WSL 上用 tracemalloc 逐测拍快照 + `resource.getrusage` 看 RSS。发现每测净增**恰是一个 Engine**（去重 Bloom 33.5 MB + 各维度 CMS 19.7 MB + HLL 1.1 MB ≈ **54.6 MB**），且**逐测累积**不回落。因 tracemalloc 只统计"当前存活"分配（释放会减），存活分配还在涨 → **是对象没被释放，不是分配器/OS 未退还**。用 weakref + `gc.get_referrers` 逐层追：Engine 被 `Application` 引用，而 `Application` 被 **aiohttp 的全局中间件缓存** `_cached_build_middleware`（`web_app.py:84`，`lru_cache(maxsize=1024)(_build_middlewares)`）引用——其缓存键是 `(handler, match_info.apps)`，`apps` 是**含 Application 的元组**。所以每个 `create_app` 都把那个 Application（连带 Engine）用**强引用**挂进进程级缓存。`cache_clear()` 后 weakref 立即失效（`alive=True→False`、条目 1→0），坐实。
+- **属于"对象未释放"**，按指令在非冻结代码修复：`tests/e2e/conftest.py` 加 autouse fixture，每个 e2e 测试结束后 `aiohttp.web_app._cached_build_middleware.cache_clear()` + `gc.collect()`（用 `getattr` 守卫，aiohttp 改名不至于全挂）。
+- **验证**：修复前 6 个 e2e 测试 RSS 55→358 MB（+54.6 MB/测）；修复后 RSS 平台化在 ~121 MB、tracemalloc 存活分配净增 ≈0 MB/测。**生产单实例不受影响**（只建一个 app、缓存就一条、长驻运行，清缓存只针对"一个进程反复建/拆 app"的测试场景）。
+- **与 T9 长时间内存测试相关**：单实例长时间运行**不会**因此持续增长（缓存只按 app 数增长，生产就一个 app）；若 T9 在单实例下测出持续增长，那是别的来源（例如未释放的在途请求、SSE 组），与本条无关。
+
+**三、Windows 内存读数（`memstat.py`）**：cgroup 与 statm 都读不到时（纯 Windows），ctypes 调 psapi 的 `GetProcessMemoryInfo` 读本进程 `WorkingSetSize`，让本地 `/healthz` 显示真实值、内存降级逻辑本地能真正触发。`PROCESS_MEMORY_COUNTERS` 结构体**延迟定义并缓存**（`ctypes.windll` 只存在于 Windows，顶层定义会让非 Windows 的 import 失败）；`GetCurrentProcess` 声明 `restype=c_void_p`、`GetProcessMemoryInfo` 声明 `argtypes`。**踩坑**：初版不声明 `restype`，ctypes 把 64 位伪句柄 `0xFFFF…FF` 截断成 32 位有符号 `-1`，`GetProcessMemoryInfo` 静默失败返回 0；再声明 `argtypes` 才解决（否则传参 `OverflowError`）。任何异常吞掉返回 0、绝不抛。补 `tests/test_memstat.py`：跨平台 mock `_windows_working_set` 验证"全缺→退回该读数"的调用链 + 仅 Windows 的真实读数（`skipif sys.platform != "win32"`）。另把原来断言"全缺返回 0"的 2 条测试改成平台感知（Windows 上现在返回真实值 > 0，原断言锁死了"Windows 恒 0"的旧 bug）。
+
+**四、小修**：(1) `engine.ingest` 采样（w>1）不再重算 event_id 哈希——去重时已算一次（`h_id_all`），采样直接按下标 `keep` 复用（`h_id = h_id_all[keep]`）。这段只在降级时跑、降级本就因 CPU 紧张，省一次 `key_hashes`；同一批里同一 event_id 两次哈希结果相同（hash 是字符串纯函数），复用不改变确定性采样语义；w=1 正常路径不变。(2) 第 3 级把在途上限 4→2 MB，这期间解压后 2~4 MB 的请求在预留阶段放不下、收 503（非 413），`ingest.py` 在 `admission.limit < MAX_PENDING_BYTES` 时把 503 信息改成"降级期间单个请求的上限暂时为 2 MB，请稍后重试"（有意、暂时性），记入 DESIGN_TODO #15。
+
+**五、每个任务必须在 Linux 上验证**：CLAUDE.md"每个任务结束时"加一条——除 Windows 外必须在 WSL 跑全量 `pytest -q`（`/mnt/d/dhy/code/flowlens`、`/home/user/flowlens-venv`，缺依赖先 `pip install -e ".[dev]"`），两平台结果分别汇报。
+
+**与指令不一致 / 说明**：无实质偏离。指令第二节只要求"查清原因 + 属于前者则修、属于后者则说明"；本项**属于前者（对象未释放）且根因在 aiohttp（第三方库）而非 flowlens 代码**——无法直接改 aiohttp 的 lru_cache（会改依赖），故修复落在 flowlens 拥有的测试侧（`tests/e2e/conftest.py`），这与"在非冻结代码中修复"一致。指令未指定假读数注入点，按"create_app 加参数、默认 memstat"实现。
+
+**测试**：新增 3 条（e2e `test_memory_reader_drives_levels` 走真实 Ticker 链路、memstat 跨平台 mock 全缺退回、memstat 仅 Windows 真实读数）；改 2 条 memstat 测试为平台感知；e2e 全部 `create_app` 注入假内存读数。
+
+**验证（两平台均全过）**：
+- Windows：`pytest -q` **250 passed**, 5 deselected；`pytest -q -m slow` **5 passed**。
+- WSL（Python 3.14）：`pytest -q` **249 passed, 1 skipped**（1 skip=仅 Windows 的 memstat 真实读数测试）, 5 deselected；`pytest -q -m slow` **5 passed**。
+- 基准（Windows，每项 3 次中位，与 T8 同机）：bench_core 长尾 ~18.5 万/s（197/185/185）、bench_model ~1.87 μs/条、bench_engine 每批 1000/5000 合计 ~5.84/~4.65 μs/条、单次定稿 ~25 ms、满载快照 ~52 ms、完整 tick ~116 ms。**T8b 未触及任何热路径**，正常路径与 T8 代码相同，差异在本机波动范围内；bench_model 与每批合计相对 T8 持平或略快。
+- 本地 `python -m flowlens` 的 `/healthz` 现在 `memory_bytes` 是真实 WorkingSetSize（约 15 MB），不再是 0。

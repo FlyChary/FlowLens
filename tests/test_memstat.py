@@ -1,6 +1,9 @@
 """memstat：有 cgroup 上限时用 cgroup 读数、无上限退回 statm，v1 与 v2 都覆盖。"""
 
+import sys
 from pathlib import Path
+
+import pytest
 
 import flowlens.memstat as mem
 from flowlens.memstat import memory_bytes, memory_limit_bytes
@@ -98,9 +101,15 @@ def test_limit_but_usage_missing_falls_back_to_statm(tmp_path, monkeypatch):
 
 # ---- 健壮性：全缺返回 0、乱码不抛 ----
 
-def test_all_missing_returns_zero(tmp_path):
-    assert memory_bytes(str(tmp_path)) == 0
-    assert memory_bytes(str(tmp_path / "不存在")) == 0
+def test_all_missing_no_fake_data(tmp_path):
+    # 全缺时不返回伪造值：非 Windows 没有 WorkingSet 兜底 → 0；Windows 退回真实的
+    # WorkingSetSize（> 0，T8b）——不能断言 == 0，否则把"Windows 恒 0"的旧 bug 锁死。
+    if sys.platform == "win32":
+        v1, v2 = mem._windows_working_set(), mem._windows_working_set()
+    else:
+        v1 = v2 = 0
+    assert memory_bytes(str(tmp_path)) == v1
+    assert memory_bytes(str(tmp_path / "不存在")) == v2
 
 
 def test_garbage_files_do_not_raise(tmp_path):
@@ -110,7 +119,9 @@ def test_garbage_files_do_not_raise(tmp_path):
     _write(tmp_path, "sys/fs/cgroup/memory/memory.limit_in_bytes", "\x00\x01\n")
     _write(tmp_path, "sys/fs/cgroup/memory/memory.usage_in_bytes", "???\n")
     _write(tmp_path, "proc/self/statm", "xx yy\n")
-    assert memory_bytes(str(tmp_path)) == 0
+    # 乱码文件全读不出：非 Windows → 0；Windows 退回真实 WorkingSetSize（> 0）
+    expected = mem._windows_working_set() if sys.platform == "win32" else 0
+    assert memory_bytes(str(tmp_path)) == expected
     assert memory_limit_bytes(str(tmp_path)) is None
 
 
@@ -119,3 +130,30 @@ def test_empty_file_skipped(tmp_path):
     (tmp_path / "sys" / "fs" / "cgroup").mkdir(parents=True)
     (tmp_path / "sys" / "fs" / "cgroup" / "memory.max").write_bytes(b"")
     assert memory_limit_bytes(str(tmp_path)) is None
+
+
+# ---- T8b：cgroup 与 statm 全缺时退回 Windows WorkingSetSize ----
+
+def test_all_missing_falls_back_to_windows_working_set(tmp_path, monkeypatch):
+    # cgroup 与 statm 都读不到时，memory_bytes 应退回 _windows_working_set（Windows
+    # 开发机拿真实值）。跨平台可测：把 _windows_working_set 换成返回固定值的替身，
+    # 验证"全缺 → 退回该读数"这条调用链（不管实际在哪个平台跑）。
+    monkeypatch.setattr(mem, "_windows_working_set", lambda platform=None: 7_000_000)
+    assert memory_bytes(str(tmp_path)) == 7_000_000
+    # 有 statm 时不退回 Windows 分支（statm 优先）
+    _write(tmp_path, "proc/self/statm", "5000 1234 200 0 0 1000 0\n")
+    monkeypatch.setattr(mem, "_page_size", lambda: 4096)
+    assert memory_bytes(str(tmp_path)) == 1234 * 4096
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="只在 Windows 上验证真实读数")
+def test_windows_working_set_reads_real_value():
+    # Windows 开发机：memory_bytes 读到真实的 WorkingSetSize（> 0、量级为进程实际
+    # 内存）。此前 memstat 在 Windows 上恒返回 0，这条路径本地从没跑过（T8b 背景）。
+    v = mem._windows_working_set()
+    assert isinstance(v, int)
+    assert v > 0, "Windows 上应读到正的 WorkingSetSize"
+    # 进程内存量级：Python 解释器 + numpy 约几十 MB，不该是 KB 级或 TB 级
+    assert 1 * 1024 * 1024 < v < 4 * 1024 * 1024 * 1024
+    # 全缺路径（无 cgroup、无 /proc）也走到它
+    assert memory_bytes(str("C:/不存在的路径")) == v

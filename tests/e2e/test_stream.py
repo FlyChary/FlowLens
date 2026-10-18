@@ -35,6 +35,15 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _fake_memory_reader() -> tuple[int, int | None]:
+    """测试用假内存读数（T8b）：恒 (0, None)，与运行环境的真实内存解耦。
+
+    不注入时 Ticker 会把测试进程（pytest）的真实内存喂给降级控制器，Linux 上测试
+    逐个跑会累积到超过 256 MB × 0.9，把服务打进第 4 级（写入全 503）。
+    """
+    return 0, None
+
+
 def _evs(n, ts_base, url_prefix="/x"):
     return [{"event_id": f"e{i}", "user_id": f"u{i % 20}",
              "url": f"{url_prefix}{i % 10}",
@@ -75,7 +84,8 @@ def _serve(run, *, tick_period: float = 1000.0):
         engine = Engine(Config(), Clock())
         qs = QueryService(engine)
         app = create_app(engine, IngestService(engine, Admission()), qs,
-                         tick_period=tick_period)
+                         tick_period=tick_period,
+                         memory_reader=_fake_memory_reader)
         server = TestServer(app)
         client = TestClient(server)
         await server.start_server()
@@ -560,7 +570,7 @@ def test_shutdown_ends_all_streams_fast():
         engine = Engine(Config(), Clock())
         qs = QueryService(engine)
         app = create_app(engine, IngestService(engine, Admission()), qs,
-                         tick_period=1000.0)
+                         tick_period=1000.0, memory_reader=_fake_memory_reader)
         server = TestServer(app)
         client = TestClient(server)
         await server.start_server()
@@ -585,7 +595,8 @@ def test_app_shutdown_ends_streams():
     async def main():
         engine = Engine(Config(), Clock())
         qs = QueryService(engine)
-        app = create_app(engine, IngestService(engine, Admission()), qs, tick_period=1000.0)
+        app = create_app(engine, IngestService(engine, Admission()), qs,
+                         tick_period=1000.0, memory_reader=_fake_memory_reader)
         server = TestServer(app)
         client = TestClient(server)
         await server.start_server()

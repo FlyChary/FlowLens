@@ -94,4 +94,5 @@ tests/                   单元测试；tests/e2e/ 端到端用例
 ## 每个任务结束时
 
 - `pytest -q` 通过；涉及热路径的改动跑一次 `tools/bench_core.py`，吞吐不能明显下降；
+- **两个平台都要跑全量 `pytest -q`**：Windows（本机）之外，还必须在 WSL 中跑一次全量测试（评测在 Linux 上进行，两边结果都必须全部通过，汇报时分别给出）。WSL 项目路径 `/mnt/d/dhy/code/flowlens`，用 T6c 建的虚拟环境 `/home/user/flowlens-venv`（缺依赖先 `pip install -e ".[dev]"`）：`wsl -e bash -lc 'cd /mnt/d/dhy/code/flowlens && PYTHONHASHSEED=0 /home/user/flowlens-venv/bin/python -m pytest -q'`。
 - 在 AI_LOG.md 末尾追加几行：做了什么、AI 给的方案哪里被修改或否决、为什么。

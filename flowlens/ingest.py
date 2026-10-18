@@ -128,6 +128,13 @@ class IngestService:
         #    否则解析本身的内存（约 3.4 倍）挡不住
         n_bytes = len(raw)
         if not self.admission.try_reserve(n_bytes):
+            # 第 3 级把在途上限从 4 MB 收紧到 2 MB：这期间解压后 2~4 MB 的请求预留
+            # 不下，走这里的 503（而不是 413）——有意的、暂时性的，退出降级即可成功。
+            # 错误信息里说明"降级期间单个请求的上限暂时为 2 MB"，让调用方知道是临时限制。
+            if self.admission.limit < MAX_PENDING_BYTES:
+                mb = self.admission.limit // (1024 * 1024)
+                raise Overloaded(
+                    f"降级期间单个请求的上限暂时为 {mb} MB，请稍后重试", retry_after=1)
             raise Overloaded(retry_after=1)
         try:
             # 3. 解析出顶层数组（不合法抛 BadRequest）

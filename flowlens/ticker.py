@@ -7,9 +7,9 @@ ingest.py 是一次性请求的处理，两者职责不同，合在一个模块�
 
 import asyncio
 import logging
+from typing import Callable
 
 from .engine import Engine
-from .memstat import memory_bytes, memory_limit_bytes
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class Ticker:
     """
 
     def __init__(self, engine: Engine, period: float = 1.0, *,
-                 controller=None, admission=None):
+                 controller=None, admission=None, memory_reader=None):
         self.engine = engine
         self.period = period
         self.tick_count = 0              # 已完成的 tick 次数
@@ -35,6 +35,10 @@ class Ticker:
         # 降级控制器（T8）与写入在途预留（occupancy 来源）：create_app 注入
         self.controller = controller
         self.admission = admission
+        # 内存读数 reader（T8b）：返回 (memory_bytes, memory_limit_bytes)。create_app
+        # 注入（默认 memstat）；测试可注入假读数，让测试与真实内存解耦。None 时不喂内存
+        # （只有 create_app 之外的直接构造会用，如 test_ingest）。
+        self.memory_reader: Callable[[], tuple[int, int | None]] | None = memory_reader
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -81,8 +85,11 @@ class Ticker:
         if self.controller is None:
             return
         occ = self.admission.occupancy if self.admission is not None else 0.0
-        self.controller.update(occ, self.last_tick_delay_ms,
-                               memory_bytes(), memory_limit_bytes())
+        if self.memory_reader is not None:
+            mem, limit = self.memory_reader()
+        else:
+            mem, limit = 0, None  # 未注入 reader：不判内存（内存阈值永不触发）
+        self.controller.update(occ, self.last_tick_delay_ms, mem, limit)
 
     async def _wait_until(self, at: float) -> None:
         """睡到绝对时刻 at（已过期则只让出一次）；期间若 stop() 被调用立即返回。"""
