@@ -11,8 +11,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
-[tool.setuptools]
-packages = ["flowlens", "flowlens.sketch"]
+[tool.setuptools.packages.find]
+# 自动发现 flowlens 及其全部子包（api、sketch、以后新增的），不再手工列举，
+# 避免再漏子包导致非 editable 安装（Docker、pip install .）缺包。
+include = ["flowlens*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
