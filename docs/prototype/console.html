@@ -88,6 +88,11 @@ main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
 .treewrap svg { width: 100%; min-width: 620px; height: auto; display: block; }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
 .legend i { display: inline-block; width: 12px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.evhead { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 20px 0 6px; }
+.evhead h3 { font-size: 14px; font-weight: 600; margin: 0; }
+.evhead .seg button { padding: 3px 8px; font-size: 12px; }
+.evhead .note { font-size: 12.5px; color: var(--muted); flex-basis: 100%; }
+#evchart { cursor: crosshair; }
 
 svg text { fill: var(--muted); font-size: 11px; }
 svg .ink { fill: var(--ink); }
@@ -264,6 +269,12 @@ svg .ink { fill: var(--ink); }
             <span><i style="background:var(--read)"></i>查询选中的节点</span>
             <span><i style="background:var(--read-soft);border:1.5px dashed var(--read)"></i>按比例计入的边缘秒</span>
           </div>
+          <div class="evhead">
+            <h3>事件数</h3>
+            <div class="seg" role="group" aria-label="颗粒度" id="evSeg"></div>
+            <span class="note" id="evNote"></span>
+          </div>
+          <div class="treewrap"><svg id="evchart" viewBox="0 0 1000 180" role="img" aria-label="线段树时间范围内的事件数"></svg></div>
         </div>
       </div>
       <div class="query">
@@ -595,8 +606,8 @@ function renderRing(f, q) {
 
 // ===================== 渲染：线段树 =====================
 const treeSvg = document.getElementById('tree');
-let treeView = 'full';
-const ROW = 24, TOP = 26, LEFT = 30, TW = 1000 - LEFT - 10;
+let treeView = 'full', evLevel = 0;
+const ROW = 24, TOP = 26, LEFT = 56, TW = 1000 - LEFT - 10;
 function renderTree(f, q) {
   if (f.newest === null) return;
   const hi = f.newest + 1;
@@ -611,6 +622,7 @@ function renderTree(f, q) {
   let h = `<defs><clipPath id="clipT"><rect x="${LEFT}" y="0" width="${TW}" height="${H}"/></clipPath></defs>`;
   for (let k = 0; k <= maxLv; k++) h += `<text x="${LEFT - 8}" y="${Y(k) + 14}" text-anchor="end">${k}</text>`;
   h += `<text x="${LEFT - 8}" y="${TOP - 10}" text-anchor="end">层</text>`;
+  if (evLevel <= maxLv) h += `<rect x="${LEFT - 4}" y="${Y(evLevel) - 3}" width="${TW + 8}" height="${ROW}" rx="4" style="fill:var(--write-soft)"/>`;
   h += `<g clip-path="url(#clipT)">`;
   for (const n of f.nodes) {
     if (n.level > maxLv) continue;
@@ -646,6 +658,98 @@ function renderTree(f, q) {
   }
   treeSvg.innerHTML = h;
 }
+
+// ===================== 事件数折线图（与线段树共用横轴，颗粒度即线段树的层） =====================
+const evSvg = document.getElementById('evchart');
+let evState = null;
+const niceMax = v => { const p = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1)))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; };
+const axisFmt = v => v >= 1e4 ? (v / 1e4).toFixed(v >= 1e5 || v === 0 ? 0 : 1) + ' 万' : String(Math.round(v));
+function buildEvSeg() {
+  const maxLv = treeView === 'full' ? LV : 6;
+  if (evLevel > maxLv) evLevel = maxLv;
+  const seg = document.getElementById('evSeg');
+  seg.innerHTML = Array.from({ length: maxLv + 1 }, (_, k) =>
+    `<button data-k="${k}" aria-pressed="${k === evLevel}" title="线段树第 ${k} 层">${1 << k} 秒</button>`).join('');
+}
+function renderEvents(f, q) {
+  if (f.newest === null) return;
+  const hi = f.newest + 1, lo = treeView === 'full' ? hi - RET : hi - 64, span = hi - lo;
+  const k = evLevel, sp = 1 << k;
+  const X = t => LEFT + (t - lo) / span * TW;
+  const T0 = 12, B0 = 148, H0 = 180;
+  const segs = [];
+  for (const n of f.nodes) if (n.level === k && n.start + sp > lo && n.start < hi)
+    segs.push({ s: n.start, e: n.start + sp, rate: n.events / sp, total: n.events, done: true });
+  const b = f.builders.find(x => x.level === k);
+  if (b && b.filled > 0) segs.push({ s: b.start, e: b.start + b.filled, rate: b.events / b.filled, total: b.events, done: false, filled: b.filled });
+  segs.sort((a, c) => a.s - c.s);
+  let ymax = 1;
+  for (const g of segs) ymax = Math.max(ymax, g.rate);
+  ymax = niceMax(ymax * 1.08);
+  const Y = v => B0 - (B0 - T0) * v / ymax;
+  let h = `<defs><clipPath id="clipE"><rect x="${LEFT}" y="0" width="${TW}" height="${H0}"/></clipPath></defs>`;
+  for (let i = 0; i <= 2; i++) {
+    const v = ymax * i / 2, y = Y(v);
+    h += `<line x1="${LEFT}" y1="${y}" x2="${LEFT + TW}" y2="${y}" style="stroke:var(--faint)"/>`;
+    h += `<text x="${LEFT - 8}" y="${y + 4}" text-anchor="end">${axisFmt(v)}</text>`;
+  }
+  h += `<g clip-path="url(#clipE)">`;
+  if (q && !q.err) {
+    const a = Math.max(lo, q.fromS), c = Math.min(hi, q.toS);
+    if (c > a) h += `<rect x="${X(a)}" y="${T0 - 6}" width="${X(c) - X(a)}" height="${B0 - T0 + 6}" style="fill:var(--read-soft)"/>`;
+  }
+  let line = '', area = '', prevE = null, startX = null;
+  const closeArea = () => { if (startX !== null) area += `L${X(prevE).toFixed(2)} ${B0}L${startX.toFixed(2)} ${B0}Z`; };
+  for (const g of segs.filter(g => g.done)) {
+    const x0 = X(g.s), x1 = X(g.e), y = Y(g.rate).toFixed(2);
+    if (prevE === null || g.s !== prevE) { closeArea(); line += `M${x0.toFixed(2)} ${y}`; area += `M${x0.toFixed(2)} ${B0}L${x0.toFixed(2)} ${y}`; startX = x0; }
+    else { line += `L${x0.toFixed(2)} ${y}`; area += `L${x0.toFixed(2)} ${y}`; }
+    line += `L${x1.toFixed(2)} ${y}`; area += `L${x1.toFixed(2)} ${y}`;
+    prevE = g.e;
+  }
+  closeArea();
+  h += `<path d="${area}" style="fill:var(--write);opacity:.12"/>`;
+  h += `<path d="${line}" style="fill:none;stroke:var(--write);stroke-width:1.6;stroke-linejoin:round"/>`;
+  const pend = segs.find(g => !g.done);
+  if (pend) {
+    const y = Y(pend.rate).toFixed(2);
+    h += `<path d="M${X(pend.s).toFixed(2)} ${y}L${X(pend.e).toFixed(2)} ${y}" style="fill:none;stroke:var(--write);stroke-width:1.6;stroke-dasharray:4 3"/>`;
+  }
+  h += `<line id="evCross" x1="0" y1="${T0 - 6}" x2="0" y2="${B0}" style="stroke:var(--muted);stroke-dasharray:2 2;visibility:hidden"/>`;
+  h += `</g>`;
+  h += `<line x1="${LEFT}" y1="${B0}" x2="${LEFT + TW}" y2="${B0}" style="stroke:var(--line)"/>`;
+  const ticks = treeView === 'full' ? [[lo, '10 分钟前'], [lo + 300, '5 分钟前'], [hi, '最新定稿秒']] : [[lo, '64 秒前'], [lo + 32, '32 秒前'], [hi, '最新定稿秒']];
+  for (const [t, label] of ticks) {
+    const x = X(t);
+    h += `<line x1="${x}" y1="${B0}" x2="${x}" y2="${B0 + 5}" style="stroke:var(--muted)"/>`;
+    h += `<text x="${x}" y="${B0 + 20}" text-anchor="${t === lo ? 'start' : t === hi ? 'end' : 'middle'}">${label}</text>`;
+  }
+  evSvg.innerHTML = h;
+  evState = { lo, span, segs, k, sp };
+  document.getElementById('evNote').textContent =
+    `每一级台阶是线段树第 ${k} 层的一个节点（${sp} 秒），高度为这段时间的平均每秒事件数；虚线是构建中的节点，按已并入的秒数计算。`;
+}
+evSvg.addEventListener('mousemove', ev => {
+  if (!evState) return;
+  const r = evSvg.getBoundingClientRect(), xs = (ev.clientX - r.left) / r.width * 1000;
+  const cross = document.getElementById('evCross');
+  if (xs < LEFT || xs > LEFT + TW) { hideTip(); if (cross) cross.style.visibility = 'hidden'; return; }
+  const t = evState.lo + (xs - LEFT) / TW * evState.span;
+  const g = evState.segs.find(x => t >= x.s && t < x.e);
+  if (cross) { cross.setAttribute('x1', xs); cross.setAttribute('x2', xs); cross.style.visibility = 'visible'; }
+  if (!g) return hideTip();
+  const head = `<b>第 ${evState.k} 层${evState.k === 0 ? '（叶子）' : ''}</b>：${hms(g.s)} 起 ${evState.sp} 秒`;
+  showTip(ev, g.done
+    ? `${head}<br>事件 ${fmt(g.total)}<br>平均每秒 ${fmt(g.rate)}`
+    : `${head}（构建中）<br>已并入 ${g.filled} / ${evState.sp} 秒<br>事件 ${fmt(g.total)}，平均每秒 ${fmt(g.rate)}`);
+});
+evSvg.addEventListener('mouseleave', () => { hideTip(); const c = document.getElementById('evCross'); if (c) c.style.visibility = 'hidden'; });
+document.getElementById('evSeg').addEventListener('click', ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  evLevel = +b.dataset.k;
+  buildEvSeg(); draw();
+});
+buildEvSeg();
 
 // ===================== 查询覆盖 =====================
 let query = null;
@@ -686,7 +790,7 @@ function computeQuery(f) {
     fr.push(fr0.toFixed(1));
     if (s >= ringNext) ringSecs.set(s, fr0); else treeEdges.set(s, fr0);
   }
-  return { ringSecs, nodeKeys, treeEdges, ringCount, nodeCount, edges: fr };
+  return { ringSecs, nodeKeys, treeEdges, ringCount, nodeCount, edges: fr, fromS: from / 1000, toS: at / 1000 };
 }
 function renderQuery(q) {
   const el = document.getElementById('qResult');
@@ -778,6 +882,7 @@ function renderAll(frames) {
   const q = computeQuery(f);
   renderRing(f, q && !q.err ? q : null);
   renderTree(f, q && !q.err ? q : null);
+  renderEvents(f, q && !q.err ? q : null);
   renderQuery(q);
   renderPanels(frames);
 }
@@ -883,6 +988,7 @@ $('treeSeg').addEventListener('click', ev => {
   const b = ev.target.closest('button'); if (!b) return;
   treeView = b.dataset.view;
   [...$('treeSeg').children].forEach(x => x.setAttribute('aria-pressed', x === b));
+  buildEvSeg();
   draw();
 });
 $('qBtn').addEventListener('click', () => {
