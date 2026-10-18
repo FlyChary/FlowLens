@@ -9,6 +9,7 @@ import asyncio
 import logging
 
 from .engine import Engine
+from .memstat import memory_bytes, memory_limit_bytes
 
 log = logging.getLogger(__name__)
 
@@ -17,17 +18,23 @@ class Ticker:
     """按固定周期执行 engine.advance() + refresh_snapshot_async()。
 
     记录每次 tick 的耗时，以及实际开始时间相对预定时间的延迟（降级控制器 T8 要用，
-    用属性对外提供）。单拍抛普通异常时记日志、计入 error_count 并继续下一拍，
-    不让后台任务因一次失败就永久退出。
+    用属性对外提供）。每拍结束后调一次降级控制器 update（喂 occupancy / tick 延迟 /
+    内存读数），所以控制器由 Ticker 驱动——单写者、每秒一次、无需独立任务。
+    单拍抛普通异常时记日志、计入 error_count 并继续下一拍，不让后台任务因一次失败
+    就永久退出。
     """
 
-    def __init__(self, engine: Engine, period: float = 1.0):
+    def __init__(self, engine: Engine, period: float = 1.0, *,
+                 controller=None, admission=None):
         self.engine = engine
         self.period = period
         self.tick_count = 0              # 已完成的 tick 次数
         self.error_count = 0             # tick 抛异常的累计次数
         self.last_tick_duration_ms = 0.0  # 最近一次 tick（advance + 快照）耗时
         self.last_tick_delay_ms = 0.0     # 最近一次 tick 实际开始相对预定时间的延迟
+        # 降级控制器（T8）与写入在途预留（occupancy 来源）：create_app 注入
+        self.controller = controller
+        self.admission = admission
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -53,6 +60,7 @@ class Ticker:
                 await self.engine.refresh_snapshot_async()
                 self.last_tick_duration_ms = (loop.time() - t0) * 1000.0
                 self.tick_count += 1
+                self._update_degrade()
             except Exception:
                 # 单拍失败不退出后台任务：记完整异常、计数，继续下一拍。
                 # 只捕获 Exception——CancelledError（3.11+ 属 BaseException）照常向上传播
@@ -62,6 +70,19 @@ class Ticker:
                 break
             next_at += self.period
             await self._wait_until(next_at)
+
+    def _update_degrade(self) -> None:
+        """一拍结束后喂降级控制器一次：occupancy（写入在途占用率）、tick 延迟、内存读数。
+
+        控制器由 Ticker 驱动的理由：单写者、每秒一拍正好"每秒更新一次"，且
+        occupancy / tick 延迟都是这一拍刚产出的量，放在这里读到的就是本拍的值，
+        不用另起一个每秒任务（那会多一个后台任务、还要处理它和 Ticker 的先后）。
+        """
+        if self.controller is None:
+            return
+        occ = self.admission.occupancy if self.admission is not None else 0.0
+        self.controller.update(occ, self.last_tick_delay_ms,
+                               memory_bytes(), memory_limit_bytes())
 
     async def _wait_until(self, at: float) -> None:
         """睡到绝对时刻 at（已过期则只让出一次）；期间若 stop() 被调用立即返回。"""

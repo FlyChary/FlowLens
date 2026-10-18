@@ -291,3 +291,31 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 **与指令不一致 / 说明**：无实质偏离。"帧计算节流改按帧时刻"是执行第 5 节"验证重算节流"时发现原墙钟口径无法满足"interval>1s 每帧重算"而做的必要修正（行为更正确、与指令意图一致），已记入 PROGRESS 决策。基准表以 T7b 提交号标注；各项持平或好于上一版，无劣化 10% 以上。
 
 **验证**：`pytest -q` 226 passed, 5 deselected、无警告；`pytest -q -m slow` 5 passed（未动 bounds/heavy，输出不变）；bench_core 长尾 ~30.5 万/s、bench_model ~1.36 μs/条、bench_engine 1000 条 ~4.72 μs/条、5000 条 ~4.20 μs/条，均持平或好于上一版。本地 `python -m flowlens --port 8091` 实测：create_app 在事件循环外创建 StreamManager（其 `asyncio.Semaphore` 3.11 构造不绑 loop）正常启动，curl -N 见 retry + 连续帧（data.to==id、间隔=interval）。
+
+### 2026-10-18 T8 过载降级（flowlens/degrade.py、engine.py、query.py、ticker.py、api/app.py、api/stream.py、model.py、tests/test_degrade.py、tests/e2e/test_degrade.py、docs/*）
+
+**一、降级控制器（flowlens/degrade.py）**：纯逻辑、不依赖 aiohttp，便于单测。四级阈值各带一个"活跃"滞回状态（进入阈值高、退出阈值低），当前级别 = 所有活跃级别中最高的一级。只读属性 level/degraded/sample_weight/replay_paused/sse_slowdown/tighten_budgets/reject_ingest 与最近一次输入值（供 /healthz）；`sample_weight`：level≥2 时 2、occupancy>0.95 时 4、否则 1（整数）。级别变化记一行日志（旧/新级别 + 触发输入值）并触发 `on_change(旧,新)` 回调。内存阈值按**上限比例**（0.78/0.70、0.90/0.82），`memory_limit_bytes` 为 None 时按 256 MB 计——比例换算到 256 MB 正好是设计文档的 200/230 MB。`pin(level)` 供集成测试固定级别（None 恢复阈值判定）。
+
+**二、控制器挂在 app 上、由谁驱动**：T8 说"挂在 app 上（web.AppKey），由 Ticker 每拍结束后调用一次 update（或单独每秒任务，选一个并说明理由）"。**选 Ticker 每拍结束后 update**：单写者、每秒一拍正好"每秒更新一次"，且 update 的输入（occupancy、tick 延迟）就是这一拍刚产出的量，放这里读到的就是本拍值；另起每秒任务要多维护一个后台任务、还要处理它与 Ticker 的先后。副作用（第 3 级收紧/恢复预算、清缓存）不能塞进 update（控制器要保持纯逻辑、不依赖 aiohttp），改用 `on_change` 回调，由 `create_app` 里 `_make_degrade_change_hook(app)` 闭包捕获 app 注入，只在实际级别变化时回调一次——"进入第 3 级清一次缓存"因此天然成立。
+
+**三、共享一个控制器实例（T8 未明说，但必须）**：T8 要求"engine.ingest 的 weight 改由控制器提供"、"判断放在 QueryService 内部"，但第 1 级可由 **occupancy>0.6** 触发——occupancy 只有 app 层（ingest 的 Admission）知道、只有 Ticker 喂得进来。若 engine 与 QueryService 各建一个控制器，两个都收不到 occupancy、第 1 级的占用率分支永远不触发，SSE 降频（读 query 的控制器）与采样（读 engine 的控制器）也会各看各的级别。故 `create_app` 建**一个**控制器，赋给 `engine.controller` 与 `query_service.controller` 并挂到 `app[degrade_controller_key]`，三处读同一级别。`make_engine`（__main__ 用）保持原样，create_app 会重新装配成共享实例。
+
+**四、第 2 级采样的实现**：`engine.ingest(batch, weight=None)`，weight 缺省读控制器 sample_weight、**显式传参优先**（bench_engine 与旧测试显式传 weight，不受控制器影响）。采样按 **event_id 的哈希**做确定性取舍（`h_id % w == 0` 保留，比例 1/w，与时间无关）：同一事件无论重试多少次、何时重试，取舍都一致，且与"这次是不是重复"解耦。只对两维 Top-K 名单（`hh`）与 url 维 DDSketch 采样（保留事件、权重 w）；**HLL（user 维 stats）与 event_id 去重始终全量**（HLL 用全部事件、权重 1）。因为 ring.py 冻结（`DimBucket.observe` 把名单和统计一起写），引擎改为**分别**调 `bucket.dims[d].hh.observe(...)` 与 `bucket.dims[d].stats.observe(...)`。**不采样时（weight=1）走与 T7b 结构完全相同的写入路径**（`payload` dict + `DimBucket.observe`），保证正常路径结果与 T7b 一致。
+
+**五、如何保证不采样时结果与之前完全一致**：weight==1 的分支与 T7b 的 ingest 循环逐行同构（同一 `payload = {URL:(h_url,urls), USER:(h_user,users)}`、同一 `b.dims[d].observe(h[sl], ks[sl].tolist(), a_bytes[sl], weights[sl])`，weights 全 1），唯一的净增开销是 `self.controller.sample_weight` 一次属性读取。226 条原有测试原样通过（含上下界、去重、快照断言）即为证明。
+
+**六、各级动作接入**：
+- **第 1 级**：`QueryService.topk`（带 at、或 window≠60s、或 k>snapshot_top_n 的回放查询）与 `stats`（非 60s 窗口）在降级时抛 `Overloaded(retry_after=1)`（判断在 QueryService 内，不写进 handler）；读快照的默认查询照常。SSE **不暂停、只降频**：`SubscriptionGroup` 每帧运行时读 `recompute_interval_ms()`（第 1 级 1s→5s），帧照常按 interval 推送、复用结果；生产者与补帧的 topk 调用走 `from_stream=True` 绕过"暂停回放"判断（`QueryService.topk` 加该 kwarg）。**踩坑**：`topk` 加 `from_stream` kwarg 后，T7 的 3 个 SSE spy 测试（`async def spy(d, window_ms, k, at_ms=None)`）报 `got an unexpected keyword argument`，改成 `**kw` 透传后修复（属"新增参数破坏现有 spy 签名"的测试侧小修，非 T8 行为）。
+- **第 3 级**：`on_change` 进入时 `Admission.limit 4→2 MB`、`RawBudget.limit 8→4 MB`、`QueryService.clear_cache()` + `model.clear_norm_cache()`（清一次）；退出时恢复额度、缓存不清。`StreamManager.check_limits` 在 `tighten_budgets` 时抛 Overloaded（新订阅 503、已有订阅保持）。
+- **第 4 级**：`_ingest` 在**读请求体之前**判 `reject_ingest` 抛 503；`_ingest_expect`（Expect 路径，handler 之前执行）同样判、发 503 不发 100。此时未写任何去重状态，重试安全。
+- **响应字段**：`stream.topk_data(ans, degraded=, sample_weight=)` 加两参（/v1/topk 与 SSE 共用），采样生效时带 `sample_rate=1/sample_weight`；`_stats`/`_healthz` 的 `degraded` 改真实状态，`/healthz` 增 `degrade` 字段。
+
+**七、与指令不一致 / 说明**：
+1. 第 3 级不"缩短历史保留"，改收紧额度 + 清缓存（T8 已指明：保留期由冻结 segtree 构造时定、无法动态调）→ 记入 DESIGN_TODO #13。
+2. `test_engine.py::test_ingest_weight_doubles_counts` 原断言 `l <= C*2 <= h`（weight=2 = 全体 ×2），T8 后 weight 语义变为"保留 1/2 + 每条 ×2"（无偏估计，期望 = 真实值 C，而非 2C），该断言与新语义矛盾。因 T8 明确"level 0 时现有测试原样通过"是行为等价性的证明、而本测试测的正是采样路径，**重写为 `test_ingest_weight_sampling_unbiased`**：断言加权估计围绕真实次数（非 2C），且**不**断言上下界夹住真实值（T8 明说采样期间上下界非严格保证）。这是唯一改动的现有测试，且是语义变更而非放松。
+3. SSE 帧的 `degraded`/`sample_rate` 用**产生该帧时**的控制器状态（而非订阅时）。level 0 时两者都是 false/1，与"现有测试原样通过"一致；level≥2 时按指令"SSE 帧带 sample_rate"带上。
+4. `bench_engine`/`bench_model` 未动（T8 未要求），基准对比需**同机**进行：本机整体比 T7b 记录时慢约 60%（原始代码本机 bench_model 2.19 μs/条 vs T7b 记录 1.36），T8 列相对 T7b 列的数值变大全部是本机更慢、非 T8 引入；**同机对照（原始 vs T8，各 5 次中位）** `engine.ingest` 每批 1000 条 3.44→3.29 μs、5000 条 2.74→2.57 μs（持平或略快），证明正常路径未变慢。
+
+**八、测试**：新增 `tests/test_degrade.py` 16 条（每级进入/退出、滞回区间内不变、多条件取最高级、sample_weight 随 occupancy/级别、内存上限 None 按 256 MB、阈值随上限比例缩放、日志、pin、on_change 只在实际变化时触发、status 字段）；新增 `tests/e2e/test_degrade.py` 5 条（第 1 级回放 503 + 默认查询照常 + SSE 降频 5s 仍推帧、第 2 级采样无偏 + HLL 全量 + 两独立引擎取舍一致 + 响应/SSE 帧带 degraded 与 sample_rate、第 3 级预算收紧与恢复 + 新订阅 503 + 已有订阅保持 + 两缓存清空、第 4 级拒写 + 重试不判重）。
+
+**验证**：`pytest -q` 247 passed, 5 deselected、无警告；`pytest -q -m slow` 5 passed（未动 bounds/heavy，输出不变）；bench_engine 正常路径同机对照持平或略快（见上）。本地 `python -m flowlens` 启动正常。

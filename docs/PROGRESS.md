@@ -14,20 +14,23 @@
 | T4 写入处理 + Ticker | 已审查通过 |
 | T5 查询 | 已审查通过 |
 | T6 HTTP 接口 | 已审查通过 |
-| T7 SSE + T7b 修正 | 进行中：SSE、前置小修、T7b 修正均已完成，等审查 |
-| T8 降级、T9 驻留表、T10 工具与实验、T11 性能 | 未开始 |
+| T7 SSE + T7b 修正 | 已审查通过 |
+| T8 过载降级 | 已完成，等审查 |
+| T9 驻留表、T10 工具与实验、T11 性能 | 未开始 |
 
 ## 进行中
 
-T7b 已完成（SSE 修正与 T7 收尾补做），汇报后停下等审查。T7b 内容：
-1. 长窗口帧 TooOld 修复：`engine._plan` 保留期检查改为 `now − retention − 迟到上限`（用 `LATENESS_MS` 常量），窗口 600s 的帧与查询不再误报 TooOld。
-2. 补帧不重算：`SubscriptionGroup` 保留最近 30 帧 (帧时刻, payload)，补帧优先取缓存，现场计算全局 `Semaphore(1)` 串行化。
-3. 新订阅者立即收帧：无 Last-Event-ID 加入已有组时立即补发组里最近一帧。
-4. 关闭时立即结束所有流：`StreamManager.close()` 向每个订阅者队列放结束标记，pump 收到即返回。
-5. 两处小修：Last-Event-ID 起始游标向上对齐网格；帧计算节流改按帧时刻判断（interval ≥ 1s 每帧必重算、data.to == id）。
-6. T7 收尾补做：本文"已定的决策"追加三项（hash(str(k))、hll 分段版、内存读数不扣页缓存）+ SSE 60s 帧走回放的未解决问题；任务顺序更新为 T7 → T8 → T10 → T9 → T11 → 收尾。
+T8 过载降级已完成，汇报后停下等审查。T8 内容：
+1. **降级控制器**（新建 `flowlens/degrade.py`）：纯逻辑、无 aiohttp 依赖。四级阈值滞回（每级独立活跃状态，当前级 = 所有活跃级中最高）；只读属性 level/degraded/sample_weight/replay_paused/sse_slowdown/tighten_budgets/reject_ingest + 最近输入值；级别变化记一行日志并触发 `on_change` 回调（副作用由 app 层注入，保持控制器纯逻辑）；`pin()` 供测试固定级别。
+2. **控制器驱动**：挂在 app 上（`web.AppKey`），**与 engine、QueryService 共享同一实例**（create_app 装配）；由 **Ticker 每拍结束后调一次 update**（喂 occupancy/tick 延迟/内存读数）——单写者、每秒一次正好对应"每秒更新一次"，且读到的是本拍刚产出的量，不用另起每秒任务。
+3. **第 1 级**：`QueryService.topk/stats` 的回放查询抛 Overloaded(503+Retry-After)（判断在 QueryService 内部，不写进 handler）；SSE 不暂停、只降频（组的 `min_recompute` 1s→5s，生产者每帧运行时读取）。
+4. **第 2 级**：`engine.ingest` 按 event_id 哈希确定性采样（`h_id % w == 0` 保留），保留事件以权重 w 写入；只作用于两维 Top-K 名单与 url 维 DDSketch，HLL 与去重始终全量；`weight` 参数缺省改读控制器 sample_weight（显式传参优先，基准/测试不受影响）。weight=1 走与 T7b 结构相同的写入路径。
+5. **第 3 级**：`on_change` 在进入时把 Admission 4→2 MB、RawBudget 8→4 MB 并清一次结果缓存 + URL 归一化缓存；退出时恢复（缓存不清）；`StreamManager.check_limits` 拒绝新 SSE 订阅（已有订阅保持）。
+6. **第 4 级**：`_ingest` 与 `_ingest_expect` 在读请求体之前直接 503+Retry-After（未写去重状态，重试安全）。
+7. **响应字段**：/v1/topk、/v1/stats、/healthz 的 `degraded` 改真实状态；采样生效时 /v1/topk 与 SSE 帧带 `sample_rate`；/healthz 增加 `degrade` 字段。
+8. **文档**：DESIGN_TODO 追加两条（第 3 级"缩短历史保留"改为收紧额度+清缓存，因保留期由冻结的 segtree 构造时确定；采样期间上下界不再严格保证）。
 
-`pytest -q` 226 通过、无警告（详见"基准数据"与收尾汇报）。
+`pytest -q` 247 通过（226 原有 + 16 控制器单测 + 5 集成）、无警告。
 
 ## 已定的决策（不要改回去）
 
@@ -66,24 +69,30 @@ T7b 已完成（SSE 修正与 T7 收尾补做），汇报后停下等审查。T7
 - 无 Last-Event-ID 的订阅者加入已有组时，若组里已有最近一帧立即补发它（最多一帧），之后照常跟随实时帧，id 连续、严格递增。
 - 应用关闭时 StreamManager.close() 先向每个订阅者队列放结束标记（pump 收到立即返回），再取消生产任务——SSE 处理函数及时退出，不靠 aiohttp 的 60 秒强制取消（docker stop 只等 10 秒）。
 - Last-Event-ID 不在当前 interval 网格上（如客户端换了 interval）时，起始游标向上对齐到网格；保留期下限口径与 engine._plan 一致（now − retention − 迟到上限）。
+- 降级控制器的内存阈值按**上限的比例**计算（0.78/0.70 与 0.90/0.82），不写死 200/230 MB；`memory_limit_bytes` 为 None 时按 256 MB 计（比例换算到 256 MB 正好是设计文档的 200/230 MB）。
+- 降级控制器挂在 app 上、**与 engine 和 QueryService 共享同一实例**（create_app 装配），由 **Ticker 每拍结束后 update 一次**驱动：单写者、每秒一拍对应"每秒更新一次"，occupancy/tick 延迟是这一拍刚产出的量，且不用另起一个每秒后台任务。级别变化的副作用（收紧/恢复预算、进入第 3 级清缓存）用 `on_change` 回调注入（闭包捕获 app，控制器保持纯逻辑、不依赖 aiohttp），只在实际变化时回调一次。
+- 第 3 级不再"缩短历史保留"（§3.6 设计），改为**收紧额度（Admission 4→2 MB、RawBudget 8→4 MB）+ 清一次结果缓存与 URL 归一化缓存**：保留期由冻结的 segtree 构造时确定，无法动态调整。退出第 3 级恢复额度、缓存不清（重新填充）。
+- 第 2 级采样按 **event_id 的哈希**做确定性取舍（`h_id % w == 0` 保留，比例 1/w，与时间无关）：同一事件无论重试多少次、何时重试，取舍都一致，且与"这次是不是重复"解耦。采样只作用于两维 Top-K 名单与 url 维 DDSketch；HLL（user 维）与 event_id 去重始终全量。`engine.ingest` 的 `weight` 参数缺省读控制器 sample_weight、显式传参优先（基准/测试不受影响）；weight==1 走与 T7b 结构相同的写入路径，正常路径结果完全一致。
+- SSE 在降级时**只降频、不暂停**：生产者每帧运行时读 `recompute_interval_ms()`（第 1 级 1s→5s），帧照常按 interval 推送、复用结果；HTTP 回放查询才在第 1 级暂停（503）。SSE 计算走 `topk(..., from_stream=True)` 绕过"暂停回放"判断。
+- 采样期间（sample_weight > 1）Top-K 的上下界**不再是严格保证**（采样方差可能让加权估计偏离真实次数）；响应带 `sample_rate = 1/sample_weight`，/healthz 与 /v1/topk 的 `degraded` 为真实状态。
 
 ## 基准数据
 
-各任务结束时重跑全部测试与性能基准并追加一行（以后每个任务都一样）。"上一版"为 T6c 前后的对照数字；"本次"为 T7b 收尾重跑，提交 `d2d5c8e`。
+各任务结束时重跑全部测试与性能基准并追加一行（以后每个任务都一样）。每项各跑 3 次取中位（单次波动大）。"上一版"为 T6c 前后对照；"T7b"为提交 `d2d5c8e`；"T8"为本次。
 
-| 项目 | 上一版（T6c 前后） | 本次（T7b） |
-|---|---|---|
-| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected |
-| pytest -q -m slow | 5 passed | 5 passed |
-| bench_core 长尾 | 约 20 万～30 万 事件/秒（不同次运行波动较大） | 约 30.5 万 事件/秒（单次，落在此前波动上沿） |
-| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 |
-| bench_engine 每批 1000 条合计 | 约 6.3 μs/条（约 15.9 万/秒） | 约 4.72 μs/条（约 21.2 万/秒） |
-| bench_engine 每批 5000 条合计 | 约 4.9 μs/条（约 20.5 万/秒） | 约 4.20 μs/条（约 23.8 万/秒） |
-| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms |
-| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms |
-| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms |
+| 项目 | 上一版（T6c 前后） | T7b | T8（本次，中位数） |
+|---|---|---|---|
+| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected | 247 passed, 5 deselected |
+| pytest -q -m slow | 5 passed | 5 passed | 5 passed |
+| bench_core 长尾 | 约 20 万～30 万 事件/秒（波动大） | 约 30.5 万/秒（波动上沿） | 约 22.6 万/秒（218/236/226） |
+| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 | 约 2.22 μs/条（2.15/2.22/2.22） |
+| bench_engine 每批 1000 条合计 | 约 6.3 μs/条 | 约 4.72 μs/条 | 约 6.10 μs/条（5.84/6.10/8.27） |
+| bench_engine 每批 5000 条合计 | 约 4.9 μs/条 | 约 4.20 μs/条 | 约 5.39 μs/条（4.65/5.39/6.64） |
+| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms | 中位约 23 ms，最大约 44 ms（一次 93 s 为调度停顿） |
+| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms | 中位约 58 ms，最大约 82 ms |
+| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms | 中位约 105 ms，最大约 135 ms |
 
-本次各项均持平或好于上一版，无一项劣化 10% 以上。T7b 未动写入热路径（engine._plan 的保留期检查只是多一次整数比较，SSE 相关改动都在查询/推送路径外），性能差异主要是本机单次运行的波动，非 T7b 引入。
+**性能对比必须同机对照**：本机（本次运行）整体比 T7b 记录时那台机器**慢约 60%**——用同一份原始代码在本机重跑 `bench_model` 得 2.19 μs/条（T7b 记录 1.36），`bench_engine` 每批 1000 合计原始代码也是 ~5.9–6.3 μs/条。因此 T8 列相对 T7b 列的数值变大**全部是本机更慢，不是 T8 引入**。**同机对照（原始代码 vs T8，各 5 次中位）**：`engine.ingest` 每批 1000 条 3.44 → 3.29 μs、每批 5000 条 2.74 → 2.57 μs（T8 持平或略快）；`refresh_snapshot` 53.9 → 57.8 ms（快照路径 T8 未触及，差异在本机波动范围内）。结论：**T8 未使正常路径（sample_weight=1）变慢**。
 
 ## 未解决的问题
 
@@ -96,4 +105,4 @@ T7b 已完成（SSE 修正与 T7 收尾补做），汇报后停下等审查。T7
 
 ## 下一步
 
-T7b 汇报后停下等待审查；审查通过后按新顺序（TASKS.md 已确认）执行：T8 降级控制器 → T10 工具与实验（含端到端压测，粗测吞吐与查询 p99 记入"基准数据"）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。
+T8 汇报后停下等待审查；审查通过后按顺序执行：T10 工具与实验（含端到端压测，粗测吞吐与查询 p99 记入"基准数据"）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。

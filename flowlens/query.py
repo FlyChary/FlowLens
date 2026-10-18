@@ -8,9 +8,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from .bounds import Result, top_k
+from .degrade import DegradeController
 from .dims import Dim
 from .engine import Engine
-from .errors import BadRequest
+from .errors import BadRequest, Overloaded
 from .timewin import sec, split_range, watermark
 
 # 查询窗口（毫秒）合法范围：1 ~ 600 秒
@@ -52,9 +53,16 @@ class StatsAnswer:
 class QueryService:
     """回放与统计查询。最终态 Top-K 结果按 (dim, from_ms, to_ms, k) 缓存在 LRU 里。"""
 
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine,
+                 controller: "DegradeController | None" = None):
         self.engine = engine
+        # 降级控制器（T8）：第 1 级时回放查询返回 503（读快照的默认查询照常）。
+        self.controller = controller if controller is not None else DegradeController()
         self._cache: "OrderedDict[tuple, TopKAnswer]" = OrderedDict()
+
+    def clear_cache(self) -> None:
+        """清空结果缓存（降级第 3 级收紧内存时在进入那一刻调用一次）。"""
+        self._cache.clear()
 
     # ---- 缓存（容量 CACHE_CAP 的 LRU，OrderedDict 实现）----
     def _cache_get(self, key: tuple) -> TopKAnswer | None:
@@ -80,8 +88,12 @@ class QueryService:
             raise BadRequest(f"k 超出范围 {K_MIN}~{K_MAX}")
 
     async def topk(self, d: Dim, window_ms: int, k: int,
-                   at_ms: int | None = None) -> TopKAnswer:
-        """回放 Top-K。API 层会先校验一遍，这里是第二道防线。"""
+                   at_ms: int | None = None, *, from_stream: bool = False) -> TopKAnswer:
+        """回放 Top-K。API 层会先校验一遍，这里是第二道防线。
+
+        from_stream=True（SSE 生产者/补帧调用）：不受第 1 级"暂停回放"影响——
+        SSE 在降级时只降频、不暂停，帧照常按 interval 推送；暂停只对 HTTP 查询。
+        """
         self._check_window(window_ms)
         self._check_k(k)
         now = self.engine.clock.now_ms()
@@ -93,6 +105,12 @@ class QueryService:
                 d, k, window_ms, snap.from_ms, snap.to_ms, False,
                 snap.tops[d][:k], snap.unseen_upper[d],
             )
+
+        # 其余都是回放查询（带 at、或 window 不是 60 秒、或 k 超过快照名单长度）。
+        # 第 1 级降级时暂停 HTTP 回放查询：返回 503 + Retry-After，读快照的默认查询
+        # 照常；SSE 只降频不暂停（from_stream）。
+        if self.controller.replay_paused and not from_stream:
+            raise Overloaded("回放查询在降级期间暂停", retry_after=1)
 
         if at_ms is None:
             at_ms = sec(now) * 1000
@@ -125,6 +143,10 @@ class QueryService:
             snap = self.engine.snapshot
             return StatsAnswer(window_ms, snap.from_ms, snap.to_ms,
                                snap.distinct_users, snap.p95_bytes)
+
+        # 非 60 秒窗口 = 回放（现场合并概要）。第 1 级降级时暂停，返回 503。
+        if self.controller.replay_paused:
+            raise Overloaded("统计查询在降级期间暂停", retry_after=1)
 
         to_ms = sec(now) * 1000
         from_ms = to_ms - window_ms

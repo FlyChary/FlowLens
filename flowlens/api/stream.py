@@ -48,29 +48,37 @@ DEFAULT_MAX_SUBSCRIBERS = 256
 DEFAULT_MIN_RECOMPUTE_SEC = 1.0   # 同一组每秒最多重新计算一次
 DEFAULT_HEARTBEAT_SEC = 15.0      # 每 15 秒发一行 ": ping" 心跳
 DEFAULT_WRITE_TIMEOUT_SEC = 5.0   # 单帧写入超过 5 秒未完成就断开该订阅者
+# 第 1 级降级（SSE 降频）时，同一组的最小重算间隔从 1 秒放宽到 5 秒
+SLOWDOWN_MIN_RECOMPUTE_SEC = 5.0
 
 
-def topk_data(ans: TopKAnswer) -> dict:
+def topk_data(ans: TopKAnswer, *, degraded: bool = False,
+              sample_weight: int = 1) -> dict:
     """把 TopKAnswer 序列化成 /v1/topk 响应同构的 dict（/v1/topk 与 SSE 共用）。
 
     SSE 的 data 字段必须与 /v1/topk 的响应体完全相同，因此两处都从这里取，不写两份。
+    degraded / sample_weight 由调用方按当前降级状态传入（T8）：采样生效时（权重 > 1）
+    额外带 sample_rate 字段（1 / 权重）。
     """
     def fmt(x: float):
         # 整数输出整数，否则保留两位小数（与 /v1/topk 一致）
         return int(x) if float(x).is_integer() else round(float(x), 2)
 
-    return {
+    data = {
         "window_ms": ans.window_ms,
         "from": ans.from_ms,
         "to": ans.to_ms,
         "by": str(ans.dim),
         "k": ans.k,
         "final": ans.final,
-        "degraded": False,  # T8 降级控制器接入后替换
+        "degraded": degraded,
         "unseen_upper": ans.unseen_upper,
         "items": [{"key": it.key, "count": fmt(it.count), "err": fmt(it.err)}
                   for it in ans.items],
     }
+    if sample_weight > 1:
+        data["sample_rate"] = 1.0 / sample_weight
+    return data
 
 
 def fmt_frame(tid: int, payload: dict) -> bytes:
@@ -131,9 +139,17 @@ class SubscriptionGroup:
         self.k = k
         self.interval_ms = interval_ms
         self.min_recompute = min_recompute
+        # 降级控制器（T8）：第 1 级时最小重算间隔放宽（降频）；SSE 不暂停（只降频）
+        self.controller = query_service.controller
         self.subscribers: dict[int, "Subscriber"] = {}
         self.task: asyncio.Task | None = None
         self.frames: deque[tuple[int, dict]] = deque(maxlen=CATCHUP_MAX_FRAMES)
+
+    def recompute_interval_ms(self) -> float:
+        """当前生效的最小重算间隔（毫秒）。第 1 级降级时从 1 秒放宽到 5 秒。"""
+        if self.controller.sse_slowdown:
+            return SLOWDOWN_MIN_RECOMPUTE_SEC * 1000.0
+        return self.min_recompute * 1000.0
 
     def grid(self) -> int:
         """当前时刻对齐到 interval 网格上的帧时刻 T = ⌊now/interval⌋×interval。"""
@@ -155,10 +171,14 @@ class SubscriptionGroup:
         last_compute_g: int | None = None  # 上次真正计算的那一帧的帧时刻
         g = self.grid()
         while True:
-            if payload is None or (g - last_compute_g) >= self.min_recompute * 1000:
+            # 最小重算间隔在运行时可变：第 1 级降级时放宽到 5 秒（降频，帧照常推）
+            if payload is None or (g - last_compute_g) >= self.recompute_interval_ms():
                 try:
-                    ans = await self.qs.topk(self.by, self.window_ms, self.k, g)
-                    payload = topk_data(ans)
+                    ans = await self.qs.topk(self.by, self.window_ms, self.k, g,
+                                             from_stream=True)
+                    # 降级状态与采样权重随帧带上（degraded、采样时 sample_rate）
+                    payload = topk_data(ans, degraded=self.controller.degraded,
+                                        sample_weight=self.controller.sample_weight)
                     last_compute_g = g
                 except Exception:
                     # 单帧计算失败（例如该帧区间恰好早于保留期）：记日志、跳过这一帧，
@@ -236,6 +256,9 @@ class StreamManager:
 
     # ---- 上限（在开始发送流之前检查，失败抛 Overloaded → 503 + Retry-After）----
     def check_limits(self) -> None:
+        # 第 3 级降级：收紧内存，拒绝新的 SSE 订阅（已有订阅保持）
+        if self.qs.controller.tighten_budgets:
+            raise Overloaded("降级期间暂停新的 SSE 订阅", retry_after=1)
         if len(self.groups) >= self.max_groups:
             raise Overloaded("订阅组数已达上限", retry_after=1)
         if self.subscriber_count() >= self.max_subscribers:
@@ -335,11 +358,13 @@ async def _catchup(response, group: SubscriptionGroup, cursor: int, end_tid: int
             # 行为一致），游标照常前进。
             async with compute_lock:  # 现场计算全局串行
                 try:
-                    ans = await group.qs.topk(group.by, group.window_ms, group.k, t)
+                    ans = await group.qs.topk(group.by, group.window_ms, group.k, t,
+                                              from_stream=True)
                 except TooOld:
                     t += interval
                     continue
-                payload = topk_data(ans)
+                payload = topk_data(ans, degraded=group.controller.degraded,
+                                    sample_weight=group.controller.sample_weight)
         await _timed_write(response, fmt_frame(t, payload), write_timeout)
         t += interval
     # 游标不后退：已追平（end_tid < cursor）时保持 cursor

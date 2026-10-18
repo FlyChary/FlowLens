@@ -470,19 +470,34 @@ def test_snapshot_immutability():
     assert 8 <= old.p95_bytes <= 12
 
 
-# ---- ingest(weight=2)：真实次数 *2 落在上下界内 ----
+# ---- ingest(weight=2)：带权采样，保留 1/2、每条权重 2 → 估计围绕真实次数 ----
 
-def test_ingest_weight_doubles_counts():
+def test_ingest_weight_sampling_unbiased():
+    """weight=2 = 确定性采样（保留 h_id%2==0 的约一半）+ 每条权重 2。
+
+    无偏性：一个 key 在窗口内的真实次数 C，采样后保留约 C/2 条、每条记权重 2，
+    加权次数期望 ≈ C（不是 2C）。因此估计应围绕**真实次数**。
+
+    注意：T8 明确"采样期间上下界不再是严格保证"（采样方差可能让加权估计偏离真实
+    次数，上下界也不再严格夹住真实值），所以这里**不**断言 l<=C<=h，只断言估计
+    在真实次数附近的采样方差带内（C 取大一些以减小相对方差）。
+    """
     eng, clock = new_engine()
-    urls = [f"/api/item/{i % 100}" for i in range(500)]
-    ts = [NOW - 1000 + i for i in range(500)]
-    eng.ingest(make_batch([f"e{i}" for i in range(500)], ["u"] * 500, urls, ts, [10] * 500), weight=2)
+    per_key = 200  # 每个 URL 恰好 200 次（相对方差 ~ 1/√C）
+    urls = [f"/api/item/{i % 100}" for i in range(per_key * 100)]
+    # ts 全部落在窗口内、仍在环内的最近几秒（不能超过 NOW，否则判为未来事件丢弃）
+    ts = [NOW - 5000 + (i % 4000) for i in range(len(urls))]
+    eng.ingest(make_batch([f"e{i}" for i in range(len(urls))], ["u"] * len(urls),
+                          urls, ts, [10] * len(urls)), weight=2)
     parts = eng.collect_parts(Dim.URL, split_range(NOW - 60_000, NOW))
     import collections
-    exact = collections.Counter(urls)
+    exact = collections.Counter(urls)  # 每 URL 200 次
+    assert all(c == per_key for c in exact.values())
     lo, hi = for_keys(parts, key_hashes(list(exact)))
     for k, l, h in zip(exact, lo, hi):
-        assert l <= exact[k] * 2 <= h, f"{k}: real*2={exact[k]*2} 不在 [{l},{h}]"
+        c = exact[k]  # = per_key
+        # 加权次数 ≈ 真实次数 c（无偏）；采样方差 ~ ±√(c/2) + CMS 高估 → 宽松区间
+        assert 0.7 * c <= h <= 1.3 * c, f"{k}: 加权次数估计 {h} 偏离真实次数 {c} 太远"
 
 
 # ---- user_id 末尾带 '\x00'：用原始字符串的哈希能查到，次数正确 ----

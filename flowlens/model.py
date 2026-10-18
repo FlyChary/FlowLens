@@ -34,6 +34,11 @@ _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _norm_cache: dict[str, str] = {}
 
 
+def clear_norm_cache() -> None:
+    """清空 URL 归一化缓存（降级第 3 级收紧内存时调用）。"""
+    _norm_cache.clear()
+
+
 @dataclass
 class EventBatch:
     """一批通过校验的事件，按列存放，各列对齐。"""

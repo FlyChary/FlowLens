@@ -172,9 +172,9 @@ def test_shared_computation_same_params():
         calls = []
         real = qs.topk
 
-        async def spy(d, window_ms, k, at_ms=None):
+        async def spy(d, window_ms, k, at_ms=None, **kw):
             calls.append(time.monotonic())
-            return await real(d, window_ms, k, at_ms)
+            return await real(d, window_ms, k, at_ms, **kw)
         qs.topk = spy
         url = "/v1/topk/stream?window=60s&k=10&by=url&interval=200ms"
         try:
@@ -215,9 +215,9 @@ def test_recompute_at_most_once_per_second():
         calls = []
         real = qs.topk
 
-        async def spy(d, window_ms, k, at_ms=None):
+        async def spy(d, window_ms, k, at_ms=None, **kw):
             calls.append(time.monotonic())
-            return await real(d, window_ms, k, at_ms)
+            return await real(d, window_ms, k, at_ms, **kw)
         qs.topk = spy
         try:
             resp = await _open_stream(
@@ -468,10 +468,10 @@ def test_catchup_no_recompute_across_subscribers():
         calls = 0
         real = qs.topk
 
-        async def spy(d, window_ms, k, at_ms=None):
+        async def spy(d, window_ms, k, at_ms=None, **kw):
             nonlocal calls
             calls += 1
-            return await real(d, window_ms, k, at_ms)
+            return await real(d, window_ms, k, at_ms, **kw)
         qs.topk = spy
         url = "/v1/topk/stream?window=60s&k=10&by=url&interval=2s"
         # 常驻读者：保持组存活，让生产者产帧并填进组缓存；记下较早一帧的 id 当重连起点

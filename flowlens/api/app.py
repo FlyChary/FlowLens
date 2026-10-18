@@ -36,10 +36,12 @@ import orjson
 from aiohttp import hdrs, web
 from aiohttp.http import HttpVersion11
 
+from ..degrade import DegradeController
 from ..engine import Engine
 from ..errors import FlowLensError, Overloaded, PayloadTooLarge
 from ..ingest import Admission, IngestService
 from ..memstat import memory_bytes, memory_limit_bytes
+from ..model import clear_norm_cache
 from ..query import QueryService
 from ..ticker import Ticker
 from .params import QueryParams
@@ -54,6 +56,9 @@ log = logging.getLogger(__name__)
 MAX_RAW_BODY_BYTES = 4 * 1024 * 1024
 # RawBudget 总上限：所有正在读取/持有的原始请求体字节数之和
 RAW_BUDGET_LIMIT = 8 * 1024 * 1024
+# 第 3 级降级（收紧内存）时的上限：Admission 由 4 MB 降到 2 MB，RawBudget 由 8 MB 降到 4 MB
+TIGHT_ADMISSION_LIMIT = 2 * 1024 * 1024
+TIGHT_RAW_BUDGET_LIMIT = 4 * 1024 * 1024
 # 分块读取的块大小
 _READ_CHUNK = 256 * 1024
 
@@ -65,6 +70,7 @@ raw_budget_key = web.AppKey("raw_budget", Admission)
 ticker_key = web.AppKey("ticker", Ticker)
 ticker_task_key = web.AppKey("ticker_task", asyncio.Task)
 stream_manager_key = web.AppKey("stream_manager", StreamManager)
+degrade_controller_key = web.AppKey("degrade_controller", DegradeController)
 
 
 def create_app(engine: Engine, ingest_service: IngestService,
@@ -76,13 +82,23 @@ def create_app(engine: Engine, ingest_service: IngestService,
     app[query_service_key] = query_service
     # RawBudget 由 app 持有（create_app 的参数形式保持不变）
     app[raw_budget_key] = Admission(limit=RAW_BUDGET_LIMIT)
+    # 降级控制器（T8）：挂在 app 上，并与 engine（采样权重）和 query_service
+    # （暂停回放）共享同一个实例——否则 engine 的采样与 query 的暂停各看各的级别，
+    # 而"占用率触发第 1 级"这类只有 app 层才喂得进来的状态两边会不一致。
+    controller = DegradeController()
+    engine.controller = controller
+    query_service.controller = controller
+    app[degrade_controller_key] = controller
+    # 级别变化副作用（收紧/恢复预算、进入第 3 级清缓存）：只在实际变化时回调一次
+    controller.on_change = _make_degrade_change_hook(app)
     # Expect: 100-continue 的超大请求在这一步拒绝，客户端不会发送请求体（见 _ingest_expect）
     app.router.add_post("/v1/ingest", _ingest, expect_handler=_ingest_expect)
     app.router.add_get("/v1/topk", _topk)
     app.router.add_get("/v1/stats", _stats)
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/v1/topk/stream", _stream)
-    ticker = Ticker(engine, period=tick_period)
+    ticker = Ticker(engine, period=tick_period, controller=controller,
+                    admission=ingest_service.admission)
     app[ticker_key] = ticker
     # SSE 订阅管理器：参数相同的订阅者共用计算，组数/连接数/计算频率都有上限（T7）
     manager = StreamManager(
@@ -105,6 +121,36 @@ def create_app(engine: Engine, ingest_service: IngestService,
 def _json_response(data, *, status: int = 200) -> web.Response:
     return web.Response(status=status, content_type="application/json",
                         body=orjson.dumps(data))
+
+
+def _make_degrade_change_hook(app: web.Application):
+    """降级控制器级别变化时的副作用（收紧/恢复预算、进入第 3 级清一次缓存）。
+
+    做成工厂、闭包捕获 app，而不是把 app 传进控制器——控制器保持纯逻辑、不依赖
+    aiohttp。只在实际变化时调用一次，所以"进入第 3 级清缓存"确实只在进入那一刻发生。
+    """
+    admission = app[ingest_service_key].admission
+    raw_budget = app[raw_budget_key]
+    query_service = app[query_service_key]
+    normal_adm, tight_adm = admission.limit, TIGHT_ADMISSION_LIMIT
+    normal_raw, tight_raw = raw_budget.limit, TIGHT_RAW_BUDGET_LIMIT
+
+    def on_change(old: int, new: int) -> None:
+        if new >= 3:
+            if old < 3:
+                # 进入第 3 级：收紧两个预算，并清一次结果缓存与 URL 归一化缓存
+                admission.limit = tight_adm
+                raw_budget.limit = tight_raw
+                query_service.clear_cache()
+                clear_norm_cache()
+        elif new < 3:
+            if old >= 3:
+                # 退出第 3 级：恢复预算（缓存不清，重新填充）
+                admission.limit = normal_adm
+                raw_budget.limit = normal_raw
+        # 第 1/2/4 级没有需要延迟执行的副作用（暂停回放/采样/拒写都是读属性即得）
+
+    return on_change
 
 
 def _fmt_num(x: float):
@@ -164,6 +210,11 @@ async def _ingest_expect(request: web.Request) -> web.StreamResponse | None:
     """
     expect = request.headers.get(hdrs.EXPECT, "")
     if request.version == HttpVersion11 and expect.lower() == "100-continue":
+        # 第 4 级降级：在客户端发送请求体之前就直接 503（与 _ingest 的拒写口径一致）
+        if request.app[degrade_controller_key].reject_ingest:
+            resp = _json_response({"error": "降级期间暂停写入"}, status=503)
+            resp.headers["Retry-After"] = "1"
+            return resp
         cl = request.content_length
         if cl is not None and cl > MAX_RAW_BODY_BYTES:
             # 超大：直接 413，客户端不会发送请求体
@@ -224,6 +275,10 @@ async def _read_raw_body(request: web.Request, budget: Admission) -> bytes:
 
 async def _ingest(request: web.Request) -> web.Response:
     svc = request.app[ingest_service_key]
+    # 第 4 级降级：在读取请求体之前直接拒绝。此时还没写入任何去重状态，
+    # 调用方重试是安全的（CLAUDE.md 规则 2）。
+    if request.app[degrade_controller_key].reject_ingest:
+        raise Overloaded("降级期间暂停写入", retry_after=1)
     body = await _read_raw_body(request, request.app[raw_budget_key])
     result = await svc.ingest(body, request.headers.get("Content-Encoding"))
     return _json_response({
@@ -235,13 +290,16 @@ async def _ingest(request: web.Request) -> web.Response:
 
 
 async def _topk(request: web.Request) -> web.Response:
+    ctrl = request.app[degrade_controller_key]
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms)
     ans = await request.app[query_service_key].topk(qp.by, qp.window_ms, qp.k, qp.at_ms)
-    return _json_response(topk_data(ans))
+    return _json_response(topk_data(ans, degraded=ctrl.degraded,
+                                    sample_weight=ctrl.sample_weight))
 
 
 async def _stats(request: web.Request) -> web.Response:
+    ctrl = request.app[degrade_controller_key]
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms, need_k=False, need_by=False)
     s = await request.app[query_service_key].stats(qp.window_ms)
@@ -253,7 +311,7 @@ async def _stats(request: web.Request) -> web.Response:
         # 区间内没有数据时 p95 是 NaN：orjson 默认输出 null（不出现 NaN 字面量）
         "approx_p95_bytes": _fmt_num(s.p95_bytes) if s.p95_bytes == s.p95_bytes else None,
         "memory_bytes": memory_bytes(),
-        "degraded": False,  # T8 降级控制器接入后替换
+        "degraded": ctrl.degraded,
     })
 
 
@@ -261,12 +319,14 @@ async def _healthz(request: web.Request) -> web.Response:
     c = request.app[query_service_key].engine.counters
     t = request.app[ticker_key]
     mgr = request.app[stream_manager_key]
+    ctrl = request.app[degrade_controller_key]
     return _json_response({
         "ok": True,
         "events_ingested": c.events_ingested,
         "memory_bytes": memory_bytes(),
         "memory_limit_bytes": memory_limit_bytes(),  # 无上限时为 null
-        "degraded": False,  # T8 降级控制器接入后替换
+        "degraded": ctrl.degraded,
+        "degrade": ctrl.status(),
         "deduped": c.deduped,
         "late": c.late,
         "invalid": c.invalid,

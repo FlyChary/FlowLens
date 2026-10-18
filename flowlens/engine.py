@@ -13,6 +13,7 @@ import numpy as np
 from .bounds import Part, top_k
 from .config import Config
 from .dedup import GenerationalBloom
+from .degrade import DegradeController
 from .dims import ALL_DIMS, Dim
 from .errors import TooOld
 from .hashing import key_hashes
@@ -81,9 +82,12 @@ class _Plan:
 
 
 class Engine:
-    def __init__(self, cfg: Config, clock: Clock):
+    def __init__(self, cfg: Config, clock: Clock,
+                 controller: "DegradeController | None" = None):
         self.cfg = cfg
         self.clock = clock
+        # 降级控制器（T8）：采样权重在 ingest 时读取；None 时视为不降级（weight 恒 1）
+        self.controller = controller if controller is not None else DegradeController()
         self.trees = [Tree(cfg.tree_config(d)) for d in ALL_DIMS]
         self.ring = Ring(cfg.dim_specs(), self._on_finalize)
         self.bloom = GenerationalBloom(cfg.bloom)
@@ -176,9 +180,19 @@ class Engine:
         self.refresh_snapshot()
 
     # ---- 写入 ----
-    def ingest(self, batch: EventBatch, weight: int = 1) -> IngestResult:
+    def ingest(self, batch: EventBatch, weight: int | None = None) -> IngestResult:
+        """写入一批事件。weight 缺省时取控制器当前的 sample_weight（T8 带权采样）。
+
+        采样（weight > 1）：按 event_id 哈希做**确定性**采样，保留比例 1/weight。
+        同一事件被重试时取舍一致（取决于 event_id 本身，与时间无关）。采样只作用于
+        Top-K 名单（hh）与 url 维度的 p95（DDSketch）；HLL（user 维 stats）与
+        event_id 去重始终全量。weight == 1（未降级）时走原来的 DimBucket.observe，
+        正常路径结果与 T7b 完全一致。
+        """
         now = self.clock.now_ms()
         self.bloom.advance(now)  # 幂等，确保当前范围的代已就绪
+        # 采样权重：显式传参优先（测试/基准用），否则取控制器的当前权重
+        w = weight if weight is not None else self.controller.sample_weight
 
         ts = batch.ts
         cls = classify(ts, now)
@@ -208,31 +222,54 @@ class Engine:
                 # dtype=object：定长字符串数组会把短串补 '\x00'，既改变哈希值，又比 object 慢约 7 倍
                 users = np.asarray(batch.users, dtype=object)[k_idx]
                 urls = np.asarray(batch.urls, dtype=object)[k_idx]
-                h_user = key_hashes(users)
-                h_url = key_hashes(urls)
+                # 采样才需要 event_id 的哈希：按它取模判采样（确定性、与时间无关）——
+                # 同一事件（同 event_id）无论重试多少次、何时重试，取舍都一致；与
+                # "这次是不是重复"解耦，重试语义稳定。
+                h_id = key_hashes([batch.ids[i] for i in k_idx.tolist()]) if w > 1 else None
                 # 按秒分组：一次 argsort 排好秒号后按边界切片，而不是对每一秒做整批布尔掩码
                 order = np.argsort(a_ts2 // 1000, kind="stable")
                 a_ts2 = a_ts2[order]
-                h_user = h_user[order]
-                h_url = h_url[order]
+                if h_id is not None:
+                    h_id = h_id[order]
                 a_bytes = a_bytes[order]
                 users = users[order]
                 urls = urls[order]
                 s_all = a_ts2 // 1000
                 bnd = np.flatnonzero(np.r_[True, s_all[1:] != s_all[:-1]])
                 bnd = np.append(bnd, len(s_all))
-                weights = np.full(len(s_all), weight, dtype=np.uint64)
-                payload = {Dim.URL: (h_url, urls), Dim.USER: (h_user, users)}
+                # 两维度的哈希始终全量算（HLL 不采样；不采样路径也用到 url 哈希）
+                h_user = key_hashes(users)
+                h_url = key_hashes(urls)
+                weights = np.full(len(s_all), w, dtype=np.uint64)
+                if w > 1:
+                    # 采样（weight>1）：采样掩码 h_id % w == 0 保留（确定性、与时间无关）
+                    sm = (h_id % w) == 0
+                else:
+                    # 不采样（weight=1，未降级）：与 T7b 完全相同的写入路径
+                    payload = {Dim.URL: (h_url, urls), Dim.USER: (h_user, users)}
                 for j in range(len(bnd) - 1):
                     s = int(s_all[bnd[j]])
-                    sl = slice(bnd[j], bnd[j + 1])
+                    sl = slice(int(bnd[j]), int(bnd[j + 1]))
                     b = self.ring.slot(s)
                     if b is None:  # 这一秒已定稿离开环
                         late_at_engine += int(bnd[j + 1] - bnd[j])
                         continue
-                    for d in ALL_DIMS:
-                        h, ks = payload[d]
-                        b.dims[d].observe(h[sl], ks[sl].tolist(), a_bytes[sl], weights[sl])
+                    if w > 1:
+                        # 这一秒的采样子集（Top-K 名单两维 + url p95 用）
+                        lo, hi = int(bnd[j]), int(bnd[j + 1])
+                        sel = lo + np.flatnonzero(sm[lo:hi])
+                        # Top-K 名单：两维都用采样后事件、权重 w
+                        b.dims[Dim.URL].hh.observe(h_url[sel], urls[sel].tolist(), weights[sel])
+                        b.dims[Dim.USER].hh.observe(h_user[sel], users[sel].tolist(), weights[sel])
+                        # url 维 p95（DDSketch）：采样后事件、权重 w
+                        b.dims[Dim.URL].stats.observe(h_url[sel], a_bytes[sel], weights[sel])
+                        # user 维 HLL：始终全量、权重 1（不采样）
+                        b.dims[Dim.USER].stats.observe(h_user[sl], a_bytes[sl],
+                                                       np.ones(hi - lo, dtype=np.uint64))
+                    else:
+                        for d in ALL_DIMS:
+                            h, ks = payload[d]
+                            b.dims[d].observe(h[sl], ks[sl].tolist(), a_bytes[sl], weights[sl])
                     accepted += int(bnd[j + 1] - bnd[j])  # 只算真正写进桶的条数
 
         late += late_at_engine
