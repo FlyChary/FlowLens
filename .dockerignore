@@ -1,0 +1,31 @@
+# 不进镜像的东西：版本库、测试、文档、基准/实验脚本、缓存、构建产物、虚拟环境
+.git
+.gitignore
+.dockerignore
+Dockerfile
+run.sh
+tests/
+docs/
+tools/
+README.md
+AI_LOG.md
+CLAUDE.md
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+flowlens_env/
+
+# 实验用的大请求体（运行时临时生成，不入库也不进镜像）
+tools/exp/big5mb.bin

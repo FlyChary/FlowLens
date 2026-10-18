@@ -45,6 +45,7 @@ from ..memstat import memory_bytes, memory_limit_bytes
 from ..model import clear_norm_cache
 from ..query import QueryService
 from ..ticker import Ticker
+from . import debug
 from .params import QueryParams
 from .stream import (DEFAULT_HEARTBEAT_SEC, DEFAULT_MAX_GROUPS,
                      DEFAULT_MAX_SUBSCRIBERS, DEFAULT_MIN_RECOMPUTE_SEC,
@@ -127,6 +128,9 @@ def create_app(engine: Engine, ingest_service: IngestService,
     app.on_startup.append(_start_ticker)
     app.on_shutdown.append(_stop_ticker)
     app.on_shutdown.append(_stop_stream)
+    # 调试接口（B1）：仅 FLOWLENS_DEBUG=1 时注册，未设置时访问 /debug/* 返回 404
+    if debug.is_enabled():
+        debug.register(app)
     return app
 
 
