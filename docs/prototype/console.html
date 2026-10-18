@@ -93,6 +93,12 @@ main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
 .evhead .seg button { padding: 3px 8px; font-size: 12px; }
 .evhead .note { font-size: 12.5px; color: var(--muted); flex-basis: 100%; }
 #evchart { cursor: crosshair; }
+.cmp { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 24px; }
+.cmp h3 { font-size: 13.5px; font-weight: 600; margin: 0 0 6px; }
+.cmp svg { width: 100%; height: auto; display: block; }
+.chart.sm { height: 92px; margin-bottom: 10px; }
+.cmp .keyline { margin-bottom: 4px; }
+@media (max-width: 1180px) { .cmp { grid-template-columns: minmax(0, 1fr); } }
 
 svg text { fill: var(--muted); font-size: 11px; }
 svg .ink { fill: var(--ink); }
@@ -289,6 +295,28 @@ svg .ink { fill: var(--ink); }
         <button class="btn" id="qBtn">高亮这个查询</button>
         <button class="btn" id="qClear">清除</button>
         <div class="result" id="qResult" aria-live="polite">输入一个查询区间，看它如何被拆成环内秒桶、线段树节点和两端的边缘秒。</div>
+      </div>
+    </section>
+
+    <section class="panel" id="cmpPanel" hidden aria-labelledby="cmpTitle">
+      <h2 id="cmpTitle">估计与真实对比</h2>
+      <p class="hint">真实值来自离线精确解：压测时存档发出的每一条事件，回放时对同一区间计算精确答案。拖动回放滑块，下面的内容会切换到那一刻。</p>
+      <div class="cmp">
+        <div>
+          <h3>此刻的 Top-10（最近 60 秒，按 URL）</h3>
+          <div class="keyline"><span><i style="background:var(--write);opacity:.35;height:8px"></i>服务的估计值</span><span><i style="background:var(--write);height:8px"></i>服务给出的 [下界, 上界]</span><span><i style="background:var(--read);width:3px;height:12px;vertical-align:-2px"></i>真实值</span></div>
+          <svg id="cmpTop" viewBox="0 0 640 300" role="img" aria-label="Top-10 估计值与真实值对比"></svg>
+        </div>
+        <div>
+          <div class="kpis" id="cmpKpis"></div>
+          <h3>Top-1 计数</h3>
+          <canvas class="chart sm" id="cTop1"></canvas>
+          <h3>去重用户数</h3>
+          <canvas class="chart sm" id="cUsers"></canvas>
+          <h3>p95 响应字节</h3>
+          <canvas class="chart sm" id="cP95"></canvas>
+          <div class="keyline"><span><i style="background:var(--write)"></i>估计值</span><span><i style="background:var(--read)"></i>真实值</span><span><i style="background:var(--write);opacity:.2;height:8px"></i>[下界, 上界]</span></div>
+        </div>
       </div>
     </section>
 
@@ -524,13 +552,17 @@ function windowTopK(frameSec) {
   const d = S.dist;
   const rows = [];
   for (let r = 1; r <= 10; r++) {
-    if (d === 'rnd') rows.push({ k: '/r/x' + Math.floor(Math.random() * 9e6), c: 1, e: 1 });
+    if (d === 'rnd') rows.push({ k: '/r/x' + Math.floor(Math.random() * 9e6), c: 1, e: 0 });
     else if (d === 'uni') { const c = Math.max(1, Math.round(E / KEYSPACE * rnd(1.6, 2.4))); rows.push({ k: keyOf(r * 977, frameSec), c, e: Math.max(1, Math.round(c * 0.3)) }); }
     else { const c = Math.round(E * pz(r) * rnd(0.985, 1.015)); rows.push({ k: keyOf(r, frameSec), c, e: Math.max(0, Math.round(c * 0.002 + rnd(0, 3))) }); }
   }
+  // 模拟离线精确解：Count-Min 只会高估，真实值落在 [估计 − 误差, 估计] 内
+  for (const row of rows) { row.lo = Math.max(0, row.c - row.e); row.t = Math.round(row.lo + (row.c - row.lo) * Math.random()); }
   rows.sort((a, b) => b.c - a.c || a.k.localeCompare(b.k));
-  const users = S.dist === 'rnd' ? E : USERS * (1 - Math.exp(-E / USERS));
-  return { rows, users: users * rnd(0.993, 1.007), p95: 10918 * rnd(0.99, 1.01), E };
+  const missing = d === 'uni' && Math.random() < 0.5 ? [{ k: keyOf(4321, frameSec), t: rows[rows.length - 1].t + 1 }] : [];
+  const usersTrue = S.dist === 'rnd' ? E : USERS * (1 - Math.exp(-E / USERS));
+  const p95True = 10918 * rnd(0.997, 1.003);
+  return { rows, missing, users: usersTrue * rnd(0.993, 1.007), usersTrue, p95: p95True * rnd(0.993, 1.007), p95True, E };
 }
 
 function recordFrame(m) {
@@ -815,17 +847,35 @@ function lineChart(id, frames, series, opt) {
   ctx.clearRect(0, 0, W, Hh);
   const pad = { l: 40, r: 6, t: 8, b: 16 };
   const n = 120, data = frames.slice(-n);
-  let ymax = opt.min || 1;
+  let ymax = opt.min || 1, ymin = 0;
   for (const f of data) for (const s of series) ymax = Math.max(ymax, s.get(f));
+  if (opt.band) for (const f of data) ymax = Math.max(ymax, opt.band.hi(f));
   if (opt.limit) ymax = Math.max(ymax, opt.limit * 1.08);
-  ymax *= 1.08;
+  if (opt.zoom) {
+    // 纵轴缩放到数据附近：1% 以内的误差从 0 开始画根本看不出来
+    let lo = Infinity, hi = -Infinity;
+    for (const f of data) {
+      for (const s of series) { lo = Math.min(lo, s.get(f)); hi = Math.max(hi, s.get(f)); }
+      if (opt.band) { lo = Math.min(lo, opt.band.lo(f)); hi = Math.max(hi, opt.band.hi(f)); }
+    }
+    const padv = Math.max((hi - lo) * 0.15, Math.abs(hi) * 0.004, 1);
+    ymin = lo - padv; ymax = hi + padv;
+    if (lo >= 0) ymin = Math.max(0, ymin);  // 计数不会是负数
+  } else ymax *= 1.08;
   const X = i => pad.l + (W - pad.l - pad.r) * (i + n - data.length) / (n - 1);
-  const Y = v => pad.t + (Hh - pad.t - pad.b) * (1 - v / ymax);
+  const Y = v => pad.t + (Hh - pad.t - pad.b) * (1 - (v - ymin) / (ymax - ymin));
   ctx.strokeStyle = css('--faint'); ctx.lineWidth = 1; ctx.fillStyle = css('--muted'); ctx.font = '11px system-ui, sans-serif';
-  for (let g = 0; g <= 3; g++) {
-    const v = ymax * g / 3, y = Y(v);
+  const grids = opt.zoom ? 2 : 3;
+  for (let g = 0; g <= grids; g++) {
+    const v = ymin + (ymax - ymin) * g / grids, y = Y(v);
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
     ctx.fillText(opt.fmt(v), 2, y + 4);
+  }
+  if (opt.band && data.length) {
+    ctx.fillStyle = css(opt.band.color); ctx.globalAlpha = 0.2; ctx.beginPath();
+    data.forEach((f, i) => { const x = X(i), y = Y(opt.band.hi(f)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    for (let i = data.length - 1; i >= 0; i--) ctx.lineTo(X(i), Y(opt.band.lo(data[i])));
+    ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
   }
   if (opt.limit) {
     ctx.strokeStyle = css('--danger'); ctx.setLineDash([4, 3]);
@@ -837,7 +887,53 @@ function lineChart(id, frames, series, opt) {
     ctx.stroke();
   }
   ctx.fillStyle = css('--muted');
-  ctx.fillText('最近 2 分钟', W - pad.r - 64, Hh - 2);
+  if (!opt.noCaption) ctx.fillText('最近 2 分钟', W - pad.r - 64, Hh - 2);
+}
+
+// ===================== 回放：估计与真实对比 =====================
+const pct = v => (v >= 0 ? '+' : '−') + Math.abs(v * 100).toFixed(2) + '%';
+function renderCompare(frames) {
+  const f = frames[frames.length - 1], tk = f.tk;
+  const rows = tk.rows.map(r => ({ ...r })), missing = tk.missing || [];
+  const all = rows.concat(missing.map(m => ({ k: m.k, t: m.t, miss: true })));
+  const maxV = Math.max(1, ...all.map(r => Math.max(r.c || 0, r.t)));
+  const RH = 26, KX = 0, BX = 230, BW = 330, EX = 640;
+  const X = v => BX + v / maxV * BW;
+  let h = '';
+  all.forEach((r, i) => {
+    const y = 8 + i * RH, cy = y + 9;
+    h += `<text x="${KX}" y="${cy + 4}" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px" class="ink">${i + 1}. ${r.k}</text>`;
+    h += `<rect x="${BX}" y="${cy - 7}" width="${BW}" height="14" rx="2" style="fill:var(--faint)"/>`;
+    if (!r.miss) {
+      h += `<rect x="${BX}" y="${cy - 5}" width="${(X(r.c) - BX).toFixed(1)}" height="10" rx="2" style="fill:var(--write);opacity:.35"/>`;
+      h += `<rect x="${X(r.lo).toFixed(1)}" y="${cy - 5}" width="${Math.max(2, X(r.c) - X(r.lo)).toFixed(1)}" height="10" rx="1" style="fill:var(--write)"/>`;
+    }
+    h += `<rect x="${(X(r.t) - 1.5).toFixed(1)}" y="${cy - 9}" width="3" height="18" rx="1" style="fill:var(--read)"/>`;
+    const label = r.miss ? '漏报' : r.t ? pct((r.c - r.t) / r.t) : '—';
+    h += `<text x="${EX}" y="${cy + 4}" text-anchor="end" style="${r.miss ? 'fill:var(--danger);font-weight:600' : ''}">${label}</text>`;
+  });
+  const H = 8 + all.length * RH + 6;
+  const svg = document.getElementById('cmpTop');
+  svg.setAttribute('viewBox', `0 0 640 ${H}`);
+  svg.innerHTML = h;
+  // 此刻的四项指标
+  const exact = all.slice().sort((a, b) => b.t - a.t).slice(0, 10), tenth = exact[exact.length - 1].t;
+  const hits = rows.filter(r => r.t >= tenth).length;
+  const errs = rows.filter(r => r.t > 0).map(r => Math.abs(r.c - r.t) / r.t).sort((a, b) => a - b);
+  const med = errs.length ? errs[Math.floor(errs.length / 2)] : 0;
+  const ue = (tk.users - tk.usersTrue) / Math.max(1, tk.usersTrue), pe = (tk.p95 - tk.p95True) / tk.p95True;
+  document.getElementById('cmpKpis').innerHTML =
+    `<div class="kpi"><b>${Math.min(10, hits)} / 10</b>Top-10 召回</div>` +
+    `<div class="kpi"><b>${(med * 100).toFixed(2)}%</b>计数误差中位数</div>` +
+    `<div class="kpi"><b>${pct(ue)}</b>去重用户数</div>` +
+    `<div class="kpi"><b>${pct(pe)}</b>p95</div>`;
+  const short = v => v >= 1e5 ? (v / 1e4).toFixed(1) + '万' : Math.round(v).toLocaleString('zh-CN');
+  lineChart('cTop1', frames, [{ get: f => f.tk.rows[0].c, color: '--write', w: 1.6 }, { get: f => f.tk.rows[0].t, color: '--read', w: 1.6 }],
+    { fmt: short, zoom: true, noCaption: true, band: { lo: f => f.tk.rows[0].lo, hi: f => f.tk.rows[0].c, color: '--write' } });
+  lineChart('cUsers', frames, [{ get: f => f.tk.users, color: '--write', w: 1.6 }, { get: f => f.tk.usersTrue, color: '--read', w: 1.6 }],
+    { fmt: short, zoom: true, noCaption: true });
+  lineChart('cP95', frames, [{ get: f => f.tk.p95, color: '--write', w: 1.6 }, { get: f => f.tk.p95True, color: '--read', w: 1.6 }],
+    { fmt: short, zoom: true, noCaption: true });
 }
 const fmt = v => v >= 1e6 ? (v / 1e6).toFixed(1) + ' 百万' : v >= 1e4 ? (v / 1e4).toFixed(1) + ' 万' : Math.round(v).toLocaleString('zh-CN');
 const hms = s => { const d = new Date(s * 1000); return d.toTimeString().slice(0, 8); };
@@ -885,6 +981,7 @@ function renderAll(frames) {
   renderEvents(f, q && !q.err ? q : null);
   renderQuery(q);
   renderPanels(frames);
+  if (mode === 'replay') renderCompare(frames);
 }
 
 // ===================== 定稿动画：最旧的秒桶飞进线段树 =====================
@@ -1002,6 +1099,7 @@ function setMode(m) {
   mode = m;
   $('modeLive').setAttribute('aria-pressed', m === 'live'); $('modeReplay').setAttribute('aria-pressed', m === 'replay');
   $('replayBar').classList.toggle('on', m === 'replay');
+  $('cmpPanel').hidden = m !== 'replay';
   if (m === 'replay') {
     const sl = $('replaySlider'); sl.max = S.frames.length - 1; sl.value = sl.max; replayIdx = +sl.value;
     $('replayLen').textContent = S.frames.length;
