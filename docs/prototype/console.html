@@ -577,7 +577,9 @@ function recordFrame(m) {
   const tk = windowTopK(S.cur);
   const sse = S.run && S.run.scen === 'mixed' ? [4, 64] : [1, 2];
   S.frames.push({ m, cur: S.cur, ringNext: S.cur - WIN, newest: S.newest, slots, nodes, builders, tk, sse, ingested: S.ingested });
-  if (S.frames.length > 300) { S.frames.shift(); S.dropped = (S.dropped || 0) + 1; }
+  // 回放时暂不丢旧帧（最多 15 分钟），避免正在看的那一帧被挤掉；回到实时后恢复为 5 分钟
+  const cap = S.replaying ? 900 : 300;
+  while (S.frames.length > cap) { S.frames.shift(); S.dropped = (S.dropped || 0) + 1; }
 }
 
 // 预热：先跑 700 个模拟秒，让线段树有完整的 10 分钟历史
@@ -1119,6 +1121,7 @@ function setPlaying(p) {
 }
 function setMode(m) {
   mode = m;
+  S.replaying = m === 'replay';
   if (m !== 'replay') setPlaying(false);
   $('modeLive').setAttribute('aria-pressed', m === 'live'); $('modeReplay').setAttribute('aria-pressed', m === 'replay');
   $('replayBar').classList.toggle('on', m === 'replay');
