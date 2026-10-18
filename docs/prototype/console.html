@@ -144,6 +144,8 @@ svg .ink { fill: var(--ink); }
 .replay { display: none; align-items: center; gap: 12px; padding: 10px 24px; background: var(--state-soft); border-bottom: 1px solid var(--line); font-size: 13px; }
 .replay.on { display: flex; }
 .replay input { flex: 1; accent-color: var(--state); }
+.replay .btn { flex: 0 0 auto; padding: 4px 14px; min-width: 72px; }
+.replay .btn[aria-pressed="true"] { background: var(--state); border-color: var(--state); color: var(--panel); }
 
 #tip {
   position: fixed; z-index: 20; pointer-events: none; max-width: 300px;
@@ -183,6 +185,7 @@ svg .ink { fill: var(--ink); }
   </div>
 </header>
 <div class="replay" id="replayBar">
+  <button class="btn" id="playBtn" aria-pressed="false">播放</button>
   <span>回放最近 <b id="replayLen">0</b> 秒</span>
   <input type="range" id="replaySlider" min="0" max="0" value="0" aria-label="回放时刻">
   <span id="replayAt">--</span>
@@ -574,7 +577,7 @@ function recordFrame(m) {
   const tk = windowTopK(S.cur);
   const sse = S.run && S.run.scen === 'mixed' ? [4, 64] : [1, 2];
   S.frames.push({ m, cur: S.cur, ringNext: S.cur - WIN, newest: S.newest, slots, nodes, builders, tk, sse, ingested: S.ingested });
-  if (S.frames.length > 300) S.frames.shift();
+  if (S.frames.length > 300) { S.frames.shift(); S.dropped = (S.dropped || 0) + 1; }
 }
 
 // 预热：先跑 700 个模拟秒，让线段树有完整的 10 分钟历史
@@ -1080,6 +1083,7 @@ $('speedSeg').addEventListener('click', ev => {
   speed = +b.dataset.speed;
   [...$('speedSeg').children].forEach(x => x.setAttribute('aria-pressed', x === b));
   restart();
+  if (playing) setPlaying(true);
 });
 $('treeSeg').addEventListener('click', ev => {
   const b = ev.target.closest('button'); if (!b) return;
@@ -1095,8 +1099,27 @@ $('qBtn').addEventListener('click', () => {
   draw();
 });
 $('qClear').addEventListener('click', () => { query = null; draw(); });
+// 回放播放：按“模拟速度”逐帧前进，到最新一帧自动暂停
+let playing = false, playTimer = null;
+function setPlaying(p) {
+  playing = p;
+  const b = $('playBtn');
+  b.textContent = p ? '暂停' : '播放';
+  b.setAttribute('aria-pressed', p);
+  clearInterval(playTimer); playTimer = null;
+  if (!p) return;
+  if (replayIdx >= S.frames.length - 1) replayIdx = 0;  // 在末尾按播放：从头开始
+  $('replaySlider').value = replayIdx; draw();
+  playTimer = setInterval(() => {
+    if (replayIdx >= S.frames.length - 1) { setPlaying(false); return; }
+    replayIdx += 1;
+    $('replaySlider').value = replayIdx;
+    draw();
+  }, 1000 / speed);
+}
 function setMode(m) {
   mode = m;
+  if (m !== 'replay') setPlaying(false);
   $('modeLive').setAttribute('aria-pressed', m === 'live'); $('modeReplay').setAttribute('aria-pressed', m === 'replay');
   $('replayBar').classList.toggle('on', m === 'replay');
   $('cmpPanel').hidden = m !== 'replay';
@@ -1109,18 +1132,31 @@ function setMode(m) {
 $('modeLive').addEventListener('click', () => setMode('live'));
 $('modeReplay').addEventListener('click', () => setMode('replay'));
 $('replaySlider').addEventListener('input', ev => { replayIdx = +ev.target.value; draw(); });
+$('playBtn').addEventListener('click', () => setPlaying(!playing));
 
 function draw() {
   const frames = mode === 'live' ? S.frames : S.frames.slice(0, replayIdx + 1);
   renderAll(frames);
-  if (mode === 'replay') $('replayAt').textContent = hms(frames[frames.length - 1].cur);
+  if (mode === 'replay') {
+    const fc = frames[frames.length - 1].cur, ago = S.cur - fc;
+    $('replayAt').textContent = hms(fc) + (ago > 0 ? `（${ago} 秒前）` : '（最新）');
+  }
 }
 function tick() {
   let leaves = [];
+  const dropped0 = S.dropped || 0;
   for (let i = 0; i < speed; i++) leaves = step(true);
   updateRunStatus();
   if (mode === 'live') draw();
-  else { $('replaySlider').max = S.frames.length - 1; $('replayLen').textContent = S.frames.length; }
+  else {
+    // 回放缓存满了会丢掉最旧的帧，下标要跟着前移，保证正在看的还是同一秒
+    const shift = (S.dropped || 0) - dropped0;
+    if (shift) replayIdx = Math.max(0, replayIdx - shift);
+    $('replaySlider').max = S.frames.length - 1; $('replaySlider').value = replayIdx;
+    $('replayLen').textContent = S.frames.length;
+    const fc = S.frames[replayIdx].cur, ago = S.cur - fc;
+    $('replayAt').textContent = hms(fc) + (ago > 0 ? `（${ago} 秒前）` : '（最新）');
+  }
   if (speed === 1) leaves.forEach(l => flyLeaf(l.sec));
 }
 function restart() { clearInterval(timer); timer = setInterval(tick, 1000); }
