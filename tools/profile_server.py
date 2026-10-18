@@ -1,8 +1,14 @@
-"""T11a 端到端 CPU 剖析工具（两种模式，任务书见 docs/instructions/T11a.md）。
+"""T11a 端到端 CPU 剖析工具（两种模式，任务书见 docs/instructions/T11a-2.md）。
 
-只做一次固定速率测量：速率 20 万/秒、每批 5000 条、不 gzip，预热 30 s + 测量
-30 s（loadgen 时长 = 预热 + 测量 + 收尾余量）。回答"在不受内存降级干扰的情况下，
-服务处理每条事件的 CPU 时间花在了哪里"。
+两次固定速率测量：10 万/秒（接近单核上限，测处理能力）与 6 万/秒（较低负载，
+测事件循环延迟与垃圾回收停顿），均为每批 5000 条、不 gzip、预热 30 s + 测量
+30 s。测量窗口按墙钟截止时间（time.monotonic）计满 measure 秒；loadgen 时长
+= 预热 + 测量 + 3 s 启动延迟 + 10 s 余量，全程覆盖测量窗口。回答"在不受内存
+降级干扰的情况下，服务处理每条事件的 CPU 时间花在了哪里"。
+
+垃圾回收单独计账：每次回收的起止墙钟时刻记进 GC_EVENTS；各阶段按"调用时段与
+回收时段的交叠"扣除回收耗时（gc_us），阶段数字才反映其自身开销。URL 归一化
+缓存的命中率在运行时包装 flowlens.model.normalize_url / _normalize_url 统计。
 
 serve 模式（容器内运行）：
   - 与 flowlens/__main__.py 完全相同的方式创建真实服务（make_engine + create_app），
@@ -32,6 +38,7 @@ run 模式（WSL 宿主上运行）：
 
 import argparse
 import asyncio
+import bisect
 import gc
 import json
 import os
@@ -50,8 +57,24 @@ from pathlib import Path
 STAGES: dict[str, list] = {}
 # 事件循环延迟探针采到的延迟（微秒）：任务从"计划执行"到"实际执行"的间隔
 LOOP_LAT_US: list[float] = []
-# 每次 gc 回收的事件：{"gen", "t"(相对测量起点，秒), "us", "collected"}
+# 每次 gc 回收的事件：{"gen", "t"(相对测量起点，秒), "us", "collected",
+# "s"(回收开始的墙钟 monotonic), "e"(回收结束的墙钟 monotonic)}
 GC_EVENTS: list[dict] = []
+# 每次回收的墙钟区间 [(start, end)]，按时间顺序追加、单调递增、互不重叠。各阶段
+# "扣除 GC"用它：阶段调用时段 [t0, t1] 与回收区间的交叠之和就是"该调用里事件循环
+# 正被回收占住"的时间——它同样烧进程 CPU、process_time 差值里含它，但不是该阶段
+# 自己的活。GC_ENDS 是 end 的平行列表（同序），供 bisect 二分定位候选区间，把每次
+# 调用的扣除开销压到 O(log n)（回收稀疏，绝大多数调用与任何回收都不相交）。
+GC_SPANS: list[tuple[float, float]] = []
+GC_ENDS: list[float] = []
+# URL 归一化缓存统计（包装 flowlens.model.normalize_url / _normalize_url 累计，
+# 测量起点清零）：[总调用次数, 未命中次数, 未命中累计耗时 ns, 未命中中带 ID 段
+# 的原始 URL 数]
+NORM_STATS: list = [0, 0, 0, 0]
+# 查询延迟探针采到的查询端到端延迟（毫秒）：每 250 ms 走一次真实
+# QueryService.topk（url 维、60 s 窗口、k=10），wall 口径。直接回答"低负载下
+# 查询 p99 能否低于 50 ms"（T11a-2 第三节第 5 条）
+QUERY_LAT_MS: list[float] = []
 # 每秒的真实工作集（MiB）
 MEM_MB: list[float] = []
 # 测量起点（monotonic）与起点时的进程 CPU 时间（秒）
@@ -75,29 +98,57 @@ ALL_STAGES = TOP_STAGES + INGEST_SUBS
 IO_BOUND_STAGES = {"read_body"}
 
 
-def _record(name: str, wall_ns: int, cpu_ns: int) -> None:
-    # STAGES[name] = [累计 wall ns, 调用次数, 累计 cpu ns]
+def _record(name: str, wall_ns: int, cpu_ns: int, gc_ns: int = 0) -> None:
+    # STAGES[name] = [累计 wall ns, 调用次数, 累计 cpu ns, 累计 gc ns（扣除项）]
     e = STAGES.get(name)
     if e is None:
-        e = STAGES[name] = [0, 0, 0]
+        e = STAGES[name] = [0, 0, 0, 0]
     e[0] += wall_ns
     e[1] += 1
     e[2] += cpu_ns
+    e[3] += gc_ns
+
+
+def _gc_overlap_ns(t0: float, t1: float) -> int:
+    """调用时段 [t0, t1]（monotonic 秒）与所有回收区间的交叠之和（ns）。
+
+    回收与调用都在事件循环单线程里发生，交叠部分烧的进程 CPU 既算进该阶段的
+    process_time 差值、也不是它自己的活——从该阶段 wall 与 cpu 里各扣一次
+    （单线程下这段时间两者相等）。
+
+    候选区间只有"end > t0 且 start < t1"的那些；end 单调递增，用 bisect 定位
+    end > t0 的第一个下标，再顺序走到 start >= t1 为止（区间互不重叠，候选数
+    通常 ≤2）。回收稀疏时绝大多数调用在此直接返回 0。
+    """
+    i = bisect.bisect_right(GC_ENDS, t0)
+    total = 0
+    while i < len(GC_SPANS):
+        s, e = GC_SPANS[i]
+        if s >= t1:
+            break
+        lo, hi = max(t0, s), min(t1, e)
+        if hi > lo:
+            total += int((hi - lo) * 1e9)
+        i += 1
+    return total
 
 
 def _wrap_sync(stage: str, fn):
     """同步函数的包装：计时累加到 stage，返回值原样传回（不改行为）。
 
     同时记 wall（perf_counter）与 cpu（process_time）：同步调用基本是纯 CPU 计算，
-    两者接近；cpu 口径才是与服务核 CPU 时间对齐的量。异常也照常计时并抛回。
+    两者接近；cpu 口径才是与服务核 CPU 时间对齐的量。再记该调用时段内发生的
+    垃圾回收耗时（_gc_overlap_ns），报告时从阶段数字里扣除。异常也照常计时并抛回。
     """
     def wrapper(*a, **kw):
-        t0 = time.perf_counter_ns()
+        t0 = time.monotonic()
         c0 = time.process_time_ns()
         try:
             return fn(*a, **kw)
         finally:
-            _record(stage, time.perf_counter_ns() - t0, time.process_time_ns() - c0)
+            t1 = time.monotonic()
+            _record(stage, (t1 - t0) * 1e9, time.process_time_ns() - c0,
+                    _gc_overlap_ns(t0, t1))
     wrapper.__wraps_stage__ = stage
     wrapper.__wrapped__ = fn
     return wrapper
@@ -151,6 +202,90 @@ def _install_ingest_sub() -> None:
     np.argsort = _wrap_sync("groupby", np.argsort)
 
 
+# ---- URL 归一化缓存命中率统计（T11a-2） ------------------------------------------
+#
+# 只包装 flowlens.model 自己的两个函数（不改 flowlens/ 下任何文件）：
+#   - normalize_url：每条事件调用一次（validate 内）→ 总调用次数
+#   - _normalize_url：只在缓存未命中时被调用 → 未命中次数 + 未命中耗时
+# validate 的包装（"validate" 阶段）在它们外层，未命中耗时同时进 validate 阶段
+# 与 NORM_STATS——后者只是前者的一部分，不存在双重计数问题。
+#
+# 缓存键是剥掉 ?/# 之后的路径部分；键里含 {id} 的 URL（约一半流量）每次的路径段
+# 都是随机数字/UUID/长十六进制，路径本身都不同、缓存必未命中。未命中时顺手判断
+# 原始 URL 的路径部分是否含 ID 段（_id_seg_like），量化"带 ID 路径导致未命中"
+# 的占比。判断口径与 flowgen 的 {id} 归一化规则一致（纯数字 / UUID / ≥16 位十六
+# 进制）：只查键、不真做归一化，每条未命中多花约 1 微秒，只测未命中路径。
+
+
+def _id_seg_like(seg: str) -> bool:
+    """一个路径段是否会被归一化成 {id}（纯数字 / UUID / ≥16 位十六进制）。
+
+    口径与 flowlens.model._is_id_segment 相同，但只做判断、不做替换（少一次
+    字符串切片与正则）。
+    """
+    if not seg.isascii():
+        return False
+    if seg.isdigit():
+        return True
+    if len(seg) == 36 and seg[8] == seg[13] == seg[18] == seg[23] == "-":
+        return all(c in "0123456789abcdefABCDEF"
+                   for c in seg if c != "-")
+    return len(seg) >= 16 and all(c in "0123456789abcdefABCDEF" for c in seg)
+
+
+def _norm_head(raw: str) -> str:
+    """剥掉第一个 ? 或 #（取更早者）及其之后的部分——与归一化缓存的键同口径。"""
+    q, h = raw.find("?"), raw.find("#")
+    if q == -1 or (h != -1 and h < q):
+        q = h
+    if q == -1:
+        return raw
+    return raw[:q]
+
+
+def _install_norm_stats() -> None:
+    """给 flowlens.model 的归一化入口装上命中率统计（只加计数、不改行为）。
+
+    包装 model.normalize_url（总调用）与 model._normalize_url（未命中才调）。
+    口径与 model 内部一致：命中 = _norm_cache 里查得到剥掉 ?/# 后的键（T10b 起
+    缓存键是路径部分）。"带 ID 段"的判断需要原始 raw，而 _normalize_url 只拿到
+    键——用 _norm_pending 记录每次 normalize_url 调用的 (raw, 是否命中)，未命中
+    时弹出配对（validate 同步执行、同一事件循环线程内配对不会错位）。
+    """
+    import flowlens.model as model
+
+    orig_norm = model.normalize_url
+    orig_inner = model._normalize_url
+    pending: list[tuple[str, bool]] = []
+
+    def norm_wrapper(raw):
+        NORM_STATS[0] += 1
+        head = _norm_head(raw)
+        # 同步单线程、无 await 间隔，此处的缓存状态与 orig_norm 内部查表一致
+        if model._norm_cache.get(head) is None:
+            pending.append(raw)
+        return orig_norm(raw)
+
+    def inner_wrapper(head):
+        c0 = time.perf_counter_ns()
+        out = orig_inner(head)
+        dt = time.perf_counter_ns() - c0
+        NORM_STATS[1] += 1
+        NORM_STATS[2] += dt
+        if pending:
+            raw = pending.pop()
+            if any(_id_seg_like(p) for p in _norm_head(raw).split("/")):
+                NORM_STATS[3] += 1
+        return out
+
+    norm_wrapper.__wraps_stage__ = "norm"
+    norm_wrapper.__wrapped__ = orig_norm
+    inner_wrapper.__wraps_stage__ = "norm_miss"
+    inner_wrapper.__wrapped__ = orig_inner
+    model.normalize_url = norm_wrapper
+    model._normalize_url = inner_wrapper
+
+
 def install_wrappers(engine) -> None:
     """给写入路径与 tick 路径的全部包装计时装好。"""
     import flowlens.api.app as appmod
@@ -175,6 +310,8 @@ def install_wrappers(engine) -> None:
     # process_time 干净，合并记为 tick_snapshot。
     Engine._dim_tops = _wrap_sync("tick_snapshot", Engine._dim_tops)
     Engine._snapshot_stats = _wrap_sync("tick_snapshot", Engine._snapshot_stats)
+    # URL 归一化缓存命中率（T11a-2）
+    _install_norm_stats()
 
 
 # ===================== serve 模式的后台探针 =====================
@@ -211,7 +348,9 @@ async def _loop_latency_probe(interval: float, stop: "asyncio.Event") -> None:
 # 不是 gc.START/gc.FINISH（这两个名字在 CPython 里根本不存在，比较会抛 AttributeError、
 # 被 gc 回调静默吞掉）。一次回收可能跨多代（每代一个 start，最后一个 stop），
 # 这里把一次回收记为一条：从第一个 start 到 stop 的总耗时，代数取最高代。
+# 同时记墙钟区间（monotonic），供各阶段"扣除 GC"算交叠（见 _gc_overlap_ns）。
 _gc_t0 = [0]
+_gc_w0 = [0.0]
 _gc_gen = [0]
 _gc_active = [False]
 
@@ -220,18 +359,45 @@ def _gc_callback(phase, info) -> None:
     if phase == "start":
         if not _gc_active[0]:
             _gc_t0[0] = time.perf_counter_ns()
+            _gc_w0[0] = time.monotonic()
             _gc_active[0] = True
         _gc_gen[0] = max(_gc_gen[0], info.get("generation", 0))
     elif phase == "stop" and _gc_active[0]:
         _gc_active[0] = False
+        w_end = time.monotonic()
         if MEASURE_START[0] > 0:
             GC_EVENTS.append({
                 "gen": _gc_gen[0],
-                "t": round(time.monotonic() - MEASURE_START[0], 4),
+                "t": round(w_end - MEASURE_START[0], 4),
                 "us": round((time.perf_counter_ns() - _gc_t0[0]) / 1000.0, 2),
                 "collected": info.get("collected", 0),
+                "s": _gc_w0[0],
+                "e": w_end,
             })
+            GC_SPANS.append((_gc_w0[0], w_end))
+            GC_ENDS.append(w_end)
         _gc_gen[0] = 0
+
+
+async def _query_probe(query_service, interval: float, stop: "asyncio.Event") -> None:
+    """每 interval 秒发一次真实查询（默认 60 s 窗口、k=10，走快照路径），
+    记端到端 wall 延迟（毫秒）。
+
+    直接回答"低负载下查询 p99 能否低于 50 ms"（T11a-2 第三节第 5 条）。探针本身
+    占一点 CPU（一次 60 s 窗口的快照 topk，毫秒级），只在需要测查询延迟的那一组
+    （6 万/秒）开启——它会轻微压低该组的吞吐数字，报告里注明。
+    """
+    from flowlens.dims import Dim
+    while not stop.is_set():
+        await asyncio.sleep(interval)
+        if stop.is_set() or MEASURE_START[0] <= 0:
+            continue
+        try:
+            t0 = time.monotonic()
+            await query_service.topk(Dim.URL, 60_000, 10)
+            QUERY_LAT_MS.append((time.monotonic() - t0) * 1000.0)
+        except Exception:
+            pass  # 查询失败不影响测量主体，跳过该次
 
 
 async def _mem_watch(stop: "asyncio.Event") -> None:
@@ -265,8 +431,54 @@ def _percentile(xs, q):
     return xs[f] + (xs[c] - xs[f]) * (k - f)
 
 
+def _gc_summary() -> dict:
+    """垃圾回收的单独汇总（T11a-2）：总耗时、按代分列（次数/总耗时/最长一次）、
+    占核比例。GC 单独计账后，各阶段表里报的是"扣除 GC 后"的自身开销。"""
+    total_us = round(sum(g["us"] for g in GC_EVENTS), 1)
+    dur = (time.monotonic() - MEASURE_START[0]) if MEASURE_START[0] > 0 else 0.0
+    cpu_s = (time.process_time() - MEASURE_CPU0[0]) if MEASURE_START[0] > 0 else 0.0
+    per_gen = {}
+    for gen in (0, 1, 2):
+        evs = [g for g in GC_EVENTS if g["gen"] == gen]
+        per_gen[str(gen)] = {
+            "count": len(evs),
+            "total_us": round(sum(g["us"] for g in evs), 1),
+            "max_us": round(max((g["us"] for g in evs), default=0.0), 2),
+        }
+    return {
+        "total": len(GC_EVENTS),
+        "per_sec": round(len(GC_EVENTS) / dur, 2) if dur else 0.0,
+        "total_us": total_us,
+        # GC 烧的 CPU 占服务核的比例：GC 也是单核上的活，占多少核就多少"核占比"
+        "pct_of_core": round(total_us / 1e6 / cpu_s * 100.0, 2) if cpu_s > 0 else 0.0,
+        "per_gen": per_gen,
+    }
+
+
+def _norm_summary() -> dict:
+    """URL 归一化缓存的命中统计（T11a-2）。"""
+    total, miss, miss_ns, idlike = NORM_STATS
+    return {
+        "calls": total,
+        "misses": miss,
+        "hit_rate": round(1 - miss / total, 4) if total else None,
+        # 未命中时的平均耗时（微秒/次）：含正则、ID 段判断与缓存回填
+        "miss_us_avg": round(miss_ns / 1000.0 / miss, 3) if miss else None,
+        # 未命中里"路径带 ID 段（归一化后必是 {id}、路径本身不同、缓存必未命中）"
+        # 的占比——量化"未命中是由随机 ID 路径造成"的程度
+        "miss_with_id": idlike,
+        "miss_with_id_rate": round(idlike / miss, 4) if miss else None,
+    }
+
+
 def _collect_report(engine) -> dict:
-    """把全局统计汇总成一份报告 dict。"""
+    """把全局统计汇总成一份报告 dict。
+
+    垃圾回收单独计账（T11a-2）：各阶段的 wall_us / cpu_us 是**扣除 GC 后**的值
+    （该调用时段内发生的回收耗时，gc_us，已从里面减掉）；顶层"阶段之和"校验用
+    "扣除后阶段之和 + GC 总耗时"对比进程 CPU（GC 本身也烧进程 CPU，只是不归任何
+    阶段）。
+    """
     dur = (time.monotonic() - MEASURE_START[0]) if MEASURE_START[0] > 0 else 0.0
     cpu_s = (time.process_time() - MEASURE_CPU0[0]) if MEASURE_START[0] > 0 else 0.0
     c = engine.counters
@@ -277,46 +489,56 @@ def _collect_report(engine) -> dict:
            c.late - MEASURE_EVENTS0[2],
            c.invalid - MEASURE_EVENTS0[3]]
     win_accepted = max(0, win[0])
+    gc_total_us = sum(g["us"] for g in GC_EVENTS)
     stages = {}
     for name in ALL_STAGES:
         e = STAGES.get(name)
         if e:
             wall_us = e[0] / 1000.0
             cpu_us = e[2] / 1000.0
+            gc_us = e[3] / 1000.0
             io_bound = name in IO_BOUND_STAGES
+            # 扣除 GC：单线程下回收烧的 CPU 同时体现在 wall 与 cpu 里（相等），
+            # 两边各扣一次
+            wall_net_us = max(0.0, wall_us - gc_us)
+            cpu_net_us = max(0.0, cpu_us - gc_us)
             # IO 等待阶段：测得的 process_time 差值不可归为它自己的 CPU（含挂起期间
             # 事件循环干的其他活），CPU 口径按 0 计，只报 wall。
-            attr_cpu_us = 0.0 if io_bound else cpu_us
+            attr_cpu_us = 0.0 if io_bound else cpu_net_us
             stages[name] = {
-                "wall_us": round(wall_us, 1),
+                "wall_us": round(wall_net_us, 1),
                 "cpu_us": round(attr_cpu_us, 1),
+                # 扣除项：该阶段调用时段内发生的 GC 耗时
+                "gc_us": round(gc_us, 1),
                 "cpu_us_measured": round(cpu_us, 1) if io_bound else None,
                 "io_bound": io_bound,
                 "count": e[1],
-                "us_per_call": round(wall_us / e[1], 4) if e[1] else 0.0,
+                "us_per_call": round(wall_net_us / e[1], 4) if e[1] else 0.0,
                 # 每条被接受事件的该阶段 CPU 时间（微秒），按测量窗口的接受数；
                 # IO 阶段记 0（见 cpu_us）
                 "us_per_event": round(attr_cpu_us / win_accepted, 4)
                 if win_accepted else 0.0,
-                # 占进程 CPU 时间比例（cpu 口径，IO 阶段恒 0）
+                # 占进程 CPU 时间比例（cpu 口径，扣除 GC 后，IO 阶段恒 0）
                 "cpu_pct": round(attr_cpu_us / 1e6 / cpu_s * 100.0, 2)
                 if cpu_s > 0 else 0.0,
             }
         else:
-            stages[name] = {"wall_us": 0, "cpu_us": 0, "cpu_us_measured": None,
+            stages[name] = {"wall_us": 0, "cpu_us": 0, "gc_us": 0,
+                            "cpu_us_measured": None,
                             "io_bound": name in IO_BOUND_STAGES, "count": 0,
                             "us_per_call": 0.0, "us_per_event": 0.0, "cpu_pct": 0.0}
     lat = LOOP_LAT_US
-    gen2 = [g for g in GC_EVENTS if g["gen"] == 2]
-    top_wall_us = sum(STAGES[s][0] for s in TOP_STAGES if s in STAGES) / 1000.0
-    # CPU 口径的顶层阶段之和：只统计非 IO 阶段（IO 阶段的 process_time 不可归属）
-    top_cpu_us = sum(STAGES[s][2] for s in TOP_STAGES
-                     if s in STAGES and s not in IO_BOUND_STAGES) / 1000.0
+    # 顶层阶段之和（wall / cpu，均扣除 GC 后；IO 阶段的 cpu_us 恒 0）
+    top_wall_us = sum(stages[s]["wall_us"] for s in TOP_STAGES)
+    top_cpu_us = sum(stages[s]["cpu_us"] for s in TOP_STAGES)
+    # 校验口径：扣除后的阶段之和 + GC 总耗时 ≈ 进程 CPU（GC 烧的 CPU 已归 GC，
+    # 不在任何阶段里）
+    frac = (top_cpu_us + gc_total_us) / 1e6 / cpu_s if cpu_s > 0 else 0.0
     return {
         "measure_sec": round(dur, 2),
         "phase": PHASE["phase"],
-        # 进程 CPU 时间（秒，time.process_time 差值）：校验"各阶段之和 ≈ 服务核 CPU
-        # 时间"的参照。服务固定单核，所以 cpu_s / dur ≈ 该核的占用比例（0~1）。
+        # 进程 CPU 时间（秒，time.process_time 差值）：校验"各阶段之和 + GC ≈
+        # 服务核 CPU 时间"的参照。服务固定单核，所以 cpu_s / dur ≈ 该核的占用比例。
         "cpu_time_s": round(cpu_s, 3),
         "cpu_pct_of_core": round(cpu_s / dur * 100.0, 1) if dur else 0.0,
         # 测量窗口内的事件数（不是容器生命周期累计——预热期也在写入）
@@ -331,28 +553,28 @@ def _collect_report(engine) -> dict:
         "cpu_us_per_accepted_event": round(
             cpu_s / win[0] * 1e6, 3) if win[0] > 0 else 0.0,
         "stages": stages,
-        # 顶层阶段之和（wall / cpu，微秒）
-        # 各阶段之和（wall / cpu，微秒）。cpu 口径只含非 IO 阶段（read_body 等异步
-        # 阶段的 process_time 差值含"挂起期间事件循环干的其他活"，不能归属，已排除）。
+        # 顶层阶段之和（wall / cpu，微秒，均扣除 GC 后）
         "top_stages_wall_us": round(top_wall_us, 1),
         "top_stages_cpu_us": round(top_cpu_us, 1),
-        # 非 IO 阶段 CPU 之和占进程 CPU 时间的比例（校验用，应接近 1.0；< 1 说明还有
-        # 没包到的 Python 时间——如 aiohttp 协议处理、JSON 响应序列化、定时器回调）
-        "top_stages_frac_of_cpu": round(top_cpu_us / 1e6 / cpu_s, 3) if cpu_s > 0 else 0.0,
+        # 校验：（扣除后阶段之和 + GC）占进程 CPU 的比例，应接近 1.0；< 1 说明还有
+        # 没包到的 Python 时间——如 aiohttp 协议处理、JSON 响应序列化、定时器回调
+        "top_stages_frac_of_cpu": round(frac, 3),
+        "norm_cache": _norm_summary(),
         "loop_latency_us": {
             "count": len(lat),
             "p50": _percentile(lat, 0.5),
             "p99": _percentile(lat, 0.99),
             "max": round(max(lat), 2) if lat else 0.0,
         },
-        "gc": {
-            "total": len(GC_EVENTS),
-            "per_sec": round(len(GC_EVENTS) / dur, 2) if dur else 0.0,
-            "gen2_count": len(gen2),
-            "gen2_max_us": max((g["us"] for g in gen2), default=0.0),
-            "gen2_total_us": round(sum(g["us"] for g in gen2), 1),
-            "all_max_us": max((g["us"] for g in GC_EVENTS), default=0.0),
+        # 查询延迟（仅开启 --query-probe 的那组有值；60 s 窗口、k=10 快照查询，
+        # 每 250 ms 一次，wall 毫秒）
+        "query_latency_ms": {
+            "count": len(QUERY_LAT_MS),
+            "p50": _percentile(QUERY_LAT_MS, 0.5),
+            "p99": _percentile(QUERY_LAT_MS, 0.99),
+            "max": round(max(QUERY_LAT_MS), 2) if QUERY_LAT_MS else 0.0,
         },
+        "gc": _gc_summary(),
         "mem_mib": {
             "peak": max(MEM_MB, default=0.0),
             "end": MEM_MB[-1] if MEM_MB else 0.0,
@@ -412,6 +634,10 @@ async def _serve(args) -> None:
 
     loop_task = asyncio.create_task(_loop_latency_probe(0.1, stop_ev))
     mem_task = asyncio.create_task(_mem_watch(stop_ev))
+    # 查询延迟探针（默认关，只在 6 万/秒那组开——那组专门测查询延迟）
+    qtask = (asyncio.create_task(_query_probe(query_service, 0.25, stop_ev))
+             if getattr(args, "query_probe", False) else None)
+    tasks = [t for t in (loop_task, mem_task, qtask) if t is not None]
     try:
         # 等 run 模式确认 loadgen 已起（保证预热期就有流量）
         await start_ev.wait()
@@ -422,9 +648,13 @@ async def _serve(args) -> None:
         else:
             # 清零并开始测量
             for k in list(STAGES):
-                STAGES[k] = [0, 0, 0]
+                STAGES[k] = [0, 0, 0, 0]
             LOOP_LAT_US.clear()
             GC_EVENTS.clear()
+            GC_SPANS.clear()
+            GC_ENDS.clear()
+            NORM_STATS[:] = [0, 0, 0, 0]
+            QUERY_LAT_MS.clear()
             MEM_MB.clear()
             MEASURE_START[0] = time.monotonic()
             MEASURE_CPU0[0] = time.process_time()
@@ -433,19 +663,20 @@ async def _serve(args) -> None:
                                   _ce.invalid]
             PHASE["phase"] = "measuring"
             print("[profile] 测量开始", flush=True)
-            # 测量：正常跑满 measure 秒；内存超限（mem_watch 置 stop_ev 并改相位为
-            # stopping_mem）或 run 模式 POST /prof/stop（第 4 组跑完）时提前结束
-            remaining = args.measure
-            while remaining > 0 and not stop_ev.is_set():
-                step = min(0.5, remaining)
-                await asyncio.sleep(step)
-                remaining -= step
+            # 测量：按墙钟截止时间跑满 measure 秒（T11a-2 修正）。上一版用
+            # sleep(0.5)×N 累计名义时长——满载下每个 sleep 都被事件循环延迟触发
+            # （实测循环延迟 p50 68 ms），名义 30 s 拖成 47 s，而 loadgen 只发到
+            # 70 s，窗口尾部 ~10 s 没流量，把 accepted_rate 与核占比稀释了。改为
+            # deadline = monotonic() + measure，窗口长度与负载无关。
+            deadline = time.monotonic() + args.measure
+            while time.monotonic() < deadline and not stop_ev.is_set():
+                await asyncio.sleep(0.1)
             if not stop_ev.is_set():
                 PHASE["phase"] = "done"
             print(f"[profile] 测量结束（相位 {PHASE['phase']}）", flush=True)
     finally:
         stop_ev.set()
-        for t in (loop_task, mem_task):
+        for t in tasks:
             t.cancel()
         report = _collect_report(engine)
         out = Path(args.out)
@@ -472,15 +703,6 @@ REPO_TOOLS = f"{REPO_ROOT}/tools"
 IMAGE = "flowlens:latest"
 OUT_ROOT = "/tmp/flowlens_t11a"
 LOADGEN_PY = "/home/user/flowlens-venv/bin/python"
-# 单次固定速率测量的参数（任务要求）：20 万/秒、每批 5000、不 gzip、预热 30 + 测量 30
-RUN_RATE = 200_000
-RUN_BATCH = 5_000
-RUN_GZIP = False
-RUN_WARMUP = 30.0
-RUN_MEASURE = 30.0
-RUN_NAME = "run_200k"
-# loadgen 的时长 = 预热 + 测量 + 余量（容器退出后 loadgen 会被 terminate）
-LOADGEN_TAIL_SEC = 10
 
 
 def _has(cmd):
@@ -494,6 +716,27 @@ def _run(cmd, **kw):
 # run 模式自己起的 /prof 探针对 localhost 发 HTTP：WSL 的 autoProxy 可能把
 # 127.0.0.1 也走代理（T8b 决策），故建一个禁用代理的 opener，保证直连服务。
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# T11a-2 的两次固定速率测量（任务书第二节）：
+#   - 10 万/秒：接近单核上限（每条 ~10.7 μs CPU 的倒数约 9.3 万/秒），测处理能力
+#   - 6 万/秒：较低负载，测事件循环延迟与垃圾回收停顿
+# 其余参数与上次相同：每批 5000 条、不 gzip、长尾、预热 30 s + 测量 30 s。
+# 不再跑 20 万/秒——那是过载，测的是过载行为而非处理能力。
+RUN_BATCH = 5_000
+RUN_GZIP = False
+RUN_WARMUP = 30.0
+RUN_MEASURE = 30.0
+# (run_name, rate, query_probe)：query_probe 只在 6 万/秒那组开（那组专门测查询
+# 延迟，探针的少量 CPU 开销可接受）；10 万/秒组不开，避免探针干扰处理能力测量。
+RUNS = [
+    ("run_100k", 100_000, False),
+    ("run_60k", 60_000, True),
+]
+# 测量窗口前的启动延迟：run 模式起好 loadgen 后等 3 s 建连才通知 serve 预热。
+# loadgen 的时长必须覆盖"这 3 s + 预热 + 测量"全程，再多留 10 s 余量（任务书
+# 第一节第 1 条）——上一版只留了 10 s、没算启动延迟，窗口尾部没流量。
+LOADGEN_TAIL_SEC = 10
+STARTUP_DELAY_SEC = 3.0
 
 
 def _http_get(url, timeout=2):
@@ -542,12 +785,12 @@ def _parse_loadgen_summary(stdout: str) -> dict | None:
     return None
 
 
-def _loadgen_base_cmd() -> list[str]:
-    """loadgen 基础命令（不含速率/批量/时长），压测进程固定到压测核。"""
+def _loadgen_base_cmd(rate: int) -> list[str]:
+    """loadgen 基础命令（不含时长），压测进程固定到压测核。"""
     loadgen = _loadgen_python()
     cmd = [loadgen, "tools/loadgen.py", "--url", f"http://127.0.0.1:{HOST_PORT}",
            "--workers", "4", "--conc", "8", "--mode", "长尾",
-           "--rate", str(RUN_RATE), "--batch", str(RUN_BATCH)]
+           "--rate", str(rate), "--batch", str(RUN_BATCH)]
     if _has("taskset"):
         cmd = ["taskset", "-c", LOAD_CORES] + cmd
     if RUN_GZIP:
@@ -555,25 +798,28 @@ def _loadgen_base_cmd() -> list[str]:
     return cmd
 
 
-async def _run_once(warmup, measure, dry=False) -> dict:
-    """单次固定速率测量（RUN_RATE / RUN_BATCH / 不 gzip）。
+async def _run_once(rate: int, run_name: str, query_probe: bool, warmup, measure,
+                    dry=False) -> dict:
+    """单次固定速率测量（rate / RUN_BATCH / 不 gzip）。
 
-    起容器（serve）→ 等 ready → 起 loadgen（跑 warmup+measure+余量）→ 通知 serve
-    预热 → docker wait 容器退出 → 收 loadgen 汇总 → 读 serve 的 JSON。
+    起容器（serve）→ 等 ready → 起 loadgen（跑 启动延迟+warmup+measure+余量）→
+    通知 serve 预热 → docker wait 容器退出 → 收 loadgen 汇总 → 读 serve 的 JSON。
+    loadgen 时长覆盖整个预热与测量窗口并多留 10 s 余量（任务书第一节第 1 条）。
+    query_probe 为 True 时给 serve 加 --query-probe（开查询延迟探针）。
     """
     import uuid
-    name = f"flowlens-probe-{uuid.uuid4().hex[:8]}"
-    outdir = os.path.join(OUT_ROOT, RUN_NAME)
+    cname = f"flowlens-probe-{uuid.uuid4().hex[:8]}"
+    outdir = os.path.join(OUT_ROOT, run_name)
     os.makedirs(outdir, exist_ok=True)
     try:
         os.chmod(outdir, 0o777)
     except OSError:
         pass
-    out_json = f"/out/{RUN_NAME}.json"
-    report: dict = {"name": RUN_NAME, "container": name}
+    out_json = f"/out/{run_name}.json"
+    report: dict = {"name": run_name, "container": cname}
 
     if not dry:
-        docker = ["docker", "run", "--rm", "-d", "--name", name,
+        docker = ["docker", "run", "--rm", "-d", "--name", cname,
                   "--memory=256m", "--memory-swap=256m",
                   f"--cpuset-cpus={SVC_CORE}",
                   "-p", f"{HOST_PORT}:8080",
@@ -584,32 +830,35 @@ async def _run_once(warmup, measure, dry=False) -> dict:
                   "--host", "0.0.0.0", "--port", "8080",
                   "--warmup", str(warmup), "--measure", str(measure),
                   "--out", out_json]
+        if query_probe:
+            docker.append("--query-probe")
         r = _run(docker)
         if r.returncode != 0:
             report["error"] = f"docker run 失败: {r.stderr[-500:]}"
             return report
         ok = await asyncio.to_thread(_wait_phase, HOST_PORT, "ready", 60.0)
         if not ok:
-            logs = _run(["docker", "logs", name])
-            _run(["docker", "rm", "-f", name])
+            logs = _run(["docker", "logs", cname])
+            _run(["docker", "rm", "-f", cname])
             report["error"] = f"服务未就绪:\n{logs.stderr[-800:]}"
             return report
 
+    # loadgen 时长 = 启动延迟 + 预热 + 测量 + 余量：预热与测量全程都有流量
+    loadgen_dur = STARTUP_DELAY_SEC + warmup + measure + LOADGEN_TAIL_SEC
     env = dict(os.environ, NO_PROXY="localhost,127.0.0.1", PYTHONPATH=".",
                PYTHONHASHSEED="0")
     proc = None
     try:
-        cmd = _loadgen_base_cmd() + ["--duration",
-                                     str(warmup + measure + LOADGEN_TAIL_SEC)]
-        print(f"[run] {RUN_NAME} rate={RUN_RATE} batch={RUN_BATCH} "
-              f"duration={warmup + measure + LOADGEN_TAIL_SEC}s", flush=True)
+        cmd = _loadgen_base_cmd(rate) + ["--duration", str(loadgen_dur)]
+        print(f"[run] {run_name} rate={rate} batch={RUN_BATCH} "
+              f"loadgen_dur={loadgen_dur}s", flush=True)
         if not dry:
             proc = subprocess.Popen(cmd, cwd=REPO_ROOT, env=env,
                                     stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True,
                                     encoding="utf-8", errors="replace")
-            # 起好（留 3 s 建连）后通知 serve 开始预热
-            await asyncio.sleep(3.0)
+            # 起好（留 STARTUP_DELAY_SEC 建连）后通知 serve 开始预热
+            await asyncio.sleep(STARTUP_DELAY_SEC)
             await asyncio.to_thread(
                 _http_post, f"http://127.0.0.1:{HOST_PORT}/prof/start")
     finally:
@@ -621,9 +870,9 @@ async def _run_once(warmup, measure, dry=False) -> dict:
     loadgen_summary = None
     if not dry:
         # 等容器退出（serve 在测量结束后自行退出）
-        await asyncio.to_thread(_run, ["docker", "wait", name])
+        await asyncio.to_thread(_run, ["docker", "wait", cname])
         if proc is not None:
-            # 容器已退出，收 loadgen 剩余输出（它跑满 warmup+measure+tail）
+            # 容器已退出，收 loadgen 剩余输出（它跑满 loadgen_dur）
             try:
                 out, _ = proc.communicate(timeout=LOADGEN_TAIL_SEC + 20)
                 loadgen_summary = _parse_loadgen_summary(out or "")
@@ -632,14 +881,19 @@ async def _run_once(warmup, measure, dry=False) -> dict:
                 out, _ = proc.communicate()
                 loadgen_summary = _parse_loadgen_summary(out or "")
             proc = None
-    host_json = os.path.join(outdir, RUN_NAME + ".json")
+    host_json = os.path.join(outdir, run_name + ".json")
     if os.path.exists(host_json):
         report["server"] = json.loads(Path(host_json).read_text(encoding="utf-8"))
     report["loadgen"] = loadgen_summary
     return report
 
 
-async def run_main(warmup, measure, dry=False) -> None:
+async def run_main(warmup, measure, dry=False, only: str | None = None) -> None:
+    """跑 T11a-2 的两组（10 万/秒、6 万/秒），依次各起一个全新容器。
+
+    每组独立：全新容器（serve）、全新 loadgen、结果各自落盘。--only 可只跑其中
+    一组（按 run_name 前缀过滤），便于单独重跑某组。
+    """
     if not dry:
         chk = _run(["docker", "image", "inspect", IMAGE])
         if chk.returncode != 0:
@@ -648,24 +902,32 @@ async def run_main(warmup, measure, dry=False) -> None:
                       REPO_ROOT])
             if b.returncode != 0:
                 raise RuntimeError(f"构建失败: {b.stderr[-500:]}")
-    r = await _run_once(warmup, measure, dry=dry)
-    status = "OK" if "error" not in r else r["error"][:120]
-    print(f"[run] {RUN_NAME} 完成: {status}", flush=True)
+    runs = [(n, r, q) for n, r, q in RUNS if only is None or n == only]
     os.makedirs(OUT_ROOT, exist_ok=True)
-    out_path = os.path.join(OUT_ROOT, f"{RUN_NAME}.json")
-    Path(out_path).write_text(json.dumps(r, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
-    print(f"[run] 结果写入 {out_path}", flush=True)
+    for run_name, rate, query_probe in runs:
+        r = await _run_once(rate, run_name, query_probe, warmup, measure, dry=dry)
+        status = "OK" if "error" not in r else r["error"][:120]
+        print(f"[run] {run_name} 完成: {status}", flush=True)
+        out_path = os.path.join(OUT_ROOT, f"{run_name}.json")
+        Path(out_path).write_text(json.dumps(r, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+        print(f"[run] 结果写入 {out_path}", flush=True)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="T11a 端到端 CPU 剖析（单次固定速率）")
+    p = argparse.ArgumentParser(
+        description="T11a 端到端 CPU 剖析（10 万/秒 与 6 万/秒 两组固定速率）")
     p.add_argument("mode", choices=["serve", "run"])
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--warmup", type=float, default=RUN_WARMUP)
     p.add_argument("--measure", type=float, default=RUN_MEASURE)
     p.add_argument("--out", default=None, help="serve 模式输出 JSON 路径")
+    p.add_argument("--query-probe", action="store_true",
+                   help="serve：开查询延迟探针（60s 窗口 k=10，每 250ms 一次）")
+    p.add_argument("--only", default=None,
+                   choices=[n for n, _, _ in RUNS],
+                   help="run：只跑指定的一组（默认两组都跑）")
     p.add_argument("--dry-run", action="store_true", help="run：只打印，不真正跑")
     args = p.parse_args()
 
@@ -674,7 +936,8 @@ def main() -> None:
             p.error("serve 模式需要 --out")
         serve_entry(args)
     else:
-        asyncio.run(run_main(args.warmup, args.measure, dry=args.dry_run))
+        asyncio.run(run_main(args.warmup, args.measure, dry=args.dry_run,
+                             only=args.only))
 
 
 if __name__ == "__main__":

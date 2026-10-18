@@ -156,6 +156,8 @@ def test_gc_callback_records_a_collection():
     在 CPython 里不存在）。造一次真实回收，验证 _gc_callback 确实记了一条。"""
     import gc
     ps.GC_EVENTS.clear()
+    ps.GC_SPANS.clear()
+    ps.GC_ENDS.clear()
     ps.MEASURE_START[0] = time.monotonic()  # 让"测量期"判定通过
     cb = ps._gc_callback
     gc.callbacks.append(cb)
@@ -170,6 +172,91 @@ def test_gc_callback_records_a_collection():
     assert ev["us"] >= 0
     assert ev["gen"] in (0, 1, 2)
     assert "collected" in ev
+    # T11a-2：墙钟区间也记了，供各阶段"扣除 GC"算交叠
+    assert ev["s"] <= ev["e"]
+    assert len(ps.GC_SPANS) >= 1
+    s, e = ps.GC_SPANS[-1]
+    assert (s, e) == (ev["s"], ev["e"])
+    assert ps.GC_ENDS[-1] == ev["e"]
+
+
+def test_gc_overlap_partial_and_full():
+    """_gc_overlap_ns：调用时段与回收区间的交叠（按 ns）。
+
+    造三段互不重叠的回收区间（[1,2]、[3,4]、[6,7]，monotonic 秒），验证：
+    不相交 → 0；部分交叠 → 交叠部分；完全覆盖 → 区间总长；bisect 定位不靠全扫。
+    """
+    ps.GC_SPANS.clear()
+    ps.GC_ENDS.clear()
+    for s, e in ((1.0, 2.0), (3.0, 4.0), (6.0, 7.0)):
+        ps.GC_SPANS.append((s, e))
+        ps.GC_ENDS.append(e)
+    try:
+        assert ps._gc_overlap_ns(0.0, 0.5) == 0               # 早于所有区间
+        assert ps._gc_overlap_ns(2.5, 3.0) == 0               # 区间之间的空隙
+        assert ps._gc_overlap_ns(1.5, 2.5) == 500_000_000     # 与 [1,2] 交 [1.5,2] = 0.5s
+        assert ps._gc_overlap_ns(1.5, 3.5) == 1_000_000_000   # 交 [1,2] 0.5s + [3,4] 0.5s
+        assert ps._gc_overlap_ns(0.0, 10.0) == 3_000_000_000  # 覆盖全部三个区间（各 1s）
+        assert ps._gc_overlap_ns(6.2, 6.4) == 200_000_000     # 与 [6,7] 交 0.2s
+        assert ps._gc_overlap_ns(3.0, 4.0) == 1_000_000_000   # 恰好盖满一个区间
+    finally:
+        ps.GC_SPANS.clear()
+        ps.GC_ENDS.clear()
+
+
+# ---------------- 六b、URL 归一化缓存统计 ----------------
+
+def test_id_seg_like_matches_model_rules():
+    """_id_seg_like 的口径与 flowlens.model._is_id_segment 一致（纯数字 / UUID /
+    ≥16 位十六进制），但不做替换。"""
+    from flowlens.model import _is_id_segment
+    segs = ["12345", "abc", "x0", "X1", "hello",
+            "0123456789abcdef",            # 16 位十六进制
+            "0123456789abcdeg",            # 16 位但含 g → 否
+            "0123456789abc",               # 15 位十六进制 → 否
+            "550e8400-e29b-41d4-a716-446655440000",   # UUID
+            "550E8400-E29B-41D4-A716-446655440000",   # UUID 大写
+            "550e8400e29b41d4a716446655440000",       # 32 位十六进制
+            "550e8400-e29b-41d4-a716-4466554400001",  # 37 位：不是 UUID 也不是纯数字
+            "中文段",                      # 非 ASCII
+            ""]                            # 空段（根路径的开头段）
+    for s in segs:
+        assert ps._id_seg_like(s) == _is_id_segment(s), s
+
+
+def test_norm_wrapper_counts_and_preserves():
+    """包装 normalize_url / _normalize_url 后：结果与不包装完全一致，命中/未命中
+    计数正确，未命中里"带 ID 段"的判定正确。用完还原（_unwrap）。"""
+    import flowlens.model as model
+    ps.NORM_STATS[:] = [0, 0, 0, 0]
+    urls = [
+        "/api/item/x0?ref=1",        # 稳定路径：首次未命中、之后命中
+        "/api/item/x0?ref=2",        # 同路径不同 query → 命中
+        f"/api/order/{'a' * 32}/x1",           # 路径带 32 位十六进制 → 未命中 + 带 ID
+        "/api/order/550e8400-e29b-41d4-a716-446655440000",  # 带 UUID → 未命中 + 带 ID
+        "/api/item/x0",              # 命中
+    ]
+    # 归一化结果与缓存命中与否无关（命中/未命中都返回同一个归一化串），所以
+    # base 用任意缓存状态算都行；但命中/未命中"计数"依赖缓存状态，故跑包装前
+    # 清空缓存，让计数确定。
+    model.clear_norm_cache()
+    base = [model.normalize_url(u) for u in urls]
+    model.clear_norm_cache()
+
+    ps._install_norm_stats()
+    try:
+        got = [model.normalize_url(u) for u in urls]
+    finally:
+        _unwrap()
+
+    assert got == base, "包装改变了归一化结果"
+    total, miss, miss_ns, idlike = ps.NORM_STATS
+    assert total == 5
+    # 清空后：/api/item/x0 首次未命中、两条 ID 路径各自未命中、其余命中
+    assert miss == 3
+    assert idlike == 2
+    assert miss_ns > 0
+    model.clear_norm_cache()  # 收尾，别把本用例的条目留给别的测试
 
 
 def _unwrap() -> None:
@@ -178,11 +265,12 @@ def _unwrap() -> None:
     import flowlens.ingest as ingestmod
     import flowlens.engine as eng
     import flowlens.ring as ringmod
+    import flowlens.model as modelmod
     import numpy as np
     from flowlens.engine import Engine
     from flowlens.dedup import GenerationalBloom
 
-    for obj in (appmod, ingestmod, eng, ringmod, np):
+    for obj in (appmod, ingestmod, eng, ringmod, modelmod, np):
         for attr in list(vars(obj)):
             v = getattr(obj, attr)
             if hasattr(v, "__wrapped__"):
@@ -200,20 +288,22 @@ def _unwrap() -> None:
 # ---------------- 五、_collect_report 字段形状 ----------------
 
 def test_collect_report_shape():
-    """用假 engine 验证报告字段齐全、口径自洽。"""
+    """用假 engine 验证报告字段齐全、口径自洽（含 T11a-2 的 GC 扣除与 norm_cache）。"""
     ps.MEASURE_START[0] = 100.0
     ps.MEASURE_CPU0[0] = 0.5
     # 测量起点时的计数基线为 0 → 窗口事件数 == 容器累计（本用例无预热）
     ps.MEASURE_EVENTS0[:] = [0, 0, 0, 0]
     ps.PHASE["phase"] = "done"
-    # 造一点计数
+    # 造一点计数（STAGES 第 4 位是"调用时段内发生的 GC 耗时"，ns）
     ps.STAGES.clear()
-    ps.STAGES["ingest"] = [2_000_000, 10, 1_800_000]   # wall / count / cpu (ns)
-    ps.STAGES["read_body"] = [1_000_000, 10, 400_000]
+    ps.STAGES["ingest"] = [2_000_000, 10, 1_800_000, 200_000]   # wall / count / cpu / gc
+    ps.STAGES["read_body"] = [1_000_000, 10, 400_000, 0]
     ps.LOOP_LAT_US.clear()
     ps.LOOP_LAT_US.extend([1.0, 2.0, 3.0])
     ps.GC_EVENTS.clear()
-    ps.GC_EVENTS.append({"gen": 2, "t": 1.0, "us": 500.0, "collected": 10})
+    ps.GC_EVENTS.append({"gen": 2, "t": 1.0, "us": 500.0, "collected": 10,
+                         "s": 1.0, "e": 1.0005})
+    ps.NORM_STATS[:] = [100, 40, 40_000_000, 39]
     ps.MEM_MB.clear()
     ps.MEM_MB.extend([100.0, 120.0, 110.0])
 
@@ -228,12 +318,16 @@ def test_collect_report_shape():
     for key in ("measure_sec", "cpu_time_s", "cpu_pct_of_core", "events",
                 "accepted_rate", "cpu_us_per_accepted_event", "stages",
                 "top_stages_wall_us", "top_stages_cpu_us",
-                "top_stages_frac_of_cpu", "loop_latency_us", "gc", "mem_mib"):
+                "top_stages_frac_of_cpu", "loop_latency_us", "gc", "mem_mib",
+                "norm_cache"):
         assert key in rep, key
     # 事件数按测量窗口：本用例无预热基线，窗口 == 累计 1000
     assert rep["events"]["accepted"] == 1000
-    # 每条事件 ingest 阶段 CPU 时间 = 1_800_000ns /1000 /1000 事件 = 1.8us
-    assert rep["stages"]["ingest"]["us_per_event"] == pytest.approx(1.8)
+    # ingest 扣除 GC 后：cpu 1_800_000 − 200_000 = 1_600_000 ns
+    # 每条事件 CPU = 1_600_000 /1000 = 1.6us
+    assert rep["stages"]["ingest"]["cpu_us"] == pytest.approx(1600.0)
+    assert rep["stages"]["ingest"]["gc_us"] == pytest.approx(200.0)
+    assert rep["stages"]["ingest"]["us_per_event"] == pytest.approx(1.6)
     # read_body 是 IO 等待阶段：归因 CPU 按 0 计，但保留测得的 cpu_us_measured
     assert rep["stages"]["read_body"]["io_bound"] is True
     assert rep["stages"]["read_body"]["cpu_us"] == 0.0
@@ -243,5 +337,21 @@ def test_collect_report_shape():
     assert rep["loop_latency_us"]["p50"] == pytest.approx(2.0)
     # 内存峰值
     assert rep["mem_mib"]["peak"] == 120.0
-    # 顶层 CPU 之和只算非 IO 阶段 = ingest 的 1.8e6 ns = 1800us（read_body 已排除）
-    assert rep["top_stages_cpu_us"] == pytest.approx(1800.0)
+    # 顶层 CPU 之和只算非 IO 阶段 = ingest 扣 GC 后 1_600_000 ns = 1600us
+    assert rep["top_stages_cpu_us"] == pytest.approx(1600.0)
+    # 校验口径的分子 =（扣 GC 后阶段之和 + GC 总耗时）= 1600 + 500 = 2100us；
+    # 比值再除以进程 CPU。cpu_s 在测试里是真实 process_time 差值且两处都四舍五入到
+    # 3 位小数，反解误差大，故只验证 frac 非负（GC 扣除的数值正确性已由上面的
+    # top_stages_cpu_us==1600 与 stages.ingest.gc_us 直接锁住）。
+    assert rep["top_stages_frac_of_cpu"] >= 0.0
+    # 归一化缓存：命中率 = 1 − 40/100 = 0.6；未命中平均耗时 = 40_000_000ns/40 = 1000us
+    assert rep["norm_cache"]["calls"] == 100
+    assert rep["norm_cache"]["misses"] == 40
+    assert rep["norm_cache"]["hit_rate"] == pytest.approx(0.6)
+    assert rep["norm_cache"]["miss_us_avg"] == pytest.approx(1000.0)
+    assert rep["norm_cache"]["miss_with_id_rate"] == pytest.approx(39 / 40)
+    # GC 汇总：总耗时 500us、第 2 代 1 次（占核比例依赖真实 cpu_s，只验证总耗时与
+    # 代计数，不断言比值）
+    assert rep["gc"]["total"] == 1
+    assert rep["gc"]["total_us"] == pytest.approx(500.0)
+    assert rep["gc"]["per_gen"]["2"]["count"] == 1
