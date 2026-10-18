@@ -31,8 +31,12 @@ from pathlib import Path
 import numpy as np
 import orjson
 
-# 存档格式与 key 生成规则版本（meta.json 记录；读取方按版本解释）
-KEY_RULE_VERSION = 1
+# 存档格式与 key 生成规则版本（meta.json 记录；读取方按版本解释）。
+# v2：约一半 key 的模板本身含 {id} 段（如 /api/order/{id}/x{i}），raw_url 把 {id}
+# 替换为随机值；key 字符串不再是编号的双射（模板含 {id} 时），存档直接存归一化 key
+# 字符串列（url_key），精确解按 key 字符串分组。v1：key_of(i) = /api/item/x{i}，
+# 无模板，编号即双射。
+KEY_RULE_VERSION = 2
 META_NAME = "meta.json"
 
 # 事件类型（存档 etype 列的取值）
@@ -58,14 +62,47 @@ N_USER = 200_000
 SEQ_STRIDE = 10 ** 8
 
 
-def key_of(i: int) -> str:
-    """编号 i 的归一化 URL。
+# key 模板（T10b 第一节-1）：约一半 key 的模板本身含 {id} 段，raw_url 把 {id} 替换
+# 成随机值、归一化再还原成 {id}，让"把路径中的 ID 替换为 {id}"这条归一化规则在压测
+# 里被覆盖。末尾段 ``x{i}`` 以字母开头、不命中 {id} 规则，且保证不同编号的 key
+# 互不相同（key_of 仍是编号的注入映射，存档继续只存 url_idx）。
+# 含 {id} 模板里 {id} 是归一化后的占位符（字面量），出现在 key 字符串里。
+ID_KEY_RATIO = 0.5
+_PLAIN_KEY_TEMPLATE = "/api/item/x{i}"
+_ID_KEY_TEMPLATES = ("/api/order/{id}/x{i}", "/api/user/{id}/profile/x{i}")
 
-    末尾段 ``x{i}`` 以字母开头，不命中 {id} 归一化规则（纯数字/UUID/长十六进制），
-    归一化后就是它本身；raw_url 在它基础上只加 query 与 fragment（归一化整体剥掉），
-    所以 normalize_url(raw_url(key)) == key。
+
+def _uses_id_key(i: int) -> bool:
+    """编号 i 是否用含 {id} 的模板：确定性伪随机（Knuth 乘法散列，不依赖 rng）。
+
+    不依赖 rng 是因为 key_of 必须是编号的纯函数——raw() 生成与精确解从存档重建
+    会各自独立调 key_of，结果必须一致。约 ID_KEY_RATIO 比例返回 True。
     """
-    return f"/api/item/x{i}"
+    h = (i * 2654435761) & 0xFFFFFFFF
+    return h < int(ID_KEY_RATIO * 0xFFFFFFFF)
+
+
+def _id_template(i: int) -> str:
+    """i 对应的含 {id} 模板：按 i 的低位在模板间轮转。
+
+    用 ``i % len``（而不是散列的另一位）：保证同一模板下不同编号不会因模板相同
+    而撞上同一 key 字符串——末尾段 x{i} 仍区分编号，但模板若相同、i 又只差 2^N
+    的低位时靠 x{i} 区分，轮转只需用 i 本身就能让 key_of 保持编号的注入映射。
+    """
+    return _ID_KEY_TEMPLATES[i % len(_ID_KEY_TEMPLATES)]
+
+
+def key_of(i: int) -> str:
+    """编号 i 的归一化 URL（可能是含 {id} 占位符的模板实例）。
+
+    末尾段 ``x{i}`` 以字母开头，不命中 {id} 规则；含 {id} 模板里的 ``{id}`` 是归一化
+    后的占位符（字面量，不在 _is_id_segment 命中范围内）。所以 key_of(i) 本身已是
+    归一化形式：normalize_url(key_of(i)) == key_of(i)，且 raw_url 在其上做的变化
+    （替换 {id}、加 scheme/host、query、fragment）归一化后都还原，
+    从而 normalize_url(raw_url(key_of(i))) == key_of(i)。
+    """
+    tpl = _id_template(i) if _uses_id_key(i) else _PLAIN_KEY_TEMPLATE
+    return tpl.replace("{i}", str(i))
 
 
 def user_of(i: int) -> str:
@@ -74,13 +111,18 @@ def user_of(i: int) -> str:
 
 
 def raw_url(key: str, rng: np.random.Generator) -> str:
-    """在归一化 key 基础上加随机变化，保证 normalize_url(raw) == key。
+    """把归一化 key 变成发送用的原始 URL，保证 normalize_url(raw) == key。
 
-    变化只取 normalize_url 会整体剥掉的部分：query（? 之后）与 fragment（# 之后）。
-    query 的参数值用纯数字 / UUID / 长十六进制段（这些段的归一化规则在压测里
-    也被覆盖，且不影响归一化结果——它们在 ? 之后，整段被剥掉）。
+    变化只取 normalize_url 会剥掉或还原成 {id} 的部分：
+    - key 里的 {id} 占位符替换成随机的纯数字/UUID/长十六进制段（归一化再还原成 {id}）
+    - 按比例加 ``https://api.example.com``（scheme://host，归一化整体剥掉）
+    - 加 query（? 之后）与 fragment（# 之后）（归一化整体剥掉）
     """
     s = key
+    if "{id}" in s:
+        s = s.replace("{id}", _id_segment(rng))
+    if rng.random() < 0.5:
+        s = "https://api.example.com" + s
     if rng.random() < 0.8:
         s += f"?ref={_id_segment(rng)}&page={rng.integers(0, 50)}"
     if rng.random() < 0.3:

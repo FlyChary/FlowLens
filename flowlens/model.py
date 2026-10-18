@@ -143,18 +143,39 @@ def _truncate_utf8(s: str) -> str:
 def normalize_url(raw: str) -> str:
     """URL 归一化（规则见 TASKS.md T1），结果缓存 10 万条，满了整体清空。
 
-    原始 URL 超过 NORM_CACHE_MAX_KEY_LEN 字符时照常归一化，但不写入缓存
-    （键是无界的原始串，缓存它们可能占用大量内存）。
+    T10b：缓存键先用 _strip_query_fragment 截掉 ?/# 之后的部分再查——真实流量里
+    query 几乎每次都不同，若以整条原始 URL 为键几乎命中不了、每条都要走正则。
+    截掉 query/fragment 后的"路径部分"是稳定的缓存键；scheme://host 的去除仍在
+    缓存未命中时（_normalize_url 内部）进行。归一化结果与改动前逐字节一致
+    （tests/test_model.py 有修改前实现的参考对照测试）。
+
+    路径部分超过 NORM_CACHE_MAX_KEY_LEN 字符时照常归一化，但不写入缓存
+    （键是无界的路径串，缓存它们可能占用大量内存）。
     """
-    hit = _norm_cache.get(raw)
+    head = _strip_query_fragment(raw)
+    hit = _norm_cache.get(head)
     if hit is not None:
         return hit
-    out = _normalize_url(raw)
-    if len(raw) <= NORM_CACHE_MAX_KEY_LEN:
+    out = _normalize_url(head)
+    if len(head) <= NORM_CACHE_MAX_KEY_LEN:
         if len(_norm_cache) >= NORM_CACHE_CAP:
             _norm_cache.clear()
-        _norm_cache[raw] = out
+        _norm_cache[head] = out
     return out
+
+
+def _strip_query_fragment(raw: str) -> str:
+    """截掉第一个 ? 或 #（取更早者）及其之后的部分，返回路径部分（含 scheme://host）。
+
+    与 _normalize_url 内部"取 ? 与 # 中更早的一个"的口径一致；两者都没有时原样返回。
+    用作缓存键前调用，让 query/fragment 不同的同一路径命中同一缓存项。
+    """
+    q, h = raw.find("?"), raw.find("#")
+    if q == -1 or (h != -1 and h < q):
+        q = h
+    if q == -1:
+        return raw
+    return raw[:q]
 
 
 def _normalize_url(raw: str) -> str:

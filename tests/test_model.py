@@ -86,6 +86,44 @@ def test_normalize_url_cache_is_shared():
     assert a == b == "/a/b"
 
 
+def test_normalize_url_same_result_before_and_after_cache_change():
+    """T10b：归一化缓存改"先剥 query/fragment 再查"后，结果必须与修改前逐字节一致。
+
+    修改前的 normalize_url 在缓存未命中时返回 _normalize_url(raw)；_normalize_url
+    本身没有被改（这次只改了 normalize_url 用什么当缓存键），所以 _normalize_url(raw)
+    就是修改前的归一化结果。对大量 raw（含下表全部既有用例 + flowgen 生成的带
+    scheme/host/query/fragment 与 {id} 段的变化）逐一断言两者相等。
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import flowgen
+    from flowlens.model import _normalize_url
+
+    # 既有的全部表驱动用例（左值）——确保这些边界形式结果不变
+    existing = [
+        "/api/users?x=1", "/a/b?x=1&y=2", "/api/users#frag", "/api/users?x=1#frag",
+        "/a#f?q=1", "///api//users", "/a///b", "/api/users/", "/a/b/c/", "/",
+        "https://example.com/api/v1/users", "http://host:8080/x",
+        "HTTPS://EXAMPLE.com/Path", "//cdn.example.com/a.js", "//host:8080/x",
+        "/" + "m" * 126 + "/b", "/order/123", "/a/0/b/007",
+        "/o/550e8400-e29b-41d4-a716-446655440000",
+        "/o/550E8400-E29B-41D4-A716-446655440000", "/a/ab12cd34ef56ab78",
+        "/a/0000000000000000", "/a/ab12cd34ef56ab7", "/a/fffffffffffff",
+        "/a/ab12cd34ef56abz8", "/搜索/用户", "/" + "中" * 100, "", "api/users",
+        # 额外边界：query 紧跟 host（无路径）、只有 query、只有 fragment
+        "https://host?x=1", "?x=1", "#f", "//host#f?q=2", "https://h/p?q=1#f?2",
+    ]
+    assert all(normalize_url(r) == _normalize_url(r) for r in existing)
+
+    # flowgen 生成的真实流量：带 {id} 模板、scheme://host、query、fragment 的各种组合
+    rng = __import__("numpy").random.default_rng(0)
+    for i in range(2000):
+        key = flowgen.key_of(i)
+        raw = flowgen.raw_url(key, rng)
+        assert normalize_url(raw) == _normalize_url(raw) == key, raw
+
+
 def test_normalize_url_oversized_not_cached():
     # 超过 1024 字符的原始 URL：照常归一化，但不写入缓存
     import flowlens.model as m

@@ -19,11 +19,26 @@
 | T8b 测试与运行环境解耦、Linux 验证 | 已完成，等审查 |
 | T9 驻留表 | 未开始 |
 | T10a 压测工具、离线精确解、边界用例 | 已完成，等审查 |
-| T10b 实验场景与端到端粗测 | 未开始 |
+| T10b 实验场景与端到端粗测 | 已完成，等审查 |
 | T10c 调试接口与控制台页面 | 未开始 |
 | T11 性能 | 未开始 |
 
 ## 进行中
+
+T10b 已完成（按 docs/instructions/T10b.md），汇报后停下等审查。T10b 内容：
+
+1. **第零节前置修正（4 项，全部完成）**：(a) 容器内存构成实测 + 降级读数改"工作集"（`memory.current − inactive_file`，`/healthz` 加 `memory_current_bytes` 对照），推翻 T7b"保持原值"决定（见"已定的决策"）；(b) Dockerfile 加 `test` 阶段（与正式同基础同依赖 + pytest，跑全量快测试）、constraints.txt 在 python:3.12-slim 重新生成（3.12 比 3.14 多 `typing_extensions`）；(c) 修 flaky 测试——SSE 的 `test_shared_computation_same_params`/`test_recompute_at_most_once_per_second` 改 FakeClock 手工驱动网格点（连跑 20 次全过），`test_all_missing_no_fake_data` 改 monkeypatch 固定替身；(d) `.gitignore` 补 `build/ dist/ results/`。
+2. **第一节（压测流量更真实）**：(a) `flowgen.py` 约一半 key 模板含 `{id}` 段（`/api/order/{id}/x{i}` 等），`raw_url` 把 `{id}` 换成随机数字/UUID/长十六进制并按比例加 scheme+主机名，保持 `normalize_url(raw_url(key))==key`、全池注入性验证通过；(b) `model.py` 归一化缓存先剥 query/fragment 再查（`str.find` 找第一个 `?`/`#`），真实流量组 `bench_model` 每条约 **3.87 μs → 0.50 μs（约 7.7×）**，缓存命中组不受影响（1.80 μs）。
+3. **第二节（实验脚本）**：`tools/experiments.py`（S1/S2/S3/S5，`--target docker|local`、docker 目标 `--memory=256m --memory-swap=256m --cpuset-cpus` 固定单核、端口 9000 避 WSL2 保留段）、`tools/summarize.py`（读结果目录打印 Markdown 汇总）、`docs/EXPERIMENTS_FORMAT.md`（结果文件字段，供 T10c 控制台回放）、`tests/test_experiments.py`（纯函数单测）、`tests/e2e/test_experiments_smoke.py`（slow 冒烟）。按补充要求把"工作集起始/峰值/结束 + 降级级别是否变化、正常负载进 3 级单独标出"做进 timeline 与 summarize。
+4. **第三节（第一次端到端粗测，WSL docker）**：S1（不压缩 + gzip）、S2、S3（长尾 3 万/秒×5 分钟）、S5 全部跑完，结果在 `results/20261018_190021/`。**最大可持续吞吐 = 5 万/秒**（接受率≥99%、无 503、写入 p99<500ms 的最高级；10 万/秒起 p99 升到 ~1.2s、30 万/秒 503 4%）。混合负载（3.5 万/秒）下各查询 p99：topk_default 195ms、topk_replay 156ms、stats 171ms，**均远超"p99<50ms"目标**。过载（S5，1.5×=7.5 万/秒×60s）进入第 1 级、停发后 ~1s 回 0 级，无崩溃。
+
+**⚠ 主要发现：内存随持续写入增长，3 万/秒×5 分钟就进第 4 级，精度数据因此无效。** 各场景工作集（峰值 / 进级时刻）：S1_plain 204.6 MiB（进 3 级）、S1_gzip 190.6（1 级）、S2 210.5（3 级）、**S3 229.4（3 级 @90s、4 级 @200s）**、S5 190.1（1 级）。内存增长由**持续写入填满 600s 保留期**驱动（与瞬时速率无关）：S3 累积 588 万条后工作集 ~218 MiB、长期贴在第 3~4 级，结束时抽样全部落在降级期（服务返回空 topk / 回放暂停），召回 1.0、误差 0 是**空响应的假象**。**该精度数据无效，留 T9b 解决内存问题后重做。** 且与支线 C1 的内存账本矛盾：C1 进程内模拟同样 3 万/秒×11 分钟常驻增量仅 ~97 MB，容器实测工作集 ~229 MiB，差 ~90 MB（疑为请求解析碎片 / 并发瞬时峰值 / 某处泄漏），T9b 专门查。本任务**不做任何内存优化**。
+
+5. **收尾修复**：`exact.compare` 修 bug——服务返回空、精确答案非空时召回记 **0**（原来分母为 0 记 1.0，会把降级期空响应误判成完美精度）；S3 每条抽样记录 `status` 与 `degraded`，分 `valid`/`degraded`/`rejected` 三桶，精度只由 valid 统计（`summarize.py` 同步、兼容旧格式并标注不可信）；`summarize.py` 修 `client_cpu_pct` 显示（原把已是百分数的值当分数显示成 12990%）。
+
+**验证**：Windows `pytest -q` **290 passed, 2 skipped, 9 deselected**、`-m slow` **9 passed**；Docker（WSL，Python 3.12）`docker build --target test` **291 passed, 1 skipped, 9 deselected**。基准（Windows，同机对照 T10a 列，见"基准数据"）：`bench_model` 真实流量组 3.87→0.50 μs/条（归一化缓存修改生效）、缓存命中 1.45→1.80 μs/条（本机波动、未触及热路径）、其余持平。**结论：除归一化缓存显著变快外，未使任何路径变慢。**
+
+---
 
 T10a 已完成（按 docs/instructions/T10a.md），汇报后停下等审查。T10a 内容：
 
@@ -89,7 +104,8 @@ T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 - 实验用的大请求体 tools/exp/big5mb.bin 不入库（git rm --cached + .gitignore），实验脚本运行时临时生成。
 - hashing.key_hashes 中 hash(str(k)) 的改动保留：所有调用位置传入的都是校验过的字符串，结果与 hash(k) 完全一致，开销约每条事件 57 ns（约 1%）。
 - sketch/hll.py 保留支持分段的版本，不换成简化版。
-- 内存读数保持 memory.current 原值，不扣除页缓存。理由：评测以是否超出 --memory 上限判定，内核判断 OOM 用的就是 memory.current，这个口径更保守，适合做降级判断。
+- ~~内存读数保持 memory.current 原值，不扣除页缓存。理由：评测以是否超出 --memory 上限判定，内核判断 OOM 用的就是 memory.current，这个口径更保守，适合做降级判断。~~ **（T10b 已被取代，见下条）**
+- 降级判断与 /healthz 的 `memory_bytes` 改用**工作集** = memory.current − memory.stat 的 inactive_file（cgroup v1 为 memory.usage_in_bytes − total_inactive_file）；/healthz 另加 `memory_current_bytes` 字段保留原始读数便于对照；读不到 memory.stat 时退回 memory.current，无 cgroup 上限时仍用进程读数（T10b）。理由：实测容器（--memory=256m）内存构成——空闲时 memory.current ≈ 168.6 MiB，其中 anon ≈ 85.5、file ≈ 77.8（active ≈ 17.5 / **inactive ≈ 60.4**），即约 36% 是页缓存；以 5 万/秒写入 30 秒后 memory.current ≈ 248.2 MiB（峰值 256 MiB 已摸到上限），anon ≈ 164.0（增长 78.5 MiB 是真实常驻）、file ≈ 78.2（几乎不变、inactive ≈ 60.4）。file 部分基本全是不活跃页缓存，内存紧张时会被内核优先回收、不导致 OOM，把它算进读数会让降级控制器虚高触发（空闲即 66%，离第 3 级阈值 78% 只差 12 个百分点，稍有负载就降级）。改后的口径（工作集）与 docker stats、Kubernetes 驱逐判断一致：空闲 ≈ 108 MiB（42%）、写入 30 秒后 ≈ 184 MiB（72%），贴近真实常驻（anon + active_file），降级判断不再被页缓存干扰。T7b 的决定当时是为了"保守"，实测表明它会让实验全程处于降级状态、干扰结果，故推翻。
 - SSE 默认 60 秒窗口的帧暂时走回放；是否改为复用快照，等 T10 压测看过 CPU 占用后在 T11 决定（同时记入"未解决的问题"）。
 - SSE 帧计算节流按**帧时刻**判断（本帧时刻距上次计算帧时刻 ≥ min_recompute 才重算），不是墙钟：interval ≥ 1s 时每帧必重算（data.to == id），interval < 1s 时同秒多帧复用一份计算。
 - SSE 组保留最近 30 帧的 (帧时刻, payload)（deque(maxlen=30)）：补帧优先取缓存、同组重连不各自重算；不在缓存的帧才现场 topk，且全局 asyncio.Semaphore(1) 串行化。
@@ -111,6 +127,7 @@ T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 - 精确解 `quantile_bytes` 的分位数口径（T10a）：按秩取值，目标秩 R=⌊q·(n−1)⌋+1（1 起算）= numpy `quantile(x, q, method="lower")`，与 `sketch.DDSketch.quantile`（目标排名 ⌊1+q(n−1)⌋）**同一套秩定义**。DDSketch 在同一秩上返回的是**桶代表值**（相对误差 ≤ α），精确解返回该秩的**真实值**——两者取"同一个位置"、比较的是取值精度而非位置。所以"服务 p95 ≈ 精确 p95"是同一秩上的近似关系。
 - `compare()` 的召回口径（T10a，沿用既有决策）：返回的 key 的**真实次数 ≥ 精确第 k 名的次数即算命中**（并列不算错），分母是服务返回条数；另算计数相对误差、真实值是否落在 `[lower,upper]`。
 - `/v1/stats` 支持 `at`（T10a）：与 `/v1/topk` 同口径——不带 `at` 且 window=60s 读快照；带 `at`（或非 60s）走回放合并概要，`at` 早于保留期同样 422、第 1 级降级同样暂停。原因：边界用例"区间无数据 approx_p95_bytes 为 null"需对**已运行**（默认窗口有数据）的服务指向一个无数据的过去区间，必须能用 `at` 回放（见 DESIGN_TODO #16）。`stats(window_ms, at_ms=None)`，`at_ms=None` 时行为与原来完全一致。
+- 镜像的 Python 版本（3.12）是运行环境的唯一标准，依赖约束（constraints.txt）在 python:3.12-slim 容器环境中生成（安装依赖后 pip freeze，含 3.12 需要而 3.14 不需要的全部间接依赖，如 typing_extensions）；收尾检查以 `docker build --target test`（与正式镜像同基础同依赖、加 pytest 后在 3.12 上跑全量快测试）为准，其余检查按需进行（T10b，规则见 CLAUDE.md"每个任务结束时"）。原因：WSL 测试环境是 Python 3.14、constraints 原先在 3.14 上生成（缺 3.12 的 typing_extensions），测试从未在镜像的真实运行环境（3.12）里执行过。
 - 边界用例 18 条、两种形式共用一套定义（T10a）：`tools/boundary_cases.py` 的 `CASES` + `Target` 抽象（进程内用 TestClient、远端用 ClientSession），`tests/e2e/test_boundaries.py` 与 `tools/selftest.py` 都调 `run_all(t)`。题目原列 14 条，实际补到 18 条（gzip、解压炸弹、SSE 重连、区间无数据 p95 为 null 等，见 DESIGN_TODO #17）。
 - 多 worker 的 event_id 互不冲突（T10a）：每个 worker 用不相交的序号区间（`seq_offset = wid × SEQ_STRIDE`，SEQ_STRIDE=10⁸），event_id=`e{seq}` 全局唯一；worker 随机种子 = `seed + wid`。存档按 shard 写、`finalize_archive` 把各 shard 文件按 (shard,seq) 排序合并——同一 worker 内按发送序、跨 worker 的 id 不冲突，"保留第一次出现"去重直接按此序。
 - 本机 WSL2 的 80xx 端口段 bind 报 errno 98（被保留，`ss` 里也看不到占用者），9000/12345 等可用（T10a 实测）：实验脚本端口改用 9000。这不是服务问题，是开发机 WSL2 环境特性；评测容器 `--memory` 启动走 8080 不受影响。
@@ -119,17 +136,33 @@ T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 
 各任务结束时重跑全部测试与性能基准并追加一列（以后每个任务都一样）。每项各跑 3 次取中位（单次波动大）。"上一版"为 T6c 前后对照；"T7b"为提交 `d2d5c8e`；"T8"、"T8b"分别为对应任务结束时的本机（T8b 机器）中位数。
 
-| 项目 | 上一版（T6c 前后） | T7b | T8（中位数） | T8b（本次，Windows 中位数） | T10a（本次，Windows 中位数） |
-|---|---|---|---|---|---|
-| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected | 247 passed, 5 deselected | 250 passed, 5 deselected（WSL：249 passed, 1 skipped, 5 deselected） | 263 passed, 5 deselected（WSL：262 passed, 1 skipped, 5 deselected） |
-| pytest -q -m slow | 5 passed | 5 passed | 5 passed | 5 passed（Windows 与 WSL 均 5 passed） | 5 passed（Windows 与 WSL 均 5 passed） |
-| bench_core 长尾 | 约 20 万～30 万 事件/秒（波动大） | 约 30.5 万/秒（波动上沿） | 约 22.6 万/秒（218/236/226） | 约 18.5 万/秒（197/185/185） | 约 26.4 万/秒（282/264/243） |
-| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 | 约 2.22 μs/条（2.15/2.22/2.22） | 约 1.87 μs/条（1.87/1.92/1.76） | 约 1.45 μs/条（1.49/1.45/1.41） |
-| bench_engine 每批 1000 条合计 | 约 6.3 μs/条 | 约 4.72 μs/条 | 约 6.10 μs/条（5.84/6.10/8.27） | 约 5.84 μs/条（5.84/5.85/5.57） | 约 5.01 μs/条（5.01/4.83/5.84） |
-| bench_engine 每批 5000 条合计 | 约 4.9 μs/条 | 约 4.20 μs/条 | 约 5.39 μs/条（4.65/5.39/6.64） | 约 4.65 μs/条（4.58/4.79/4.65） | 约 4.15 μs/条（4.15/4.55/3.75） |
-| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms | 中位约 23 ms，最大约 44 ms（一次 93 s 为调度停顿） | 中位约 25 ms（25.9/25.0/22.5），最大约 73 ms | 中位约 18.9 ms（18.1/18.9/19.8），最大约 37.7 ms |
-| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms | 中位约 58 ms，最大约 82 ms | 中位约 52 ms（52.3/52.3/51.5），最大约 76 ms | 中位约 48.0 ms（47.4/48.2/48.0），最大约 66.2 ms |
-| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms | 中位约 105 ms，最大约 135 ms | 中位约 116 ms（116/118/106），最大约 187 ms | 中位约 85.2 ms（85.8/84.6/85.2），最大约 113.1 ms |
+| 项目 | 上一版（T6c 前后） | T7b | T8（中位数） | T8b（本次，Windows 中位数） | T10a（本次，Windows 中位数） | T10b（本次，Windows 单次） |
+|---|---|---|---|---|---|---|
+| pytest -q | 197 passed, 5 deselected | 226 passed, 5 deselected | 247 passed, 5 deselected | 250 passed, 5 deselected（WSL：249 passed, 1 skipped, 5 deselected） | 263 passed, 5 deselected（WSL：262 passed, 1 skipped, 5 deselected） | 290 passed, 2 skipped, 9 deselected（Docker 3.12：291 passed, 1 skipped, 9 deselected） |
+| pytest -q -m slow | 5 passed | 5 passed | 5 passed | 5 passed（Windows 与 WSL 均 5 passed） | 5 passed（Windows 与 WSL 均 5 passed） | 9 passed（新增 4 条 e2e slow 冒烟） |
+| bench_core 长尾 | 约 20 万～30 万 事件/秒（波动大） | 约 30.5 万/秒（波动上沿） | 约 22.6 万/秒（218/236/226） | 约 18.5 万/秒（197/185/185） | 约 26.4 万/秒（282/264/243） | 约 30.0 万/秒 |
+| bench_model（缓存命中） | 约 1.68 μs/条 | 约 1.36 μs/条 | 约 2.22 μs/条（2.15/2.22/2.22） | 约 1.87 μs/条（1.87/1.92/1.76） | 约 1.45 μs/条（1.49/1.45/1.41） | 约 1.80 μs/条（本机波动，未触及该路径） |
+| bench_model（真实流量，T10b 新增） | — | — | — | — | 改前 ~3.82 / 改后 ~0.50 μs/条 | 改前 3.87 / 改后 0.50 μs/条（归一化缓存剥离 query/fragment 生效，约 7.7×） |
+| bench_engine 每批 1000 条合计 | 约 6.3 μs/条 | 约 4.72 μs/条 | 约 6.10 μs/条（5.84/6.10/8.27） | 约 5.84 μs/条（5.84/5.85/5.57） | 约 5.01 μs/条（5.01/4.83/5.84） | 约 5.24 μs/条 |
+| bench_engine 每批 5000 条合计 | 约 4.9 μs/条 | 约 4.20 μs/条 | 约 5.39 μs/条（4.65/5.39/6.64） | 约 4.65 μs/条（4.58/4.79/4.65） | 约 4.15 μs/条（4.15/4.55/3.75） | 约 4.13 μs/条 |
+| 单次定稿 | 中位约 23 ms，最大约 47 ms | 中位约 18 ms，最大约 32 ms | 中位约 23 ms，最大约 44 ms（一次 93 s 为调度停顿） | 中位约 25 ms（25.9/25.0/22.5），最大约 73 ms | 中位约 18.9 ms（18.1/18.9/19.8），最大约 37.7 ms | 中位约 18.2 ms，最大约 50.9 ms |
+| 满载快照 refresh_snapshot | 中位约 59 ms，最大约 81 ms | 中位约 47 ms，最大约 53 ms | 中位约 58 ms，最大约 82 ms | 中位约 52 ms（52.3/52.3/51.5），最大约 76 ms | 中位约 48.0 ms（47.4/48.2/48.0），最大约 66.2 ms | 中位约 46.5 ms，最大约 57.3 ms |
+| 完整 tick | 中位约 108 ms，最大约 137 ms | 中位约 82 ms，最大约 92 ms | 中位约 105 ms，最大约 135 ms | 中位约 116 ms（116/118/106），最大约 187 ms | 中位约 85.2 ms（85.8/84.6/85.2），最大约 113.1 ms | 中位约 83.0 ms，最大约 105.6 ms |
+
+T10b 列与 T10a 列**同一台机器**（本机）采集，但 T10b 为**单次**（未取 3 次中位）。T10b 唯一触及热路径的改动是 `model.py` 的归一化缓存键（剥离 query/fragment），`bench_model` 真实流量组据此显著变快（3.87→0.50 μs/条）；`bench_model` 缓存命中组 1.45→1.80 μs 属本机波动（该路径代码未动）。`bench_core`、`bench_engine`、定稿/快照/tick 与 T10a 持平或更快（T10a 本机本就偏快时段），**未使任何路径变慢**。
+
+### 端到端（Docker 256 MB）
+
+WSL 的 `docker run --memory=256m`（服务固定单核、压测固定其他核，`--target docker`），结果目录 `results/20261018_190021/`。注意：查询 p99 在**接近/进入降级**的负载下测得，受每秒定稿 + 快照 + 内存降级影响，**不是**低负载下的稳态查询延迟。
+
+| 项目 | 数值 | 备注 |
+|---|---|---|
+| S1 最大可持续吞吐（不压缩） | **5 万 事件/秒** | 接受率≥99%、无 503、写入 p99<500ms 的最高级；离 20 万/秒目标差 4 倍 |
+| S1 最大可持续吞吐（gzip） | **5 万 事件/秒** | gzip 各级接受率 100%（0 拒绝），但高率 p99 更高（解压开销） |
+| S1 各率写入 p99 | 5 万：375ms / 10 万：1185ms / 30 万：1505ms（不压缩） | 5 万级已偏高（客户端 4 进程×8 并发 + WSL 单核争抢）；服务 CPU 100%（单核打满） |
+| S2 混合负载查询 p99 | topk_default 195ms / topk_replay 156ms / stats 171ms | 写入 3.5 万/秒 + 查询 + 20 SSE；**均远超 p99<50ms 目标**（S2 峰值工作集 210.5 MiB、进第 3 级，查询被定稿/快照与降级拖累） |
+| S3 精度（3 万/秒×5 分钟） | **无效** | 内存增长进第 4 级，抽样全落在降级期（服务返回空 topk / 回放暂停），召回 1.0、误差 0 是空响应假象；留 T9b 解决内存后重做 |
+| S5 过载（1.5×=7.5 万/秒×60s） | 进第 1 级、停发后 ~1s 回 0 级 | 无崩溃、无 503 反复（接受率 99.0%） |
 
 **性能对比必须同机对照**：T8b 列在本机（本次运行）采集，与 T8 列同一台机器，故可直接对比。T8b 相对 T8：`bench_core 长尾` 22.6→18.5 万/秒、`完整 tick` 105→116 ms、`单次定稿` 23→25 ms——**T8b 未触及任何热路径**（改动是内存读数来源、`create_app` 加一个 reader 参数、`ingest` 采样分支复用已算好的 event_id 哈希、`ingest.py` 加一条错误信息），正常路径（sample_weight=1）的写入/快照/定稿代码与 T8 完全相同，数值差异在本机单次波动范围内（长尾吞吐波动历来很大，见"上一版"列 20 万～30 万）。`bench_model` 1.87 vs T8 的 2.22、每批 1000/5000 合计 5.84/4.65 vs T8 的 6.10/5.39，T8b 持平或略快。**结论：T8b 未使任何路径变慢**。
 
@@ -137,7 +170,13 @@ T10a 列与 T8b 列**同一台机器**（本机）采集。T10a 同样**未触�
 
 ## 未解决的问题
 
-1. 查询延迟：每拍定稿约 23 ms（最长约 47 ms），快照在极端流量下约 60 ms，可能让查询 p99 超过 50 ms。等端到端压测后决定是否优化 segtree 或提前做窗口汇总。
+8. **【主要发现，T10b】内存随持续写入增长，3 万/秒×5 分钟就进第 4 级，S3 精度数据因此无效；且与 C1 账本矛盾，差 ~90 MB，T9b 专门查。**
+   - 现象（`results/20261018_190021/`，工作集口径）：S1_plain 峰值 204.6 MiB（进 3 级）、S1_gzip 190.6（1 级）、S2 210.5（3 级）、**S3 229.4（3 级 @90s、4 级 @200s，结束后仍贴 4 级）**、S5 190.1（1 级）。
+   - 关键：内存增长由**持续写入填满 600s 保留期**驱动，与瞬时速率无关——S3 累积 588 万条后工作集 ~218 MiB 并长期不回落；S5 虽然 7.5 万/秒（1.5×）但只跑 60s、累积少，只到 1 级。
+   - 影响：S3 结束时服务处于 3~4 级，回放查询暂停（503）或返回空 topk，200 个抽样区间全部落在降级期，**召回 1.0 / 误差 0 / stats 全 null 是空响应的假象，精度数据无效**（`exact.compare` 已修：空服务答案对非空精确答案召回记 0，不再记 1.0；S3 抽样分 valid/degraded/rejected 三桶）。**精度实验留 T9b 解决内存问题后重做。**
+   - 与 C1 账本矛盾：支线 C1 在**进程内**模拟同样 3 万/秒、持续 11 分钟，服务常驻增量仅 **~97 MB**；容器实测工作集 **~229 MiB**，差 **~90 MB**。怀疑方向（未定）：① 频繁解析大请求的内存碎片 / 分配器未退还；② 并发请求的瞬时峰值叠加；③ 某处对象泄漏。**本任务不做任何内存优化，T9b 专门调查。**
+
+1. 查询延迟：每拍定稿约 23 ms（最长约 47 ms），快照在极端流量下约 60 ms，可能让查询 p99 超过 50 ms。等端到端压测后决定是否优化 segtree 或提前做窗口汇总。（T10b 端到端已证实：混合负载下各查询 p99 156~195 ms，远超 50 ms 目标，主要受定稿 + 快照 + 内存降级拖累。）
 2. 内存尚未在 256 MB 容器里实测，估算常驻约 195 MB 加写入路径。T9 实测。
 3. 吞吐：每批 5000 条约 20.5 万/秒，每批 1000 条约 16 万/秒，未计 HTTP 开销。T11 优化。
 4. T9 的字符串驻留表与冻结的 segtree.py 冲突，开始 T9 前由用户决定做法。
@@ -147,4 +186,4 @@ T10a 列与 T8b 列**同一台机器**（本机）采集。T10a 同样**未触�
 
 ## 下一步
 
-T10a 汇报后停下等待审查；审查通过后按顺序执行：T10b 实验场景与第一次端到端粗测（吞吐/查询 p99 记入"基准数据"）→ T10c 调试接口与控制台页面（界面参考 docs/prototype/console.html）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。
+T10b 汇报后停下等待审查。审查通过后：优先 **T9b 内存专项**——查"未解决的问题"第 8 条（容器持续写入内存增长 ~229 MiB、与 C1 账本差 ~90 MB 的来源），解决后**重做 S3 精度实验**（S1/S2/S5 结果可保留复用）；再按原顺序 T10c 调试接口与控制台页面（界面参考 docs/prototype/console.html，直接读 `results/` 下各场景文件，格式见 docs/EXPERIMENTS_FORMAT.md）→ T9 驻留表 → T11 性能 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。

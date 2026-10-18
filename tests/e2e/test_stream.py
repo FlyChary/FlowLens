@@ -16,12 +16,13 @@ import time
 from aiohttp.test_utils import TestClient, TestServer
 
 from flowlens.api.app import create_app, query_service_key, stream_manager_key
-from flowlens.api.stream import Subscriber
+from flowlens.api.stream import StreamManager, Subscriber
 from flowlens.config import Config
+from flowlens.dims import Dim
 from flowlens.engine import Engine
 from flowlens.ingest import Admission, IngestService
 from flowlens.query import QueryService
-from flowlens.timewin import Clock
+from flowlens.timewin import Clock, FakeClock
 
 
 def _strict_json(text: str):
@@ -172,78 +173,113 @@ def test_ids_strictly_increasing_by_interval():
     _serve(run)
 
 
-# ---- 共享计算：同参数订阅者共用一份计算 ----
+# ---- 共享计算与重算节流（确定性：直接驱动订阅组的生产逻辑，不用真实时间计数）----
+# 旧写法在真实 3s / 2.5s 窗口里统计 topk 调用次数，机器负载高时会少算、时好时坏
+# （T10b 第零节-3）。改为 FakeClock + 手工步进 interval 网格、按 producer() 的节流
+# 规则（帧时刻距上次计算的帧时刻 ≥ recompute_interval_ms 才调 topk）逐个网格点驱动，
+# 调用次数完全确定：interval=200ms、1s 节流下 5 秒（25 个网格点）恰好 5 次。
+
+def _drive_grid(group, clock, ms: int, topk_call):
+    """按 producer() 的节流规则手工步进 [clock.ms, clock.ms+ms) 的网格点。
+
+    每个网格点要么调一次 topk_call(g)（节流放行），要么复用上一次结果；返回
+    topk_call 实际被调用的帧时刻列表。与 SubscriptionGroup.producer 的节流判断
+    相同（payload is None or (g - last_g) >= recompute_interval_ms）。
+    """
+    calls = []
+    payload = None
+    last_g = None
+    g = clock.ms  # 从当前网格点开始（clock.ms 是 200ms 的整数倍）
+    end = clock.ms + ms
+    while g < end:
+        clock.advance(g - clock.ms)  # 时钟跟到网格点（否则 at 晚于 now 被拒）
+        if payload is None or (g - last_g) >= group.recompute_interval_ms():
+            calls.append(g)
+            topk_call(g)
+            payload = {"to": g}
+            last_g = g
+        g += group.interval_ms
+    return calls
+
+
+def _shared_group():
+    """同参数 2 个订阅者的订阅组（FakeClock 驱动），返回（组, 时钟）。
+
+    走真实的 StreamManager.subscribe（建组、起生产任务、登记订阅者），之后取消
+    生产任务改为手工驱动——生产任务用 engine 时钟算网格、睡真实时间，测试里换成
+    FakeClock 后直接驱动，计数才与机器负载无关。
+    """
+    async def setup():
+        clock = FakeClock(10_000)  # 10.000 s：200ms 网格的整数倍
+        engine = Engine(Config(), clock)
+        qs = QueryService(engine)
+        manager = StreamManager(qs)
+        # raw 必须留住引用：subscribe 用 id(raw) 作订阅者下标，临时 object()
+        # 被回收后下一个会复用同一地址、id 撞在一起
+        raw1, raw2 = object(), object()
+        g1, _ = manager.subscribe(by=Dim.URL, window_ms=60_000, k=10,
+                                  interval_ms=200, raw=raw1)
+        g2, _ = manager.subscribe(by=Dim.URL, window_ms=60_000, k=10,
+                                  interval_ms=200, raw=raw2)
+        return manager, g1, g2, clock, (raw1, raw2)
+    manager, g1, g2, clock, _raws = asyncio.run(setup())
+    assert g1 is g2 and len(manager.groups) == 1  # 同参数落在同一个组
+    assert len(g1.subscribers) == 2  # 两个订阅者都在这个组里
+    assert g1.task is not None  # 组只有这一个生产任务（结构上唯一）
+    # 停掉真实生产任务，改由测试按网格手工驱动
+    g1.task.cancel()
+    return g1, clock
+
+
+def _cancel_group(group):
+    group.subscribers.clear()
+    if group.task is not None and not group.task.done():
+        group.task.cancel()
+
 
 def test_shared_computation_same_params():
-    async def run(client, engine, app):
-        await _ingest(client, _evs(50, _now_ms()))
-        qs = app[query_service_key]
-        manager = app[stream_manager_key]
-        calls = []
-        real = qs.topk
+    """两个同参数订阅者共用一个生产任务：5 秒内 topk 只算 5 次（单生产者、每秒一次）。
 
-        async def spy(d, window_ms, k, at_ms=None, **kw):
-            calls.append(time.monotonic())
-            return await real(d, window_ms, k, at_ms, **kw)
-        qs.topk = spy
-        url = "/v1/topk/stream?window=60s&k=10&by=url&interval=200ms"
-        try:
-            # 结构性证明：两个同参数订阅者落在同一个组、共用同一个后台生产任务
-            # （计算只由这一个任务做，不是每个订阅者各算一份）
-            r1 = await _open_stream(client, url)
-            await _read_block(r1)  # retry
-            r2 = await _open_stream(client, url)
-            await _read_block(r2)
-            assert len(manager.groups) == 1  # 一个组
-            group = next(iter(manager.groups.values()))
-            assert len(group.subscribers) == 2  # 两个订阅者都在这个组里
-            assert group.task is not None and not group.task.done()  # 只有一个后台任务
-            task_id = group.task
-            await asyncio.sleep(0.5)  # 等两个订阅者的首次补发（也会调 topk）跑完
-            assert group.task is task_id  # 仍是同一个任务，没有多开
-            # 稳态：两个订阅者共用一个生产任务时，后台计算仍是"每秒最多一次"的单
-            # 生产者频率（~1/s，3s 约 2~3 次）。若每个订阅者各算一份，3s 会 ~6 次
-            # （翻倍）。断言落在单生产者的区间，即"与只有一个订阅者时相同"。
-            calls.clear()
-            t0 = time.monotonic()
-            while time.monotonic() - t0 < 3.0:
-                await asyncio.sleep(0.2)
-            c_both = len(calls)
-            assert 2 <= c_both <= 4, c_both
-        finally:
-            r1.close()
-            qs.topk = real
-    _serve(run)
+    若没有共享（每个订阅者各算一份），同样 5 秒会算 10 次——断言恰好 5 次且每
+    秒一个（帧时刻间隔 1s），两种错误写法都能被抓出。
+    """
+    group, clock = _shared_group()
+    real = group.qs.topk
 
+    async def spy(d, window_ms, k, at_ms=None, **kw):
+        return await real(d, window_ms, k, at_ms, **kw)
+    group.qs.topk = spy
+    try:
+        start = clock.ms  # 驱动过程中时钟会跟到网格点，先记下起点
+        calls = _drive_grid(group, clock, 5000,
+                            lambda g: asyncio.run(spy(group.by, group.window_ms,
+                                                      group.k, g, from_stream=True)))
+        assert calls == [start + i * 1000 for i in range(5)], calls
+    finally:
+        group.qs.topk = real
+        _cancel_group(group)
 
-# ---- 计算频率：interval=200ms 时，每秒最多重新计算一次 ----
 
 def test_recompute_at_most_once_per_second():
-    async def run(client, engine, app):
-        await _ingest(client, _evs(50, _now_ms()))
-        qs = app[query_service_key]
-        calls = []
-        real = qs.topk
+    """interval=200ms 时每秒最多重新计算一次：5 秒 25 个网格点只算 5 次。"""
+    group, clock = _shared_group()
+    real = group.qs.topk
+    calls = 0
 
-        async def spy(d, window_ms, k, at_ms=None, **kw):
-            calls.append(time.monotonic())
-            return await real(d, window_ms, k, at_ms, **kw)
-        qs.topk = spy
-        try:
-            resp = await _open_stream(
-                client, "/v1/topk/stream?window=60s&k=10&by=url&interval=200ms")
-            await _read_block(resp)  # retry
-            # 跑 2.5 秒：不设限每 200ms 算一次 ≈ 12 次；限流后约 1 次/秒 → 2~4 次
-            calls.clear()
-            t0 = time.monotonic()
-            while time.monotonic() - t0 < 2.5:
-                await asyncio.sleep(0.1)
-            c = len(calls)
-            assert 2 <= c <= 5, c
-            resp.close()
-        finally:
-            qs.topk = real
-    _serve(run)
+    async def spy(d, window_ms, k, at_ms=None, **kw):
+        nonlocal calls
+        calls += 1
+        return await real(d, window_ms, k, at_ms, **kw)
+    group.qs.topk = spy
+    try:
+        # 不设限的话 25 个网格点会算 25 次；节流后恰好 5 次（每满 1s 一次）
+        grid_calls = _drive_grid(group, clock, 5000,
+                                 lambda g: asyncio.run(spy(group.by, group.window_ms,
+                                                           group.k, g, from_stream=True)))
+        assert calls == 5 and len(grid_calls) == 5, (calls, grid_calls)
+    finally:
+        group.qs.topk = real
+        _cancel_group(group)
 
 
 # ---- 上限：订阅组数与连接数超过时返回 503 + Retry-After（JSON）----

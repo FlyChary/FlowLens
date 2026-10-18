@@ -32,6 +32,26 @@ from flowgen import (INVALID, FUTURE, ArchiveData, load_archive, key_of, user_of
 LATENESS_MS = 60_000
 
 
+def _idx_from_key(key: str) -> int | None:
+    """归一化 URL key → url 编号；解析不出返回 None。
+
+    所有 key 模板的末尾段都是 ``x{url_idx}``（见 flowgen.key_of），取最后一个路径
+    段、去掉前缀 ``x``、必须是纯数字。含 {id} 模板（如 /api/order/{id}/x{i}）的
+    {id} 段在中间，不影响末尾段解析。
+    """
+    seg = key.rsplit("/", 1)[-1]
+    if not seg.startswith("x") or not seg[1:].isdigit():
+        return None
+    return int(seg[1:])
+
+
+def _user_idx_from_key(key: str) -> int | None:
+    """归一化 user key（u{user_idx}）→ user 编号；解析不出返回 None。"""
+    if not key.startswith("u") or not key[1:].isdigit():
+        return None
+    return int(key[1:])
+
+
 @dataclass
 class ExactSolution:
     """存档 → 被接受事件集合（按 ts 排序）→ 区间查询。"""
@@ -90,15 +110,13 @@ class ExactSolution:
         return [(key, int(c)) for c, key in pairs[:k]]
 
     def count_of(self, by: str, from_ms: int, to_ms: int, key: str) -> int:
-        """某个 key 在区间内的精确次数。"""
+        """某个 key 在区间内的精确次数（key 是服务返回的归一化 key 字符串）。"""
         i0, i1 = self._span(from_ms, to_ms)
         idx = (self.url_idx if by == "url" else self.user_idx)[i0:i1]
-        # 编号与字符串的映射是双射（key_of / user_of），反解编号
-        prefix = "/api/item/x" if by == "url" else "u"
-        num = key[len(prefix):]
-        if not num.isdigit():
+        num = _idx_from_key(key) if by == "url" else _user_idx_from_key(key)
+        if num is None:
             return 0
-        return int(np.sum(idx == int(num)))
+        return int(np.sum(idx == num))
 
     def distinct_users(self, from_ms: int, to_ms: int) -> int:
         i0, i1 = self._span(from_ms, to_ms)
@@ -160,9 +178,16 @@ def compare(service_items: list[dict], exact_items: list[tuple[str, int]],
             if not (lo <= true <= hi):
                 in_bounds = False
     n = len(service_items)
+    if n:
+        recall = hits / n
+    else:
+        # 服务未返回任何 key：精确答案也为空（区间无数据）时算全命中；否则服务漏
+        # 掉了整个 top-k，召回为 0——绝不能记成 1.0（T10b 发现降级期空响应会被
+        # 误判为 recall=1.0，伪造出完美的精度）。
+        recall = 1.0 if not exact_items else 0.0
     return {
         "k": k,
-        "recall": hits / n if n else 1.0,
+        "recall": recall,
         "mean_rel_err": float(np.mean(rel_errs)) if rel_errs else 0.0,
         "max_rel_err": float(np.max(rel_errs)) if rel_errs else 0.0,
         "in_bounds": in_bounds,
