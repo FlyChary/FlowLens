@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FlowLens 控制台（原型）</title>
+<style>
+:root {
+  --bg: #F3F5F8; --panel: #FFFFFF; --ink: #1C2333; --muted: #5D6677; --line: #D5DAE2; --faint: #EDF0F4;
+  --write: #0E7C7B; --state: #4B4FA6; --read: #8A3E7A; --danger: #C0392B; --warn: #B7791F;
+  --write-soft: #E3F1F0; --state-soft: #E9EAF6; --read-soft: #F4E8F1;
+  color-scheme: light;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #171B22; --panel: #20262F; --ink: #E6E9EF; --muted: #9AA3B2; --line: #343C4A; --faint: #262D38;
+    --write: #46C2BA; --state: #9599F2; --read: #DA8FCB; --danger: #F07167; --warn: #E9B44C;
+    --write-soft: #1E3838; --state-soft: #2A2D4A; --read-soft: #3A2637;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #171B22; --panel: #20262F; --ink: #E6E9EF; --muted: #9AA3B2; --line: #343C4A; --faint: #262D38;
+  --write: #46C2BA; --state: #9599F2; --read: #DA8FCB; --danger: #F07167; --warn: #E9B44C;
+  --write-soft: #1E3838; --state-soft: #2A2D4A; --read-soft: #3A2637;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: inherit; }
+html { height: 100%; scroll-padding-top: env(safe-area-inset-top, 0px); }
+body {
+  margin: 0; min-height: 100%; background: var(--bg); color: var(--ink);
+  font: 14px/1.55 "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased;
+}
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--state); outline-offset: 2px; }
+
+header {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 14px 24px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h1 { font-size: 18px; font-weight: 600; margin: 0; }
+.proto { font-size: 12.5px; color: var(--muted); }
+.spacer { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 6px 14px; cursor: pointer; color: var(--muted); }
+.seg button[aria-pressed="true"] { background: var(--state-soft); color: var(--state); font-weight: 600; }
+.clock { font-size: 13px; color: var(--muted); }
+.clock b { color: var(--ink); font-weight: 600; }
+
+.layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 20px; padding: 20px 24px 32px; max-width: 1680px; margin: 0 auto; }
+aside { display: flex; flex-direction: column; gap: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+.panel h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
+.panel .hint { font-size: 12.5px; color: var(--muted); margin: 0 0 12px; }
+
+.field { display: grid; gap: 4px; margin-bottom: 12px; }
+.field label { font-size: 13px; color: var(--muted); display: flex; justify-content: space-between; }
+.field label output { color: var(--ink); font-weight: 600; }
+.field select, .field input[type="number"] {
+  width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
+}
+.field input[type="range"] { width: 100%; accent-color: var(--write); }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-bottom: 14px; }
+.actions { display: flex; gap: 8px; }
+.btn { flex: 1; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; }
+.btn.primary { background: var(--write); border-color: var(--write); color: var(--panel); font-weight: 600; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.progress { height: 6px; border-radius: 3px; background: var(--faint); margin: 14px 0 6px; overflow: hidden; }
+.progress i { display: block; height: 100%; width: 0; background: var(--write); transition: width .3s; }
+.status-line { font-size: 12.5px; color: var(--muted); }
+
+.scen-desc { font-size: 12.5px; color: var(--muted); margin: -4px 0 12px; }
+
+main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+
+/* 结构视图 */
+.structure { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
+.ringbox svg { width: 100%; height: auto; display: block; }
+.treehead { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.treehead h3, .ringbox h3 { font-size: 14px; font-weight: 600; margin: 0; }
+.treehead .seg button { padding: 3px 10px; font-size: 12.5px; }
+.treewrap { overflow-x: auto; }
+.treewrap svg { width: 100%; min-width: 620px; height: auto; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 12px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.evhead { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 20px 0 6px; }
+.evhead h3 { font-size: 14px; font-weight: 600; margin: 0; }
+.evhead .seg button { padding: 3px 8px; font-size: 12px; }
+.evhead .note { font-size: 12.5px; color: var(--muted); flex-basis: 100%; }
+#evchart { cursor: crosshair; }
+.cmp { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 24px; }
+.cmp h3 { font-size: 13.5px; font-weight: 600; margin: 0 0 6px; }
+.cmp svg { width: 100%; height: auto; display: block; }
+.chart.sm { height: 92px; margin-bottom: 10px; }
+.cmp .keyline { margin-bottom: 4px; }
+@media (max-width: 1180px) { .cmp { grid-template-columns: minmax(0, 1fr); } }
+
+svg text { fill: var(--muted); font-size: 11px; }
+svg .ink { fill: var(--ink); }
+.slot { cursor: default; }
+
+.query { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.query .field { margin: 0; width: 190px; }
+.query .btn { flex: 0 0 auto; }
+.query .result { flex: 1 1 260px; font-size: 13px; color: var(--muted); min-height: 1.5em; }
+.query .result b { color: var(--read); }
+.query .result .err { color: var(--danger); }
+.query .result code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--faint); color: var(--ink); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+
+/* 指标面板 */
+.metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.chart { width: 100%; height: 150px; display: block; }
+.kpis { display: flex; gap: 18px; flex-wrap: wrap; margin: 4px 0 8px; }
+.kpi { font-size: 12.5px; color: var(--muted); }
+.kpi b { display: block; font-size: 18px; font-weight: 600; color: var(--ink); }
+.keyline { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.keyline i { display: inline-block; width: 14px; height: 2px; margin-right: 5px; vertical-align: 3px; }
+
+.levels { display: flex; gap: 4px; margin: 8px 0 2px; }
+.levels span { flex: 1; text-align: center; font-size: 12px; padding: 4px 0; border-radius: 5px; background: var(--faint); color: var(--muted); }
+.levels span.on { background: var(--warn); color: var(--panel); font-weight: 600; }
+.levels span.on.l0 { background: var(--write); }
+.level-desc { font-size: 12.5px; color: var(--muted); min-height: 2.6em; }
+
+.lower { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 20px; }
+.topk { width: 100%; border-collapse: collapse; font-size: 13px; }
+.topk th { text-align: left; font-weight: 500; color: var(--muted); padding: 4px 6px; border-bottom: 1px solid var(--line); }
+.topk td { padding: 5px 6px; border-bottom: 1px solid var(--faint); }
+.topk td.key { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; word-break: break-all; }
+.topk td.num { text-align: right; white-space: nowrap; }
+.bar { height: 6px; border-radius: 3px; background: var(--write-soft); position: relative; min-width: 60px; }
+.bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--write); }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+.acc { width: 100%; border-collapse: collapse; font-size: 13px; }
+.acc td { padding: 5px 0; border-bottom: 1px solid var(--faint); }
+.acc td:last-child { text-align: right; font-weight: 600; }
+.empty { font-size: 13px; color: var(--muted); padding: 10px 0; }
+
+/* 回放 */
+.replay { display: none; align-items: center; gap: 12px; padding: 10px 24px; background: var(--state-soft); border-bottom: 1px solid var(--line); font-size: 13px; }
+.replay.on { display: flex; }
+.replay input { flex: 1; accent-color: var(--state); }
+.replay .btn { flex: 0 0 auto; padding: 4px 14px; min-width: 72px; }
+.replay .btn[aria-pressed="true"] { background: var(--state); border-color: var(--state); color: var(--panel); }
+
+#tip {
+  position: fixed; z-index: 20; pointer-events: none; max-width: 300px;
+  background: var(--ink); color: var(--panel); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; line-height: 1.5;
+  opacity: 0; transition: opacity .1s;
+}
+#tip.show { opacity: 1; }
+#tip .k { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+.fly { position: fixed; width: 10px; height: 10px; border-radius: 2px; background: var(--state); z-index: 15; pointer-events: none;
+  transition: transform .7s cubic-bezier(.5,0,.3,1), opacity .7s; }
+
+@media (max-width: 1180px) {
+  .structure { grid-template-columns: minmax(0, 1fr); }
+  .ringbox { max-width: 360px; margin: 0 auto; width: 100%; }
+  .metrics { grid-template-columns: minmax(0, 1fr); }
+  .lower { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 860px) {
+  .layout { grid-template-columns: minmax(0, 1fr); padding: 14px; }
+  header { padding: 12px 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fly { display: none; }
+  .progress i, #tip { transition: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>FlowLens 控制台</h1>
+  <span class="proto">原型：数据由页面内的模拟器生成，未连接服务</span>
+  <span class="spacer"></span>
+  <span class="clock">当前秒 <b id="clock">--:--:--</b></span>
+  <div class="seg" role="group" aria-label="视图模式">
+    <button id="modeLive" aria-pressed="true">实时</button>
+    <button id="modeReplay" aria-pressed="false">回放</button>
+  </div>
+</header>
+<div class="replay" id="replayBar">
+  <button class="btn" id="playBtn" aria-pressed="false">播放</button>
+  <span>回放最近 <b id="replayLen">0</b> 秒</span>
+  <input type="range" id="replaySlider" min="0" max="0" value="0" aria-label="回放时刻">
+  <span id="replayAt">--</span>
+</div>
+
+<div class="layout">
+  <aside>
+    <section class="panel" aria-labelledby="ctlTitle">
+      <h2 id="ctlTitle">压测</h2>
+      <p class="hint">压测进程由控制台服务启动，页面只负责下发参数和展示进度。</p>
+      <div class="field">
+        <label for="scenario">场景</label>
+        <select id="scenario">
+          <option value="ramp">吞吐爬坡</option>
+          <option value="mixed">混合负载</option>
+          <option value="accuracy">精度实验</option>
+          <option value="attack">攻击流量</option>
+          <option value="overload">过载与恢复</option>
+        </select>
+      </div>
+      <p class="scen-desc" id="scenDesc"></p>
+      <div class="field">
+        <label for="rate">发送速率 <output id="rateOut"></output></label>
+        <input type="range" id="rate" min="10000" max="400000" step="10000" value="300000">
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label for="conc">并发连接</label>
+          <input type="number" id="conc" min="1" max="256" value="32">
+        </div>
+        <div class="field">
+          <label for="dur">时长（秒）</label>
+          <input type="number" id="dur" min="10" max="900" value="90">
+        </div>
+      </div>
+      <div class="field">
+        <label for="dist">流量分布</label>
+        <select id="dist">
+          <option value="lt">长尾</option>
+          <option value="uni">接近均匀</option>
+          <option value="rnd">全随机</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="gzip" checked> 请求体 gzip 压缩</label>
+      <div class="actions">
+        <button class="btn primary" id="startBtn">开始压测</button>
+        <button class="btn" id="stopBtn" disabled>停止</button>
+      </div>
+      <div class="progress" aria-hidden="true"><i id="prog"></i></div>
+      <div class="status-line" id="runStatus">空闲：只有背景流量</div>
+    </section>
+
+    <section class="panel">
+      <h2>模拟速度</h2>
+      <p class="hint">加快后每秒推进多个模拟秒，方便观察线段树的构建与冻结。</p>
+      <div class="seg" role="group" aria-label="模拟速度" id="speedSeg">
+        <button data-speed="1" aria-pressed="true">1 倍</button>
+        <button data-speed="4" aria-pressed="false">4 倍</button>
+        <button data-speed="10" aria-pressed="false">10 倍</button>
+      </div>
+    </section>
+  </aside>
+
+  <main>
+    <section class="panel" aria-labelledby="structTitle">
+      <h2 id="structTitle">内部结构</h2>
+      <p class="hint">左边是最近 66 秒的活跃环，右边是保存 10 分钟历史的稀疏线段树。鼠标悬停可查看每一秒、每个节点的状态。</p>
+      <div class="structure">
+        <div class="ringbox">
+          <h3>活跃环</h3>
+          <svg id="ring" viewBox="0 0 360 360" role="img" aria-label="活跃环：66 个 1 秒槽"></svg>
+          <div class="legend">
+            <span><i style="background:var(--write)"></i>颜色越深，这一秒事件越多</span>
+            <span><i style="background:transparent;border:1.5px dashed var(--write)"></i>未来容差 5 秒</span>
+            <span><i style="background:var(--state)"></i>即将定稿离环</span>
+          </div>
+        </div>
+        <div>
+          <div class="treehead">
+            <h3>稀疏线段树</h3>
+            <div class="seg" role="group" aria-label="线段树视图" id="treeSeg">
+              <button data-view="full" aria-pressed="true">完整 10 分钟</button>
+              <button data-view="zoom" aria-pressed="false">最近 64 秒</button>
+            </div>
+          </div>
+          <div class="treewrap"><svg id="tree" viewBox="0 0 1000 300" role="img" aria-label="线段树各层节点"></svg></div>
+          <div class="legend">
+            <span><i style="background:var(--state);opacity:.75"></i>已冻结，越深名单越满</span>
+            <span><i style="background:transparent;border:1.5px dashed var(--state)"></i>构建中，内部填充为进度</span>
+            <span><i style="background:var(--read)"></i>查询选中的节点</span>
+            <span><i style="background:var(--read-soft);border:1.5px dashed var(--read)"></i>按比例计入的边缘秒</span>
+          </div>
+          <div class="evhead">
+            <h3>事件数</h3>
+            <div class="seg" role="group" aria-label="颗粒度" id="evSeg"></div>
+            <span class="note" id="evNote"></span>
+          </div>
+          <div class="treewrap"><svg id="evchart" viewBox="0 0 1000 180" role="img" aria-label="线段树时间范围内的事件数"></svg></div>
+        </div>
+      </div>
+      <div class="query">
+        <div class="field">
+          <label for="qAt">结束时刻 at（几秒前）</label>
+          <input type="number" id="qAt" min="0" max="600" step="0.1" value="3.4">
+        </div>
+        <div class="field">
+          <label for="qWin">区间长度 window（整秒）</label>
+          <input type="number" id="qWin" min="1" max="600" step="1" value="150">
+        </div>
+        <button class="btn" id="qBtn">高亮这个查询</button>
+        <button class="btn" id="qClear">清除</button>
+        <div class="result" id="qResult" aria-live="polite">输入一个查询区间，看它如何被拆成环内秒桶、线段树节点和两端的边缘秒。</div>
+      </div>
+    </section>
+
+    <section class="panel" id="cmpPanel" hidden aria-labelledby="cmpTitle">
+      <h2 id="cmpTitle">估计与真实对比</h2>
+      <p class="hint">真实值来自离线精确解：压测时存档发出的每一条事件，回放时对同一区间计算精确答案。拖动回放滑块，下面的内容会切换到那一刻。</p>
+      <div class="cmp">
+        <div>
+          <h3 id="cmpTopTitle">此刻的 Top-10（最近 60 秒，按 URL）</h3>
+          <div class="keyline"><span><i style="background:var(--write);opacity:.35;height:8px"></i>服务的估计值</span><span><i style="background:var(--write);height:8px"></i>服务给出的 [下界, 上界]</span><span><i style="background:var(--read);width:3px;height:12px;vertical-align:-2px"></i>真实值</span></div>
+          <svg id="cmpTop" viewBox="0 0 640 300" role="img" aria-label="Top-10 估计值与真实值对比"></svg>
+        </div>
+        <div>
+          <div class="kpis" id="cmpKpis"></div>
+          <h3>Top-1 计数</h3>
+          <canvas class="chart sm" id="cTop1"></canvas>
+          <h3>去重用户数</h3>
+          <canvas class="chart sm" id="cUsers"></canvas>
+          <h3>p95 响应字节</h3>
+          <canvas class="chart sm" id="cP95"></canvas>
+          <div class="keyline"><span><i style="background:var(--write)"></i>估计值</span><span><i style="background:var(--read)"></i>真实值</span><span><i style="background:var(--write);opacity:.2;height:8px"></i>[下界, 上界]</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="metrics">
+      <div class="panel">
+        <h2>吞吐</h2>
+        <div class="kpis">
+          <div class="kpi"><b id="kSent">0</b>发送（事件/秒）</div>
+          <div class="kpi"><b id="kAcc">0</b>被接受</div>
+          <div class="kpi"><b id="kRej">0</b>503 拒绝</div>
+        </div>
+        <canvas class="chart" id="cThroughput"></canvas>
+        <div class="keyline"><span><i style="background:var(--muted)"></i>发送</span><span><i style="background:var(--write)"></i>接受</span><span><i style="background:var(--danger)"></i>拒绝</span></div>
+      </div>
+      <div class="panel">
+        <h2>查询延迟</h2>
+        <div class="kpis">
+          <div class="kpi"><b id="kP50">0</b>p50（ms）</div>
+          <div class="kpi"><b id="kP95">0</b>p95</div>
+          <div class="kpi"><b id="kP99">0</b>p99</div>
+        </div>
+        <canvas class="chart" id="cLatency"></canvas>
+        <div class="keyline"><span><i style="background:var(--write)"></i>p50</span><span><i style="background:var(--state)"></i>p95</span><span><i style="background:var(--read)"></i>p99</span><span><i style="background:var(--danger)"></i>50 ms 预算</span></div>
+      </div>
+      <div class="panel">
+        <h2>服务状态</h2>
+        <div class="kpis">
+          <div class="kpi"><b id="kMem">0</b>内存（MB）</div>
+          <div class="kpi"><b id="kOcc">0</b>在途占用</div>
+          <div class="kpi"><b id="kLag">0</b>tick 延迟（ms）</div>
+        </div>
+        <canvas class="chart" id="cMemory"></canvas>
+        <div class="levels" id="levels"><span class="l0">正常</span><span>1 级</span><span>2 级</span><span>3 级</span><span>4 级</span></div>
+        <div class="level-desc" id="levelDesc"></div>
+      </div>
+    </section>
+
+    <section class="lower">
+      <div class="panel">
+        <div class="treehead">
+          <h2 style="margin:0">实时热点</h2>
+          <div class="seg" role="group" aria-label="热点维度" id="bySeg">
+            <button data-by="url" aria-pressed="true">URL</button>
+            <button data-by="user" aria-pressed="false">用户</button>
+          </div>
+        </div>
+        <p class="hint" id="topkHint">通过 SSE 订阅：最近 60 秒，按 URL，前 10 名。</p>
+        <table class="topk">
+          <thead><tr><th>#</th><th id="thKey">URL</th><th>次数</th><th>误差</th><th style="width:28%"></th></tr></thead>
+          <tbody id="topkBody"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>统计与结果</h2>
+        <div class="stats">
+          <div class="kpi"><b id="kUsers">0</b>去重用户数（60 秒）<br>误差约 ±0.8%（HLL，2¹⁴ 个寄存器）</div>
+          <div class="kpi"><b id="kP95b">0</b>字节数 p95（60 秒，单位：字节）<br>误差约 ±1%（DDSketch）</div>
+          <div class="kpi"><b id="kSse">0</b>SSE 订阅组 / 订阅者</div>
+          <div class="kpi"><b id="kIngested">0</b>累计写入事件</div>
+        </div>
+        <h2 style="margin-top:6px">与离线精确解对比</h2>
+        <div id="accBox"><div class="empty">运行"精度实验"场景，结束后在这里显示召回率与误差。</div></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="tip" role="tooltip"></div>
+
+<script>
+(() => {
+'use strict';
+// ===================== 常量（与 FlowLens 的真实参数一致） =====================
+const RING = 66, WIN = 60, FUT = 5, RET = 600, LV = 9, HEAP = 512, LEAF_KEEP = 128;
+const KEEP = k => (k <= 3 ? 256 : 1024);
+const KEYSPACE = 20000, USERS = 200000, CAPACITY = 205000, MEM_LIMIT = 256;
+const ZS = 1.1;
+let H = 0; for (let r = 1; r <= KEYSPACE; r++) H += Math.pow(r, -ZS);
+const pz = r => Math.pow(r, -ZS) / H;
+const SCEN = {
+  ramp: '发送速率从 2 万逐步升到设定值，找出最大可持续吞吐。',
+  mixed: '写入保持在设定速率，同时并发查询并挂上多个 SSE 订阅，观察查询 p99。',
+  accuracy: '按设定速率写入，结束后与离线精确解对比 Top-K 召回和误差。',
+  attack: '强制全随机流量（每个 URL、用户都只出现一次），观察内存是否有界。',
+  overload: '前 70% 时间以超出处理能力的速率发送，然后停止，观察降级与恢复。',
+};
+const LEVEL_DESC = [
+  '正常运行，所有功能全量。',
+  '1 级：回放查询暂停（503），SSE 重算间隔放宽到 5 秒，默认窗口照常返回。',
+  '2 级：Top-K 名单与 p95 带权采样，去重人数与 event_id 去重仍然全量。',
+  '3 级：收紧写入与请求体额度，拒绝新的 SSE 订阅，清空缓存。',
+  '4 级：写入在读取请求体前直接返回 503，调用方重试安全。',
+];
+
+// ===================== 模拟器 =====================
+const S = {
+  cur: Math.floor(Date.now() / 1000) - 700,  // 当前秒（先回到 700 秒前，预热出 10 分钟历史）
+  slots: new Map(),        // 活跃环：秒 → 槽
+  leaves: new Map(),       // 冻结叶子：秒 → 叶子
+  nodes: Array.from({ length: LV + 1 }, () => new Map()),  // 各层冻结节点：起点 → 节点
+  builders: Array(LV + 1).fill(null),                       // 各层构建中的节点
+  newest: null,            // 最新冻结叶子的秒号
+  occ: 0.05, mem: 128, lag: 18, level: 0, weight: 1, ingested: 0,
+  run: null, dist: 'lt', frames: [], accuracy: null,
+};
+const rnd = (a, b) => a + Math.random() * (b - a);
+const keyOf = (rank, sec) => '/api/item/x' + ((rank * 7919 + Math.floor(sec / 90) * 131) % KEYSPACE);
+
+function slotDerive(sl) {
+  const e = sl.events, d = sl.dist;
+  if (e <= 0) { sl.heapUrl = sl.heapUser = 0; sl.u = 0; sl.top = []; return; }
+  const uniqUrl = d === 'rnd' ? e : KEYSPACE * (1 - Math.exp(-e / KEYSPACE));
+  const uniqUser = d === 'rnd' ? e : USERS * (1 - Math.exp(-e / USERS));
+  sl.heapUrl = Math.min(HEAP, Math.round(uniqUrl));
+  sl.heapUser = Math.min(HEAP, Math.round(uniqUser));
+  if (sl.heapUrl < HEAP) sl.u = 0;
+  else if (d === 'lt') sl.u = Math.max(1, Math.round(e * pz(HEAP)));
+  else if (d === 'uni') sl.u = Math.max(1, Math.round(e / KEYSPACE * 1.6));
+  else sl.u = 1;
+  if (d === 'rnd') sl.top = [1, 2, 3].map(i => ({ k: '/r/x' + Math.floor(Math.random() * 9e6), c: 1 }));
+  else if (d === 'uni') sl.top = [1, 2, 3].map(i => ({ k: keyOf(i * 977, sl.sec), c: Math.max(1, Math.round(e / KEYSPACE * rnd(1.4, 2.2))) }));
+  else sl.top = [1, 2, 3].map(r => ({ k: keyOf(r, sl.sec), c: Math.round(e * pz(r) * rnd(0.96, 1.04)) }));
+}
+function slot(sec) {
+  let sl = S.slots.get(sec);
+  if (!sl) { sl = { sec, events: 0, dist: S.dist }; S.slots.set(sec, sl); slotDerive(sl); }
+  return sl;
+}
+function addEvents(sec, n) {
+  if (n <= 0) return;
+  const sl = slot(sec); sl.events += n; sl.dist = S.dist; slotDerive(sl);
+}
+
+function targetRate() {
+  const r = S.run;
+  if (!r) return 15000 * rnd(0.85, 1.15);  // 背景流量
+  const t = r.elapsed / r.dur;
+  switch (r.scen) {
+    case 'ramp': return 20000 + (r.rate - 20000) * Math.min(1, t);
+    case 'overload': return t < 0.7 ? Math.max(r.rate, 320000) : 0;
+    default: return r.rate * rnd(0.97, 1.03);
+  }
+}
+
+function updateLevel() {
+  const memB = S.mem, lim = MEM_LIMIT, o = S.occ, lag = S.lag;
+  const L = S.level;
+  const inL4 = L >= 4 ? memB > lim * 0.82 : memB > lim * 0.90;
+  const inL3 = L >= 3 ? memB > lim * 0.70 : memB > lim * 0.78;
+  const inL2 = L >= 2 ? o > 0.5 : o > 0.8;
+  const inL1 = L >= 1 ? (o > 0.4 || lag > 500) : (o > 0.6 || lag > 1000);
+  S.level = inL4 ? 4 : inL3 ? 3 : inL2 ? 2 : inL1 ? 1 : 0;
+  S.weight = S.level >= 2 ? (o > 0.95 ? 4 : 2) : 1;
+}
+
+function finalize(sec) {
+  const sl = S.slots.get(sec);
+  S.slots.delete(sec);
+  const leaf = { sec, level: 0, start: sec, events: sl ? sl.events : 0,
+    items: sl ? Math.min(LEAF_KEEP, sl.heapUrl) : 0, u: sl ? sl.u : 0, top: sl ? sl.top : [] };
+  S.leaves.set(sec, leaf);
+  S.nodes[0].set(sec, leaf);
+  for (let k = 1; k <= LV; k++) {
+    const span = 1 << k, start = Math.floor(sec / span) * span;
+    let b = S.builders[k];
+    if (!b || b.start !== start) b = S.builders[k] = { level: k, start, filled: 0, events: 0, cand: 0, sumU: 0, top: leaf.top };
+    b.filled += 1; b.events += leaf.events; b.sumU += leaf.u;
+    b.cand = Math.min(2 * KEEP(k), b.cand + (sl ? sl.heapUrl : 0) * 0.35 + 8);
+    if (leaf.events > 0) b.top = leaf.top;
+    if (sec === start + span - 1) {
+      const keep = KEEP(k);
+      S.nodes[k].set(start, { level: k, start, events: b.events, items: Math.round(Math.min(keep, b.cand)),
+        u: Math.round(b.sumU * 0.6), top: b.top });
+      S.builders[k] = null;
+    }
+  }
+  S.newest = sec;
+  const cutoff = sec + 1 - RET;
+  for (const lv of S.nodes) for (const [st, n] of lv) if (st + (1 << n.level) <= cutoff) lv.delete(st);
+  for (const st of S.leaves.keys()) if (st < cutoff) S.leaves.delete(st);
+  return leaf;
+}
+
+function step(record) {
+  S.cur += 1;
+  const R = targetRate();
+  if (S.run && S.run.scen === 'attack') S.dist = 'rnd';
+  else if (S.run) S.dist = S.run.dist;
+  else S.dist = 'lt';
+  const cap = CAPACITY * (S.level >= 2 ? (S.weight === 4 ? 3 : 1.8) : 1);
+  const tgt = R <= cap ? 0.55 * R / cap : Math.min(1, 0.55 + (R - cap) / cap * 1.5);
+  S.occ += (tgt - S.occ) * 0.35;
+  let acc = S.level >= 4 ? R * 0.15 : Math.min(R, cap * rnd(0.98, 1.02));
+  acc = Math.max(0, acc);
+  const rej = Math.max(0, R - acc);
+  S.ingested += acc;
+  // 写入：大部分落在当前秒，少量是迟到事件
+  const c = S.cur;
+  addEvents(c, Math.round(acc * 0.93));
+  addEvents(c - 1, Math.round(acc * 0.04));
+  addEvents(c - 2, Math.round(acc * 0.02));
+  addEvents(c - 3 - Math.floor(Math.random() * 56), Math.round(acc * 0.01));
+  for (let s = c + 1; s <= c + FUT; s++) slot(s);
+  // 内存与延迟
+  const slope = S.dist === 'rnd' ? 2.6 : S.dist === 'uni' ? 0.55 : 0.35;
+  let memT = 128 + (acc / 10000) * slope;
+  if (S.level >= 3) memT -= 12;
+  S.mem += (memT - S.mem) * 0.15 + rnd(-0.6, 0.6);
+  S.lag = 15 + 900 * Math.pow(S.occ, 3) + (Math.random() < 0.08 ? rnd(20, 60) : 0);
+  updateLevel();
+  // 定稿：整秒早于 watermark 的秒桶离开环
+  const leaves = [];
+  const oldest = c - WIN;
+  for (const s of [...S.slots.keys()].sort((a, b) => a - b)) {
+    if (s < oldest) leaves.push(finalize(s));
+  }
+  if (S.newest === null || S.newest < oldest - 1) {
+    for (let s = (S.newest === null ? oldest - 1 : S.newest + 1); s < oldest; s++) leaves.push(finalize(s));
+  }
+  // 延迟与查询
+  const o = S.occ, relief = S.level >= 1 ? 0.6 : 1;
+  const m = {
+    sec: c, sent: R, acc, rej, mem: S.mem, occ: S.occ, lag: S.lag, level: S.level, weight: S.weight,
+    p50: 2 + 3 * o * relief + rnd(0, .6),
+    p95: 6 + 28 * o * o * relief + rnd(0, 2),
+    p99: 12 + 62 * o * o * relief + rnd(0, 4) + (Math.random() < .1 ? rnd(5, 15) : 0),
+  };
+  // 运行进度
+  if (S.run) {
+    S.run.elapsed += 1;
+    if (S.run.elapsed >= S.run.dur) finishRun();
+  }
+  if (record) recordFrame(m);
+  return leaves;
+}
+
+function windowTopK(frameSec) {
+  let E = 0;
+  for (let s = frameSec - WIN; s < frameSec; s++) { const sl = S.slots.get(s); if (sl) E += sl.events; }
+  const d = S.dist;
+  // 同一套逻辑生成 url 与 user 两个维度的榜单：只是 key 的形式和热度分布不同
+  const makeRows = (key, p, space, rndKey, missKey) => {
+    const rows = [];
+    for (let r = 1; r <= 10; r++) {
+      if (d === 'rnd') rows.push({ k: rndKey(), c: 1, e: 0 });
+      else if (d === 'uni') { const c = Math.max(1, Math.round(E / space * rnd(1.6, 2.4))); rows.push({ k: key(r * 977), c, e: Math.max(1, Math.round(c * 0.3)) }); }
+      else { const c = Math.round(E * p(r) * rnd(0.985, 1.015)); rows.push({ k: key(r), c, e: Math.max(0, Math.round(c * 0.002 + rnd(0, 3))) }); }
+    }
+    // 模拟离线精确解：Count-Min 只会高估，真实值落在 [估计 − 误差, 估计] 内
+    for (const row of rows) { row.lo = Math.max(0, row.c - row.e); row.t = Math.round(row.lo + (row.c - row.lo) * Math.random()); }
+    rows.sort((a, b) => b.c - a.c || a.k.localeCompare(b.k));
+    const missing = d === 'uni' && Math.random() < 0.5 ? [{ k: missKey, t: rows[rows.length - 1].t + 1 }] : [];
+    return [rows, missing];
+  };
+  const [rows, missing] = makeRows(r => keyOf(r, frameSec), pz, KEYSPACE, () => '/r/x' + Math.floor(Math.random() * 9e6), keyOf(4321, frameSec));
+  const [rowsUser, missingUser] = makeRows(r => userOf(r, frameSec), pu, USERS, () => 'user_r' + Math.floor(Math.random() * 9e6), userOf(4321, frameSec));
+  const usersTrue = S.dist === 'rnd' ? E : USERS * (1 - Math.exp(-E / USERS));
+  const p95True = 10918 * rnd(0.997, 1.003);
+  return { rows, missing, rowsUser, missingUser, users: usersTrue * rnd(0.993, 1.007), usersTrue, p95: p95True * rnd(0.993, 1.007), p95True, E };
+}
+// 用户的活跃度也是长尾：少数重度用户（例如爬虫、轮询客户端）贡献大量请求
+const US = 0.9;
+let HU = 0; for (let r = 1; r <= USERS; r++) HU += Math.pow(r, -US);
+function pu(r) { return Math.pow(r, -US) / HU; }
+function userOf(rank, sec) { return 'user_' + String((rank * 104729 + Math.floor(sec / 120) * 17) % USERS).padStart(6, '0'); }
+let topBy = 'url';
+const rowsOf = tk => (topBy === 'user' ? tk.rowsUser : tk.rows);
+const missingOf = tk => (topBy === 'user' ? tk.missingUser : tk.missing) || [];
+
+function recordFrame(m) {
+  const slots = [];
+  for (let s = S.cur - WIN; s <= S.cur + FUT; s++) { const sl = S.slots.get(s); slots.push(sl ? { ...sl } : { sec: s, events: 0, heapUrl: 0, heapUser: 0, u: 0, top: [] }); }
+  const nodes = [];
+  for (const lv of S.nodes) for (const n of lv.values()) nodes.push(n);
+  const builders = S.builders.filter(Boolean).map(b => ({ ...b }));
+  const tk = windowTopK(S.cur);
+  const sse = S.run && S.run.scen === 'mixed' ? [4, 64] : [1, 2];
+  S.frames.push({ m, cur: S.cur, ringNext: S.cur - WIN, newest: S.newest, slots, nodes, builders, tk, sse, ingested: S.ingested });
+  // 回放时暂不丢旧帧（最多 15 分钟），避免正在看的那一帧被挤掉；回到实时后恢复为 5 分钟
+  const cap = S.replaying ? 900 : 300;
+  while (S.frames.length > cap) { S.frames.shift(); S.dropped = (S.dropped || 0) + 1; }
+}
+
+// 预热：先跑 700 个模拟秒，让线段树有完整的 10 分钟历史
+for (let i = 0; i < 700; i++) step(i >= 700 - 300);
+
+// ===================== 渲染：活跃环 =====================
+const NS = 'http://www.w3.org/2000/svg';
+const ringSvg = document.getElementById('ring');
+const CX = 180, CY = 180, RA = 112, RB = 156, STEP = 360 / RING;
+const pol = (r, a) => [CX + r * Math.cos(a * Math.PI / 180), CY + r * Math.sin(a * Math.PI / 180)];
+function sector(r0, r1, a0, a1) {
+  const [x0, y0] = pol(r1, a0), [x1, y1] = pol(r1, a1), [x2, y2] = pol(r0, a1), [x3, y3] = pol(r0, a0);
+  return `M${x0.toFixed(1)} ${y0.toFixed(1)}A${r1} ${r1} 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}L${x2.toFixed(1)} ${y2.toFixed(1)}A${r0} ${r0} 0 0 0 ${x3.toFixed(1)} ${y3.toFixed(1)}Z`;
+}
+const slotEls = [];
+(function buildRing() {
+  let html = `<circle cx="${CX}" cy="${CY}" r="100" style="fill:var(--write-soft)"/>`;
+  for (let i = 0; i < RING; i++) {
+    const a0 = -90 + i * STEP + 0.5, a1 = -90 + (i + 1) * STEP - 0.5;
+    html += `<path class="slot" data-i="${i}" d="${sector(RA, RB, a0, a1)}"/>`;
+  }
+  html += `<g id="pointer"><line x1="${CX}" y1="${CY - 100}" x2="${CX}" y2="${CY - RB - 8}" style="stroke:var(--ink);stroke-width:2"/><circle cx="${CX}" cy="${CY - RB - 8}" r="3.5" style="fill:var(--ink)"/></g>`;
+  html += `<text x="${CX}" y="${CY - 28}" text-anchor="middle">60 秒窗口事件</text>`;
+  html += `<text id="ringE" class="ink" x="${CX}" y="${CY + 2}" text-anchor="middle" style="font-size:24px;font-weight:600">0</text>`;
+  html += `<text id="ringNext" x="${CX}" y="${CY + 26}" text-anchor="middle"></text>`;
+  html += `<text id="ringHeap" x="${CX}" y="${CY + 44}" text-anchor="middle"></text>`;
+  ringSvg.innerHTML = html;
+  ringSvg.querySelectorAll('.slot').forEach(el => slotEls.push(el));
+})();
+let pointerAngle = null;
+function renderRing(f, q) {
+  const bySlot = new Map(f.slots.map(s => [((s.sec % RING) + RING) % RING, s]));
+  let maxE = 1, sumE = 0;
+  for (const s of f.slots) if (s.sec < f.cur) { maxE = Math.max(maxE, s.events); sumE += s.events; }
+  const qSet = q ? q.ringSecs : null;
+  for (let i = 0; i < RING; i++) {
+    const s = bySlot.get(i), el = slotEls[i];
+    el.removeAttribute('style'); el.style.strokeDasharray = ''; el.style.stroke = 'none';
+    if (!s) { el.style.fill = 'var(--faint)'; continue; }
+    if (s.sec > f.cur) { el.style.fill = 'none'; el.style.stroke = 'var(--write)'; el.style.strokeWidth = '1.2'; el.style.strokeDasharray = '3 2'; }
+    else if (s.sec === f.ringNext) { el.style.fill = 'var(--state)'; el.style.opacity = '.9'; }
+    else {
+      el.style.fill = 'var(--write)';
+      el.style.opacity = (0.18 + 0.82 * Math.sqrt(s.events / maxE)).toFixed(2);
+      if (s.sec === f.cur) { el.style.stroke = 'var(--ink)'; el.style.strokeWidth = '1.4'; }
+    }
+    if (qSet && qSet.has(s.sec)) { el.style.stroke = 'var(--read)'; el.style.strokeWidth = '2.2'; el.style.strokeDasharray = qSet.get(s.sec) < 1 ? '3 2' : ''; }
+  }
+  const target = -90 + (((f.cur % RING) + RING) % RING + 1) * STEP + 90; // 指针在当前秒之后的边界
+  if (pointerAngle === null) pointerAngle = target;
+  else { let d = ((target - pointerAngle) % 360 + 360) % 360; pointerAngle += d; }
+  const p = document.getElementById('pointer');
+  p.style.transformOrigin = `${CX}px ${CY}px`;
+  p.style.transform = `rotate(${pointerAngle}deg)`;
+  p.style.transition = matchMedia('(prefers-reduced-motion: reduce)').matches ? 'none' : 'transform .35s ease-out';
+  document.getElementById('ringE').textContent = fmt(sumE);
+  document.getElementById('ringNext').textContent = `待定稿：${hms(f.ringNext)}`;
+  const cs = f.slots.find(s => s.sec === f.cur - 1);
+  document.getElementById('ringHeap').textContent = cs ? `上一秒名单 ${cs.heapUrl} / ${HEAP}` : '';
+}
+
+// ===================== 渲染：线段树 =====================
+const treeSvg = document.getElementById('tree');
+let treeView = 'full', evLevel = 0;
+const ROW = 24, TOP = 26, LEFT = 56, TW = 1000 - LEFT - 10;
+function renderTree(f, q) {
+  if (f.newest === null) return;
+  const hi = f.newest + 1;
+  const lo = treeView === 'full' ? hi - RET : hi - 64;
+  const span = hi - lo;
+  const maxLv = treeView === 'full' ? LV : 6;
+  const H = TOP + (maxLv + 1) * ROW + 34;
+  treeSvg.setAttribute('viewBox', `0 0 1000 ${H}`);
+  const X = t => LEFT + (t - lo) / span * TW;
+  const Y = k => TOP + (maxLv - k) * ROW;
+  const sel = q ? q.nodeKeys : null, edges = q ? q.treeEdges : null;
+  let h = `<defs><clipPath id="clipT"><rect x="${LEFT}" y="0" width="${TW}" height="${H}"/></clipPath></defs>`;
+  for (let k = 0; k <= maxLv; k++) h += `<text x="${LEFT - 8}" y="${Y(k) + 14}" text-anchor="end">${k}</text>`;
+  h += `<text x="${LEFT - 8}" y="${TOP - 10}" text-anchor="end">层</text>`;
+  if (evLevel <= maxLv) h += `<rect x="${LEFT - 4}" y="${Y(evLevel) - 3}" width="${TW + 8}" height="${ROW}" rx="4" style="fill:var(--write-soft)"/>`;
+  h += `<g clip-path="url(#clipT)">`;
+  for (const n of f.nodes) {
+    if (n.level > maxLv) continue;
+    const s = n.start, e = s + (1 << n.level);
+    if (e <= lo || s >= hi) continue;
+    const x = X(s), w = Math.max(0.8, X(e) - X(s) - (span > 200 ? 0.3 : 1.5));
+    const key = n.level + ':' + s;
+    let style;
+    if (sel && sel.has(key)) style = 'fill:var(--read)';
+    else if (edges && n.level === 0 && edges.has(s)) style = 'fill:var(--read-soft);stroke:var(--read);stroke-width:1.2;stroke-dasharray:3 2';
+    else {
+      const keep = n.level === 0 ? LEAF_KEEP : KEEP(n.level);
+      const op = n.events === 0 ? 0.12 : (0.28 + 0.6 * Math.min(1, n.items / keep));
+      style = `fill:var(--state);opacity:${op.toFixed(2)}`;
+    }
+    h += `<rect data-n="${key}" x="${x.toFixed(2)}" y="${Y(n.level)}" width="${w.toFixed(2)}" height="${ROW - 6}" rx="${w > 6 ? 2 : 0}" style="${style}"/>`;
+  }
+  for (const b of f.builders) {
+    if (b.level > maxLv) continue;
+    const s = b.start, e = s + (1 << b.level);
+    const x = X(s), w = Math.max(1, X(e) - X(s) - 1.5), fill = Math.max(0, X(s + b.filled) - X(s) - 1);
+    h += `<rect data-b="${b.level}" x="${x.toFixed(2)}" y="${Y(b.level)}" width="${w.toFixed(2)}" height="${ROW - 6}" rx="2" style="fill:none;stroke:var(--state);stroke-width:1.2;stroke-dasharray:4 3"/>`;
+    h += `<rect x="${x.toFixed(2)}" y="${Y(b.level) + 3}" width="${fill.toFixed(2)}" height="${ROW - 12}" rx="1.5" style="fill:var(--state);opacity:.25;pointer-events:none"/>`;
+  }
+  h += `</g>`;
+  const ay = TOP + (maxLv + 1) * ROW + 4;
+  h += `<line x1="${LEFT}" y1="${ay}" x2="${LEFT + TW}" y2="${ay}" style="stroke:var(--line)"/>`;
+  const ticks = treeView === 'full' ? [[lo, '10 分钟前'], [lo + 300, '5 分钟前'], [hi, '最新定稿秒']] : [[lo, '64 秒前'], [lo + 32, '32 秒前'], [hi, '最新定稿秒']];
+  for (const [t, label] of ticks) {
+    const x = X(t);
+    h += `<line x1="${x}" y1="${ay}" x2="${x}" y2="${ay + 5}" style="stroke:var(--muted)"/>`;
+    h += `<text x="${x}" y="${ay + 20}" text-anchor="${t === lo ? 'start' : t === hi ? 'end' : 'middle'}">${label}</text>`;
+  }
+  treeSvg.innerHTML = h;
+}
+
+// ===================== 事件数折线图（与线段树共用横轴，颗粒度即线段树的层） =====================
+const evSvg = document.getElementById('evchart');
+let evState = null;
+const niceMax = v => { const p = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1)))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; };
+const axisFmt = v => v >= 1e4 ? (v / 1e4).toFixed(v >= 1e5 || v === 0 ? 0 : 1) + ' 万' : String(Math.round(v));
+function buildEvSeg() {
+  const maxLv = treeView === 'full' ? LV : 6;
+  if (evLevel > maxLv) evLevel = maxLv;
+  const seg = document.getElementById('evSeg');
+  seg.innerHTML = Array.from({ length: maxLv + 1 }, (_, k) =>
+    `<button data-k="${k}" aria-pressed="${k === evLevel}" title="线段树第 ${k} 层">${1 << k} 秒</button>`).join('');
+}
+function renderEvents(f, q) {
+  if (f.newest === null) return;
+  const hi = f.newest + 1, lo = treeView === 'full' ? hi - RET : hi - 64, span = hi - lo;
+  const k = evLevel, sp = 1 << k;
+  const X = t => LEFT + (t - lo) / span * TW;
+  const T0 = 12, B0 = 148, H0 = 180;
+  const segs = [];
+  for (const n of f.nodes) if (n.level === k && n.start + sp > lo && n.start < hi)
+    segs.push({ s: n.start, e: n.start + sp, rate: n.events / sp, total: n.events, done: true });
+  const b = f.builders.find(x => x.level === k);
+  if (b && b.filled > 0) segs.push({ s: b.start, e: b.start + b.filled, rate: b.events / b.filled, total: b.events, done: false, filled: b.filled });
+  segs.sort((a, c) => a.s - c.s);
+  let ymax = 1;
+  for (const g of segs) ymax = Math.max(ymax, g.rate);
+  ymax = niceMax(ymax * 1.08);
+  const Y = v => B0 - (B0 - T0) * v / ymax;
+  let h = `<defs><clipPath id="clipE"><rect x="${LEFT}" y="0" width="${TW}" height="${H0}"/></clipPath></defs>`;
+  for (let i = 0; i <= 2; i++) {
+    const v = ymax * i / 2, y = Y(v);
+    h += `<line x1="${LEFT}" y1="${y}" x2="${LEFT + TW}" y2="${y}" style="stroke:var(--faint)"/>`;
+    h += `<text x="${LEFT - 8}" y="${y + 4}" text-anchor="end">${axisFmt(v)}</text>`;
+  }
+  h += `<g clip-path="url(#clipE)">`;
+  if (q && !q.err) {
+    const a = Math.max(lo, q.fromS), c = Math.min(hi, q.toS);
+    if (c > a) h += `<rect x="${X(a)}" y="${T0 - 6}" width="${X(c) - X(a)}" height="${B0 - T0 + 6}" style="fill:var(--read-soft)"/>`;
+  }
+  let line = '', area = '', prevE = null, startX = null;
+  const closeArea = () => { if (startX !== null) area += `L${X(prevE).toFixed(2)} ${B0}L${startX.toFixed(2)} ${B0}Z`; };
+  for (const g of segs.filter(g => g.done)) {
+    const x0 = X(g.s), x1 = X(g.e), y = Y(g.rate).toFixed(2);
+    if (prevE === null || g.s !== prevE) { closeArea(); line += `M${x0.toFixed(2)} ${y}`; area += `M${x0.toFixed(2)} ${B0}L${x0.toFixed(2)} ${y}`; startX = x0; }
+    else { line += `L${x0.toFixed(2)} ${y}`; area += `L${x0.toFixed(2)} ${y}`; }
+    line += `L${x1.toFixed(2)} ${y}`; area += `L${x1.toFixed(2)} ${y}`;
+    prevE = g.e;
+  }
+  closeArea();
+  h += `<path d="${area}" style="fill:var(--write);opacity:.12"/>`;
+  h += `<path d="${line}" style="fill:none;stroke:var(--write);stroke-width:1.6;stroke-linejoin:round"/>`;
+  const pend = segs.find(g => !g.done);
+  if (pend) {
+    const y = Y(pend.rate).toFixed(2);
+    h += `<path d="M${X(pend.s).toFixed(2)} ${y}L${X(pend.e).toFixed(2)} ${y}" style="fill:none;stroke:var(--write);stroke-width:1.6;stroke-dasharray:4 3"/>`;
+  }
+  h += `<line id="evCross" x1="0" y1="${T0 - 6}" x2="0" y2="${B0}" style="stroke:var(--muted);stroke-dasharray:2 2;visibility:hidden"/>`;
+  h += `</g>`;
+  h += `<line x1="${LEFT}" y1="${B0}" x2="${LEFT + TW}" y2="${B0}" style="stroke:var(--line)"/>`;
+  const ticks = treeView === 'full' ? [[lo, '10 分钟前'], [lo + 300, '5 分钟前'], [hi, '最新定稿秒']] : [[lo, '64 秒前'], [lo + 32, '32 秒前'], [hi, '最新定稿秒']];
+  for (const [t, label] of ticks) {
+    const x = X(t);
+    h += `<line x1="${x}" y1="${B0}" x2="${x}" y2="${B0 + 5}" style="stroke:var(--muted)"/>`;
+    h += `<text x="${x}" y="${B0 + 20}" text-anchor="${t === lo ? 'start' : t === hi ? 'end' : 'middle'}">${label}</text>`;
+  }
+  evSvg.innerHTML = h;
+  evState = { lo, span, segs, k, sp };
+  document.getElementById('evNote').textContent =
+    `每一级台阶是线段树第 ${k} 层的一个节点（${sp} 秒），高度为这段时间的平均每秒事件数；虚线是构建中的节点，按已并入的秒数计算。`;
+}
+evSvg.addEventListener('mousemove', ev => {
+  if (!evState) return;
+  const r = evSvg.getBoundingClientRect(), xs = (ev.clientX - r.left) / r.width * 1000;
+  const cross = document.getElementById('evCross');
+  if (xs < LEFT || xs > LEFT + TW) { hideTip(); if (cross) cross.style.visibility = 'hidden'; return; }
+  const t = evState.lo + (xs - LEFT) / TW * evState.span;
+  const g = evState.segs.find(x => t >= x.s && t < x.e);
+  if (cross) { cross.setAttribute('x1', xs); cross.setAttribute('x2', xs); cross.style.visibility = 'visible'; }
+  if (!g) return hideTip();
+  const head = `<b>第 ${evState.k} 层${evState.k === 0 ? '（叶子）' : ''}</b>：${hms(g.s)} 起 ${evState.sp} 秒`;
+  showTip(ev, g.done
+    ? `${head}<br>事件 ${fmt(g.total)}<br>平均每秒 ${fmt(g.rate)}`
+    : `${head}（构建中）<br>已并入 ${g.filled} / ${evState.sp} 秒<br>事件 ${fmt(g.total)}，平均每秒 ${fmt(g.rate)}`);
+});
+evSvg.addEventListener('mouseleave', () => { hideTip(); const c = document.getElementById('evCross'); if (c) c.style.visibility = 'hidden'; });
+document.getElementById('evSeg').addEventListener('click', ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  evLevel = +b.dataset.k;
+  buildEvSeg(); draw();
+});
+buildEvSeg();
+
+// ===================== 查询覆盖 =====================
+let query = null;
+function computeQuery(f) {
+  if (!query) return null;
+  const nowMs = f.cur * 1000 + 500;
+  const at = Math.round(nowMs - query.atAgo * 1000), from = Math.round(at - query.win * 1000);
+  if (query.atAgo < 0) return { err: 'at 不能晚于当前时间' };
+  if (from < (f.cur - RET - WIN) * 1000) return { err: '区间起点早于保留期（约 660 秒前），会返回 422' };
+  // 拆成整秒与边缘秒（与 timewin.split_range 相同）
+  let start, stop, edgeList = [];
+  if (Math.floor(from / 1000) === Math.floor((at - 1) / 1000) && (from % 1000 || at % 1000)) {
+    start = stop = Math.floor(from / 1000); edgeList.push([start, (at - from) / 1000]);
+  } else {
+    start = Math.ceil(from / 1000); stop = Math.floor(at / 1000);
+    if (start * 1000 - from > 0) edgeList.push([start - 1, (start * 1000 - from) / 1000]);
+    if (at - stop * 1000 > 0) edgeList.push([stop, (at - stop * 1000) / 1000]);
+  }
+  const ringSecs = new Map(), nodeKeys = new Set(), treeEdges = new Map();
+  const ringNext = f.ringNext;
+  let ringCount = 0, nodeCount = 0;
+  for (let s = Math.max(start, ringNext); s < stop; s++) { ringSecs.set(s, 1); ringCount++; }
+  const nodeMap = new Map(f.nodes.map(n => [n.level + ':' + n.start, n]));
+  let cur = start;
+  const end = Math.min(stop, ringNext);
+  while (cur < end) {
+    let picked = null;
+    for (let k = LV; k >= 0; k--) {
+      const sp = 1 << k;
+      if (cur % sp || cur + sp > end) continue;
+      if (nodeMap.has(k + ':' + cur)) { picked = k; break; }
+    }
+    if (picked === null) { cur++; continue; }
+    nodeKeys.add(picked + ':' + cur); nodeCount++; cur += 1 << picked;
+  }
+  const fr = [];
+  for (const [s, fr0] of edgeList) {
+    fr.push(fr0.toFixed(1));
+    if (s >= ringNext) ringSecs.set(s, fr0); else treeEdges.set(s, fr0);
+  }
+  return { ringSecs, nodeKeys, treeEdges, ringCount, nodeCount, edges: fr, fromS: from / 1000, toS: at / 1000, atMs: at };
+}
+function renderQuery(q) {
+  const el = document.getElementById('qResult');
+  if (!query) { el.innerHTML = '输入一个查询区间，看它如何被拆成环内秒桶、线段树节点和两端的边缘秒。'; return; }
+  if (q.err) { el.innerHTML = `<span class="err">${q.err}</span>`; return; }
+  const head = `查询区间 [${(query.atAgo + query.win).toFixed(1)} 秒前, ${query.atAgo.toFixed(1)} 秒前)，对应 <code>GET /v1/topk?window=${query.win}s&amp;at=${q.atMs}</code>。`;
+  el.innerHTML = head + `拆成 <b>${q.nodeCount}</b> 个线段树节点、<b>${q.ringCount}</b> 个环内秒桶` +
+    (q.edges.length ? `，以及 <b>${q.edges.length}</b> 个边缘秒（f = ${q.edges.join('、')}）` : '') + '。';
+}
+
+// ===================== 渲染：图表与面板 =====================
+function sizeCanvas(c) {
+  const dpr = window.devicePixelRatio || 1, r = c.getBoundingClientRect();
+  if (c.width !== Math.round(r.width * dpr) || c.height !== Math.round(r.height * dpr)) {
+    c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr);
+  }
+  const ctx = c.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, r.width, r.height];
+}
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function lineChart(id, frames, series, opt) {
+  const c = document.getElementById(id); const [ctx, W, Hh] = sizeCanvas(c);
+  ctx.clearRect(0, 0, W, Hh);
+  const pad = { l: 40, r: 6, t: 8, b: 16 };
+  const n = 120, data = frames.slice(-n);
+  let ymax = opt.min || 1, ymin = 0;
+  for (const f of data) for (const s of series) ymax = Math.max(ymax, s.get(f));
+  if (opt.band) for (const f of data) ymax = Math.max(ymax, opt.band.hi(f));
+  if (opt.limit) ymax = Math.max(ymax, opt.limit * 1.08);
+  if (opt.zoom) {
+    // 纵轴缩放到数据附近：1% 以内的误差从 0 开始画根本看不出来
+    let lo = Infinity, hi = -Infinity;
+    for (const f of data) {
+      for (const s of series) { lo = Math.min(lo, s.get(f)); hi = Math.max(hi, s.get(f)); }
+      if (opt.band) { lo = Math.min(lo, opt.band.lo(f)); hi = Math.max(hi, opt.band.hi(f)); }
+    }
+    const padv = Math.max((hi - lo) * 0.15, Math.abs(hi) * 0.004, 1);
+    ymin = lo - padv; ymax = hi + padv;
+    if (lo >= 0) ymin = Math.max(0, ymin);  // 计数不会是负数
+  } else ymax *= 1.08;
+  const X = i => pad.l + (W - pad.l - pad.r) * (i + n - data.length) / (n - 1);
+  const Y = v => pad.t + (Hh - pad.t - pad.b) * (1 - (v - ymin) / (ymax - ymin));
+  ctx.strokeStyle = css('--faint'); ctx.lineWidth = 1; ctx.fillStyle = css('--muted'); ctx.font = '11px system-ui, sans-serif';
+  const grids = opt.zoom ? 2 : 3;
+  for (let g = 0; g <= grids; g++) {
+    const v = ymin + (ymax - ymin) * g / grids, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillText(opt.fmt(v), 2, y + 4);
+  }
+  if (opt.band && data.length) {
+    ctx.fillStyle = css(opt.band.color); ctx.globalAlpha = 0.2; ctx.beginPath();
+    data.forEach((f, i) => { const x = X(i), y = Y(opt.band.hi(f)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    for (let i = data.length - 1; i >= 0; i--) ctx.lineTo(X(i), Y(opt.band.lo(data[i])));
+    ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+  }
+  if (opt.limit) {
+    ctx.strokeStyle = css('--danger'); ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.moveTo(pad.l, Y(opt.limit)); ctx.lineTo(W - pad.r, Y(opt.limit)); ctx.stroke(); ctx.setLineDash([]);
+  }
+  for (const s of series) {
+    ctx.strokeStyle = css(s.color); ctx.lineWidth = s.w || 1.6; ctx.beginPath();
+    data.forEach((f, i) => { const x = X(i), y = Y(s.get(f)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke();
+  }
+  ctx.fillStyle = css('--muted');
+  if (!opt.noCaption) ctx.fillText('最近 2 分钟', W - pad.r - 64, Hh - 2);
+}
+
+// ===================== 回放：估计与真实对比 =====================
+const pct = v => (v >= 0 ? '+' : '−') + Math.abs(v * 100).toFixed(2) + '%';
+function renderCompare(frames) {
+  const f = frames[frames.length - 1], tk = f.tk;
+  const rows = rowsOf(tk).map(r => ({ ...r })), missing = missingOf(tk);
+  document.getElementById('cmpTopTitle').textContent = `此刻的 Top-10（最近 60 秒，按${topBy === 'user' ? '用户' : ' URL'}）`;
+  const all = rows.concat(missing.map(m => ({ k: m.k, t: m.t, miss: true })));
+  const maxV = Math.max(1, ...all.map(r => Math.max(r.c || 0, r.t)));
+  const RH = 26, KX = 0, BX = 230, BW = 330, EX = 640;
+  const X = v => BX + v / maxV * BW;
+  let h = '';
+  all.forEach((r, i) => {
+    const y = 8 + i * RH, cy = y + 9;
+    h += `<text x="${KX}" y="${cy + 4}" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px" class="ink">${i + 1}. ${r.k}</text>`;
+    h += `<rect x="${BX}" y="${cy - 7}" width="${BW}" height="14" rx="2" style="fill:var(--faint)"/>`;
+    if (!r.miss) {
+      h += `<rect x="${BX}" y="${cy - 5}" width="${(X(r.c) - BX).toFixed(1)}" height="10" rx="2" style="fill:var(--write);opacity:.35"/>`;
+      h += `<rect x="${X(r.lo).toFixed(1)}" y="${cy - 5}" width="${Math.max(2, X(r.c) - X(r.lo)).toFixed(1)}" height="10" rx="1" style="fill:var(--write)"/>`;
+    }
+    h += `<rect x="${(X(r.t) - 1.5).toFixed(1)}" y="${cy - 9}" width="3" height="18" rx="1" style="fill:var(--read)"/>`;
+    const label = r.miss ? '漏报' : r.t ? pct((r.c - r.t) / r.t) : '—';
+    h += `<text x="${EX}" y="${cy + 4}" text-anchor="end" style="${r.miss ? 'fill:var(--danger);font-weight:600' : ''}">${label}</text>`;
+  });
+  const H = 8 + all.length * RH + 6;
+  const svg = document.getElementById('cmpTop');
+  svg.setAttribute('viewBox', `0 0 640 ${H}`);
+  svg.innerHTML = h;
+  // 此刻的四项指标
+  const exact = all.slice().sort((a, b) => b.t - a.t).slice(0, 10), tenth = exact[exact.length - 1].t;
+  const hits = rows.filter(r => r.t >= tenth).length;
+  const errs = rows.filter(r => r.t > 0).map(r => Math.abs(r.c - r.t) / r.t).sort((a, b) => a - b);
+  const med = errs.length ? errs[Math.floor(errs.length / 2)] : 0;
+  const ue = (tk.users - tk.usersTrue) / Math.max(1, tk.usersTrue), pe = (tk.p95 - tk.p95True) / tk.p95True;
+  document.getElementById('cmpKpis').innerHTML =
+    `<div class="kpi"><b>${Math.min(10, hits)} / 10</b>Top-10 召回</div>` +
+    `<div class="kpi"><b>${(med * 100).toFixed(2)}%</b>计数误差中位数</div>` +
+    `<div class="kpi"><b>${pct(ue)}</b>去重用户数</div>` +
+    `<div class="kpi"><b>${pct(pe)}</b>p95</div>`;
+  const short = v => v >= 1e5 ? (v / 1e4).toFixed(1) + '万' : Math.round(v).toLocaleString('zh-CN');
+  lineChart('cTop1', frames, [{ get: f => rowsOf(f.tk)[0].c, color: '--write', w: 1.6 }, { get: f => rowsOf(f.tk)[0].t, color: '--read', w: 1.6 }],
+    { fmt: short, zoom: true, noCaption: true, band: { lo: f => rowsOf(f.tk)[0].lo, hi: f => rowsOf(f.tk)[0].c, color: '--write' } });
+  lineChart('cUsers', frames, [{ get: f => f.tk.users, color: '--write', w: 1.6 }, { get: f => f.tk.usersTrue, color: '--read', w: 1.6 }],
+    { fmt: short, zoom: true, noCaption: true });
+  lineChart('cP95', frames, [{ get: f => f.tk.p95, color: '--write', w: 1.6 }, { get: f => f.tk.p95True, color: '--read', w: 1.6 }],
+    { fmt: short, zoom: true, noCaption: true });
+}
+const fmt = v => v >= 1e6 ? (v / 1e6).toFixed(1) + ' 百万' : v >= 1e4 ? (v / 1e4).toFixed(1) + ' 万' : Math.round(v).toLocaleString('zh-CN');
+const hms = s => { const d = new Date(s * 1000); return d.toTimeString().slice(0, 8); };
+
+function renderPanels(frames) {
+  const f = frames[frames.length - 1], m = f.m;
+  document.getElementById('clock').textContent = hms(f.cur);
+  document.getElementById('kSent').textContent = fmt(m.sent);
+  document.getElementById('kAcc').textContent = fmt(m.acc);
+  document.getElementById('kRej').textContent = fmt(m.rej);
+  document.getElementById('kP50').textContent = m.p50.toFixed(1);
+  document.getElementById('kP95').textContent = m.p95.toFixed(1);
+  document.getElementById('kP99').textContent = m.p99.toFixed(1);
+  document.getElementById('kMem').textContent = m.mem.toFixed(0);
+  document.getElementById('kOcc').textContent = Math.round(m.occ * 100) + '%';
+  document.getElementById('kLag').textContent = Math.round(m.lag);
+  lineChart('cThroughput', frames, [
+    { get: f => f.m.sent, color: '--muted', w: 1.2 }, { get: f => f.m.acc, color: '--write', w: 2 }, { get: f => f.m.rej, color: '--danger' },
+  ], { fmt: v => v >= 1e4 ? (v / 1e4).toFixed(0) + '万' : Math.round(v), min: 50000 });
+  lineChart('cLatency', frames, [
+    { get: f => f.m.p50, color: '--write' }, { get: f => f.m.p95, color: '--state' }, { get: f => f.m.p99, color: '--read', w: 2 },
+  ], { fmt: v => v.toFixed(0), limit: 50, min: 20 });
+  lineChart('cMemory', frames, [{ get: f => f.m.mem, color: '--state', w: 2 }], { fmt: v => v.toFixed(0), limit: MEM_LIMIT, min: 100 });
+  const lv = document.getElementById('levels').children;
+  for (let i = 0; i < 5; i++) lv[i].classList.toggle('on', i === m.level);
+  document.getElementById('levelDesc').textContent = LEVEL_DESC[m.level] + (m.weight > 1 ? `（采样率 1/${m.weight}）` : '');
+  // 热点（按当前选中的维度：URL 或用户）
+  const tk = f.tk, rows = rowsOf(tk), maxC = Math.max(1, ...rows.map(r => r.c));
+  document.getElementById('topkBody').innerHTML = rows.map((r, i) =>
+    `<tr><td>${i + 1}</td><td class="key">${r.k}</td><td class="num">${fmt(r.c)}</td><td class="num">±${fmt(r.e)}</td><td><div class="bar"><i style="width:${(r.c / maxC * 100).toFixed(1)}%"></i></div></td></tr>`).join('');
+  const byName = topBy === 'user' ? '用户' : ' URL';
+  document.getElementById('thKey').textContent = topBy === 'user' ? '用户' : 'URL';
+  document.getElementById('topkHint').textContent = `通过 SSE 订阅（by=${topBy}）：最近 60 秒，按${byName}，前 10 名。` +
+    (m.level >= 2 ? `当前处于 ${m.level} 级降级，结果按 1/${m.weight} 采样估算。` : '');
+  document.getElementById('kUsers').textContent = fmt(tk.users);
+  document.getElementById('kP95b').textContent = Math.round(tk.p95).toLocaleString('zh-CN');
+  document.getElementById('kSse').textContent = `${f.sse[0]} / ${f.sse[1]}`;
+  document.getElementById('kIngested').textContent = fmt(f.ingested);
+}
+
+function renderAll(frames) {
+  const f = frames[frames.length - 1];
+  const q = computeQuery(f);
+  renderRing(f, q && !q.err ? q : null);
+  renderTree(f, q && !q.err ? q : null);
+  renderEvents(f, q && !q.err ? q : null);
+  renderQuery(q);
+  renderPanels(frames);
+  if (mode === 'replay') renderCompare(frames);
+}
+
+// ===================== 定稿动画：最旧的秒桶飞进线段树 =====================
+function flyLeaf(sec) {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches || mode !== 'live') return;
+  const i = ((sec % RING) + RING) % RING, el = slotEls[i];
+  const target = treeSvg.querySelector(`rect[data-n="0:${sec}"]`);
+  if (!el || !target) return;
+  const a = el.getBoundingClientRect(), b = target.getBoundingClientRect();
+  const dot = document.createElement('div'); dot.className = 'fly';
+  dot.style.left = (a.left + a.width / 2 - 5) + 'px'; dot.style.top = (a.top + a.height / 2 - 5) + 'px';
+  document.body.appendChild(dot);
+  requestAnimationFrame(() => {
+    dot.style.transform = `translate(${b.left + b.width / 2 - a.left - a.width / 2}px, ${b.top + b.height / 2 - a.top - a.height / 2}px) scale(.6)`;
+    dot.style.opacity = '.2';
+  });
+  setTimeout(() => dot.remove(), 800);
+}
+
+// ===================== 悬停提示 =====================
+const tip = document.getElementById('tip');
+function showTip(ev, html) {
+  tip.innerHTML = html; tip.classList.add('show');
+  const x = Math.min(ev.clientX + 14, innerWidth - tip.offsetWidth - 8), y = Math.min(ev.clientY + 14, innerHeight - tip.offsetHeight - 8);
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+const hideTip = () => tip.classList.remove('show');
+const topList = t => (t && t.length ? t.map(x => `<div class="k">${x.k}　${fmt(x.c)}</div>`).join('') : '<div>没有数据</div>');
+ringSvg.addEventListener('mousemove', ev => {
+  const el = ev.target.closest('.slot'); if (!el) return hideTip();
+  const f = viewFrame(), i = +el.dataset.i;
+  const s = f.slots.find(x => ((x.sec % RING) + RING) % RING === i);
+  if (!s) return hideTip();
+  const state = s.sec > f.cur ? '未来容差' : s.sec === f.cur ? '当前秒' : s.sec === f.ringNext ? '即将定稿' : `${f.cur - s.sec} 秒前`;
+  showTip(ev, `<b>${hms(s.sec)}</b>（${state}）<br>事件 ${fmt(s.events)}<br>名单 url ${s.heapUrl} / ${HEAP}，user ${s.heapUser} / ${HEAP}<br>缺席上界 u = ${s.u}${topList(s.top)}`);
+});
+ringSvg.addEventListener('mouseleave', hideTip);
+treeSvg.addEventListener('mousemove', ev => {
+  const f = viewFrame(); const r = ev.target;
+  if (r.dataset && r.dataset.n) {
+    const [k, st] = r.dataset.n.split(':').map(Number);
+    const n = f.nodes.find(x => x.level === k && x.start === st); if (!n) return hideTip();
+    const span = 1 << k, keep = k === 0 ? LEAF_KEEP : KEEP(k);
+    showTip(ev, `<b>第 ${k} 层${k === 0 ? '（叶子）' : ''}</b>：${hms(st)} 起 ${span} 秒<br>事件 ${fmt(n.events)}<br>名单 ${n.items} / ${keep}，缺席上界 u = ${n.u}${topList(n.top)}`);
+  } else if (r.dataset && r.dataset.b) {
+    const b = f.builders.find(x => x.level === +r.dataset.b); if (!b) return hideTip();
+    showTip(ev, `<b>第 ${b.level} 层构建中</b>：${hms(b.start)} 起 ${1 << b.level} 秒<br>已并入 ${b.filled} / ${1 << b.level} 秒<br>候选 ${Math.round(b.cand)} / ${2 * KEEP(b.level)}，完成时只截断一次`);
+  } else hideTip();
+});
+treeSvg.addEventListener('mouseleave', hideTip);
+
+// ===================== 控制 =====================
+let mode = 'live', speed = 1, timer = null, replayIdx = 0;
+const viewFrame = () => mode === 'live' ? S.frames[S.frames.length - 1] : S.frames[replayIdx];
+const $ = id => document.getElementById(id);
+function syncCtl() {
+  $('rateOut').textContent = fmt(+$('rate').value) + ' /秒';
+  $('scenDesc').textContent = SCEN[$('scenario').value];
+  $('dist').disabled = $('scenario').value === 'attack' || !!S.run;
+}
+['rate', 'scenario'].forEach(id => $(id).addEventListener('input', syncCtl));
+$('startBtn').addEventListener('click', () => {
+  S.run = { scen: $('scenario').value, rate: +$('rate').value, dur: Math.max(10, +$('dur').value || 90), dist: $('dist').value, elapsed: 0 };
+  S.accuracy = null; $('accBox').innerHTML = '<div class="empty">运行中……</div>';
+  if (S.run.scen !== 'accuracy') $('accBox').innerHTML = '<div class="empty">运行"精度实验"场景，结束后在这里显示召回率与误差。</div>';
+  $('startBtn').disabled = true; $('stopBtn').disabled = false;
+  ['scenario', 'rate', 'conc', 'dur', 'dist', 'gzip'].forEach(id => $(id).disabled = true);
+  updateRunStatus();
+});
+$('stopBtn').addEventListener('click', () => finishRun(true));
+function finishRun(stopped) {
+  if (!S.run) return;
+  const r = S.run; S.run = null;
+  if (r.scen === 'accuracy' && !stopped) {
+    const d = r.dist;
+    const rows = d === 'lt' ? [['Top-10 召回（并列不算错）', '10 / 10'], ['计数相对误差（中位数）', '0.3%'], ['去重用户数相对误差', '0.7%'], ['p95 相对误差', '0.6%']]
+      : d === 'uni' ? [['Top-10 召回（并列不算错）', '9 / 10'], ['计数相对误差（中位数）', '4.8%'], ['去重用户数相对误差', '0.8%'], ['p95 相对误差', '0.7%']]
+      : [['Top-10 召回（并列不算错）', '10 / 10（全部并列）'], ['计数相对误差（中位数）', '0%'], ['去重用户数相对误差', '0.6%'], ['p95 相对误差', '0.5%']];
+    $('accBox').innerHTML = `<table class="acc">${rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table><p class="hint" style="margin-top:8px">数值为原型示意，正式版由离线精确解计算。</p>`;
+  }
+  $('startBtn').disabled = false; $('stopBtn').disabled = true;
+  ['scenario', 'rate', 'conc', 'dur', 'gzip'].forEach(id => $(id).disabled = false);
+  syncCtl();
+  $('prog').style.width = '0%';
+  $('runStatus').textContent = stopped ? '已停止：回到背景流量' : '已完成：回到背景流量';
+}
+function updateRunStatus() {
+  if (!S.run) return;
+  const r = S.run;
+  $('prog').style.width = (r.elapsed / r.dur * 100).toFixed(1) + '%';
+  const name = $('scenario').querySelector(`option[value="${r.scen}"]`).textContent;
+  $('runStatus').textContent = `${name}：${r.elapsed} / ${r.dur} 秒，${$('conc').value} 个连接`;
+}
+$('speedSeg').addEventListener('click', ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  speed = +b.dataset.speed;
+  [...$('speedSeg').children].forEach(x => x.setAttribute('aria-pressed', x === b));
+  restart();
+  if (playing) setPlaying(true);
+});
+$('treeSeg').addEventListener('click', ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  treeView = b.dataset.view;
+  [...$('treeSeg').children].forEach(x => x.setAttribute('aria-pressed', x === b));
+  buildEvSeg();
+  draw();
+});
+$('qBtn').addEventListener('click', () => {
+  const atAgo = parseFloat($('qAt').value), win = Number($('qWin').value);
+  if (!(Number.isInteger(win) && win >= 1 && win <= 600)) { query = null; $('qResult').innerHTML = '<span class="err">window 是整数秒，范围 1～600（与接口参数一致）</span>'; return; }
+  query = { atAgo: isFinite(atAgo) ? atAgo : 0, win };
+  draw();
+});
+$('qClear').addEventListener('click', () => { query = null; draw(); });
+$('bySeg').addEventListener('click', ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  topBy = b.dataset.by;
+  [...$('bySeg').children].forEach(x => x.setAttribute('aria-pressed', x === b));
+  draw();
+});
+// 回放播放：按“模拟速度”逐帧前进，到最新一帧自动暂停
+let playing = false, playTimer = null;
+function setPlaying(p) {
+  playing = p;
+  const b = $('playBtn');
+  b.textContent = p ? '暂停' : '播放';
+  b.setAttribute('aria-pressed', p);
+  clearInterval(playTimer); playTimer = null;
+  if (!p) return;
+  if (replayIdx >= S.frames.length - 1) replayIdx = 0;  // 在末尾按播放：从头开始
+  $('replaySlider').value = replayIdx; draw();
+  playTimer = setInterval(() => {
+    if (replayIdx >= S.frames.length - 1) { setPlaying(false); return; }
+    replayIdx += 1;
+    $('replaySlider').value = replayIdx;
+    draw();
+  }, 1000 / speed);
+}
+function setMode(m) {
+  mode = m;
+  S.replaying = m === 'replay';
+  if (m !== 'replay') setPlaying(false);
+  $('modeLive').setAttribute('aria-pressed', m === 'live'); $('modeReplay').setAttribute('aria-pressed', m === 'replay');
+  $('replayBar').classList.toggle('on', m === 'replay');
+  $('cmpPanel').hidden = m !== 'replay';
+  if (m === 'replay') {
+    const sl = $('replaySlider'); sl.max = S.frames.length - 1; sl.value = sl.max; replayIdx = +sl.value;
+    $('replayLen').textContent = S.frames.length;
+  }
+  draw();
+}
+$('modeLive').addEventListener('click', () => setMode('live'));
+$('modeReplay').addEventListener('click', () => setMode('replay'));
+$('replaySlider').addEventListener('input', ev => { replayIdx = +ev.target.value; draw(); });
+$('playBtn').addEventListener('click', () => setPlaying(!playing));
+
+function draw() {
+  const frames = mode === 'live' ? S.frames : S.frames.slice(0, replayIdx + 1);
+  renderAll(frames);
+  if (mode === 'replay') {
+    const fc = frames[frames.length - 1].cur, ago = S.cur - fc;
+    $('replayAt').textContent = hms(fc) + (ago > 0 ? `（${ago} 秒前）` : '（最新）');
+  }
+}
+function tick() {
+  let leaves = [];
+  const dropped0 = S.dropped || 0;
+  for (let i = 0; i < speed; i++) leaves = step(true);
+  updateRunStatus();
+  if (mode === 'live') draw();
+  else {
+    // 回放缓存满了会丢掉最旧的帧，下标要跟着前移，保证正在看的还是同一秒
+    const shift = (S.dropped || 0) - dropped0;
+    if (shift) replayIdx = Math.max(0, replayIdx - shift);
+    $('replaySlider').max = S.frames.length - 1; $('replaySlider').value = replayIdx;
+    $('replayLen').textContent = S.frames.length;
+    const fc = S.frames[replayIdx].cur, ago = S.cur - fc;
+    $('replayAt').textContent = hms(fc) + (ago > 0 ? `（${ago} 秒前）` : '（最新）');
+  }
+  if (speed === 1) leaves.forEach(l => flyLeaf(l.sec));
+}
+function restart() { clearInterval(timer); timer = setInterval(tick, 1000); }
+addEventListener('resize', draw);
+syncCtl(); draw(); restart();
+})();
+</script>
+</body>
+</html>
