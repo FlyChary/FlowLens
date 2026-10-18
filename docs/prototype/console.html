@@ -105,11 +105,12 @@ svg .ink { fill: var(--ink); }
 .slot { cursor: default; }
 
 .query { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
-.query .field { margin: 0; width: 150px; }
+.query .field { margin: 0; width: 190px; }
 .query .btn { flex: 0 0 auto; }
 .query .result { flex: 1 1 260px; font-size: 13px; color: var(--muted); min-height: 1.5em; }
 .query .result b { color: var(--read); }
 .query .result .err { color: var(--danger); }
+.query .result code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--faint); color: var(--ink); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
 
 /* 指标面板 */
 .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
@@ -288,12 +289,12 @@ svg .ink { fill: var(--ink); }
       </div>
       <div class="query">
         <div class="field">
-          <label for="qAt">at：距现在（秒）</label>
+          <label for="qAt">结束时刻 at（几秒前）</label>
           <input type="number" id="qAt" min="0" max="600" step="0.1" value="3.4">
         </div>
         <div class="field">
-          <label for="qWin">window（秒）</label>
-          <input type="number" id="qWin" min="1" max="600" step="0.1" value="150.6">
+          <label for="qWin">区间长度 window（整秒）</label>
+          <input type="number" id="qWin" min="1" max="600" step="1" value="150">
         </div>
         <button class="btn" id="qBtn">高亮这个查询</button>
         <button class="btn" id="qClear">清除</button>
@@ -847,13 +848,14 @@ function computeQuery(f) {
     fr.push(fr0.toFixed(1));
     if (s >= ringNext) ringSecs.set(s, fr0); else treeEdges.set(s, fr0);
   }
-  return { ringSecs, nodeKeys, treeEdges, ringCount, nodeCount, edges: fr, fromS: from / 1000, toS: at / 1000 };
+  return { ringSecs, nodeKeys, treeEdges, ringCount, nodeCount, edges: fr, fromS: from / 1000, toS: at / 1000, atMs: at };
 }
 function renderQuery(q) {
   const el = document.getElementById('qResult');
   if (!query) { el.innerHTML = '输入一个查询区间，看它如何被拆成环内秒桶、线段树节点和两端的边缘秒。'; return; }
   if (q.err) { el.innerHTML = `<span class="err">${q.err}</span>`; return; }
-  el.innerHTML = `拆成 <b>${q.nodeCount}</b> 个线段树节点、<b>${q.ringCount}</b> 个环内秒桶` +
+  const head = `查询区间 [${(query.atAgo + query.win).toFixed(1)} 秒前, ${query.atAgo.toFixed(1)} 秒前)，对应 <code>GET /v1/topk?window=${query.win}s&amp;at=${q.atMs}</code>。`;
+  el.innerHTML = head + `拆成 <b>${q.nodeCount}</b> 个线段树节点、<b>${q.ringCount}</b> 个环内秒桶` +
     (q.edges.length ? `，以及 <b>${q.edges.length}</b> 个边缘秒（f = ${q.edges.join('、')}）` : '') + '。';
 }
 
@@ -1117,8 +1119,8 @@ $('treeSeg').addEventListener('click', ev => {
   draw();
 });
 $('qBtn').addEventListener('click', () => {
-  const atAgo = parseFloat($('qAt').value), win = parseFloat($('qWin').value);
-  if (!(win >= 1 && win <= 600)) { query = null; $('qResult').innerHTML = '<span class="err">window 需要在 1～600 秒之间</span>'; return; }
+  const atAgo = parseFloat($('qAt').value), win = Number($('qWin').value);
+  if (!(Number.isInteger(win) && win >= 1 && win <= 600)) { query = null; $('qResult').innerHTML = '<span class="err">window 是整数秒，范围 1～600（与接口参数一致）</span>'; return; }
   query = { atAgo: isFinite(atAgo) ? atAgo : 0, win };
   draw();
 });
