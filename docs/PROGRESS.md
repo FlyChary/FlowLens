@@ -25,6 +25,62 @@
 
 ## 进行中
 
+T11a 进行中（按 docs/instructions/T11a.md）。**上下文快满，先停下**，修 bug 与重跑留待下一会话。
+
+### 已完成
+
+1. **剖析脚本 `tools/profile_server.py`**（serve + run 两种模式）与测试 `tests/test_profile_server.py`（9 条，全过；全量 `pytest -q` 298 passed）。脚本按任务要求改为**单次固定速率测量**：20 万/秒、每批 5000、不 gzip、预热 30 s + 测量 30 s。机制：容器内起真实服务（`memory_reader` 传假读数 50 MB/256 MB，永不因内存降级）；写入路径与 tick 的函数做包装计时（替换模块属性/类方法，wall 与 CPU 双口径）；`gc.callbacks` 记回收代数/耗时/对象数；每 100 ms 小任务测事件循环延迟；每秒读真实工作集、超 220 MB 提前结束。开发中发现并修掉的关键 bug：
+   - **GC 回调恒空**：`gc.START`/`gc.FINISH` 在 CPython（3.11/3.12）里根本不存在，回调阶段是字符串 `'start'`/`'stop'`，原比较抛 AttributeError 被 gc 静默吞掉。已改字符串判断并有测试锁定。
+   - **异步阶段 CPU 双重计数**：`read_body`、`refresh_snapshot_async` 是 async，`process_time` 差值会把"协程挂起期间事件循环干的其他活"算进来（实测顶层阶段之和 = 进程 CPU 的 184%）。修正：异步 IO 阶段（`read_body`）CPU 归因按 0、只报 wall，排除出"顶层阶段 CPU 之和"；快照改包**同步**的 `_dim_tops` + `_snapshot_stats`。修正后校验通过（见下）。
+   - **窗口事件数**：每条事件的 CPU 时间改用测量窗口内接受数（预热期也写入，用累计值会稀释）。
+2. **正式跑过一次**（WSL docker，服务 0 号核、256 MB、loadgen 压 1-6 核）：结果在 `results/T11a/`（本次从 WSL `/tmp/flowlens_t11a/` 全量复制，含早期四组数据 `g1`~`g4`、短验证 `shortval`、本次 `run_200k.json`）。
+
+### 单次 20 万/秒 测量结果（`results/T11a/run_200k.json`）
+
+**参数**：20 万/秒、每批 5000、不 gzip、预热 30 s + 测量 30 s；假内存读数（不降级）。
+
+**两个总前提**：
+- **20 万/秒超出单核能力，没喂满**：服务核 CPU ~85%，实际接受速率远低于 20 万/秒（见窗口 bug 说明）。按每条 ~10.7 μs CPU 估算，20 万/秒需要 ~2.1 个核。
+- **⚠ 测量窗口 bug（未修）**：请求测量 30 s，实际 `measure_sec=46.96 s`。原因：测量循环用 `sleep(0.5)×60` 计时，满载下每次 sleep 都被延迟触发（循环延迟 p50 68 ms），名义 30 s 拖成 47 s；而 loadgen 只发 70 s（预热 30+测量 30+余量 10）→ 测量窗口最后 ~10 s 没有流量，把**基于窗口时长**的 `accepted_rate`（79 426/s）与 `cpu_pct_of_core`（84.7%）**稀释**。每条事件的 CPU 数字不受影响（分子分母都只含流量期）。**修复方案**：测量循环改墙钟 deadline（`deadline = monotonic() + measure`，循环条件改 `monotonic() < deadline`），待下一会话改后重跑。
+
+**分阶段 CPU 占比（可靠，与窗口时长无关；进程 CPU 39.78 s）**：
+
+| 阶段 | CPU 占比 | 每条事件 | 备注 |
+|---|---|---|---|
+| **validate** | **49.5%** | **5.28 μs** | 最大头；逐条校验 + URL 归一化 |
+| **ingest**（合计） | 29.1% | 3.10 μs | 引擎写入 |
+| └ dim_write（写秒桶） | 12.7% | 1.35 μs | 两维 DimBucket.observe |
+| └ dedup（Bloom 去重） | 7.4% | 0.79 μs | check_and_set |
+| └ hash（key_hashes） | 5.3% | 0.57 μs | 去重 + 两维 key 哈希 |
+| └ classify + groupby | 0.4% | 0.04 μs | |
+| **tick_snapshot**（快照） | 5.2% | 0.56 μs | 每秒一次 |
+| load_array（orjson） | 7.7% | 0.82 μs | JSON 解析 |
+| tick_finalize（定稿） | 1.6% | 0.17 μs | 每秒一次 |
+| decode（解压） | 0.01% | ~0 | 不 gzip，符合预期 |
+| read_body | 0（IO） | — | 收包等待 wall 275.9 s，不计 CPU |
+
+- **顶层阶段 CPU 之和 = 进程 CPU 的 93.1%** → "各阶段之和 ≈ 服务核 CPU 时间"校验通过；余下 ~7% 为 aiohttp 协议处理、JSON 响应序列化等未包装部分。
+- **每条被接受事件平均 CPU ≈ 10.7 μs**（可靠值；T10b 端到端 20 μs 的差距由此拆开了）。
+
+**与基准对比**：
+- bench_engine 纯统计核心 ~4.1 μs/条 vs 端到端 ingest 3.10 μs/条 → **统计核心没变慢**，与基准一致。
+- **validate 5.28 μs/事件是最大异常**：本地热缓存基准 0.93 μs（Python 3.14）、容器空闲 1.84 μs（Python 3.12）、**满载 5.28 μs**（比容器空闲还慢 ~2.9×）。N_URL=2 万 < 缓存上限 10 万，热缓存理应命中，满载下变慢的根因未查明（方向：归一化缓存命中率 / 满载下其他干扰）。**首要优化点。**
+
+**其他观测**：
+- 事件循环延迟极高：p50=68 ms、p99=347 ms、max=405 ms —— 直接决定查询 p99 超标；来源是 validate+ingest 的大同步块、每秒快照、GC 停顿。
+- GC：每秒 16.7 次回收；第 2 代仅 4 次但**单次最长 31.7 ms**（gen2_total 80.8 ms）——一次 gen2 ≈ 30 ms 停顿。
+- 内存：峰值 219.5 MB（贴 220 MB 阈值未触发提前结束），结束 200 MB。
+- loadgen 侧：客户端 CPU 252%（压测工具自身吃紧）、写入 p99 1.5 s、503 重试 795 次、接受率 99.1%（窗口被稀释，真实流量期接受率更高）。
+
+### 待办（下一会话）
+
+1. **修测量窗口 bug**：`tools/profile_server.py` 的测量循环 `sleep(0.5)×N` 改墙钟 deadline，然后重跑拿到干净的窗口内速率与核占用，确认单核可持续速率量级（预期 ~8 万/秒：1/(10.7 μs)×效率）。
+2. **查 validate 满载慢 2.9× 的根因**：满载下归一化缓存命中率（可加包装在 `normalize_url` 上计数命中/未命中），或内存压力/其他干扰。
+3. 写 `docs/perf/T11a-report.md`（报告六节：分阶段表、与基准对比、GC、事件循环延迟、无降级干扰的最高可持续速率、优化方向清单）。
+4. 收尾：`docker build --target test`、更新 PROGRESS.md"未解决的问题"与"基准数据"、AI_LOG.md、提交（不推送）。
+
+---
+
 T10b 已完成（按 docs/instructions/T10b.md），汇报后停下等审查。T10b 内容：
 
 1. **第零节前置修正（4 项，全部完成）**：(a) 容器内存构成实测 + 降级读数改"工作集"（`memory.current − inactive_file`，`/healthz` 加 `memory_current_bytes` 对照），推翻 T7b"保持原值"决定（见"已定的决策"）；(b) Dockerfile 加 `test` 阶段（与正式同基础同依赖 + pytest，跑全量快测试）、constraints.txt 在 python:3.12-slim 重新生成（3.12 比 3.14 多 `typing_extensions`）；(c) 修 flaky 测试——SSE 的 `test_shared_computation_same_params`/`test_recompute_at_most_once_per_second` 改 FakeClock 手工驱动网格点（连跑 20 次全过），`test_all_missing_no_fake_data` 改 monkeypatch 固定替身；(d) `.gitignore` 补 `build/ dist/ results/`。
