@@ -72,6 +72,68 @@ def test_v2_beats_v1_when_both_have_limit(tmp_path):
     assert memory_bytes(str(tmp_path)) == 111
 
 
+# ---- memory_current_bytes：原始读数（不减文件缓存）----
+
+def test_memory_current_bytes_v2_uses_cgroup(tmp_path):
+    # memory_current_bytes 返回原始 cgroup 占用，不扣文件缓存
+    _write(tmp_path, "sys/fs/cgroup/memory.max", "256\n")
+    _write(tmp_path, "sys/fs/cgroup/memory.current", "123456789\n")
+    assert mem.memory_current_bytes(str(tmp_path)) == 123456789
+
+
+def test_memory_current_bytes_no_limit_uses_statm(tmp_path, monkeypatch):
+    # 无上限（memory.max=max）→ memory_current_bytes 退回 statm
+    _write(tmp_path, "sys/fs/cgroup/memory.max", "max\n")
+    _write(tmp_path, "sys/fs/cgroup/memory.current", "999999\n")  # 不应被采用
+    _write(tmp_path, "proc/self/statm", "5000 1234 200 0 0 1000 0\n")
+    monkeypatch.setattr(mem, "_page_size", lambda: 4096)
+    assert mem.memory_current_bytes(str(tmp_path)) == 1234 * 4096
+
+
+# ---- memory_bytes：工作集 = 原始读数 − 不活跃文件缓存（T10b）----
+
+def test_v2_working_set_subtracts_inactive_file(tmp_path):
+    # v2：工作集 = memory.current − memory.stat 的 inactive_file
+    _write(tmp_path, "sys/fs/cgroup/memory.max", "256\n")
+    _write(tmp_path, "sys/fs/cgroup/memory.current", "123456789\n")
+    _write(tmp_path, "sys/fs/cgroup/memory.stat",
+           "anon 118456789\nfile 5000000\ninactive_file 5000000\nactive_file 0\n")
+    assert mem.memory_current_bytes(str(tmp_path)) == 123456789
+    assert memory_bytes(str(tmp_path)) == 123456789 - 5000000
+
+
+def test_v1_working_set_subtracts_total_inactive_file(tmp_path):
+    # v1：工作集 = memory.usage_in_bytes − memory.stat 的 total_inactive_file
+    _write(tmp_path, "sys/fs/cgroup/memory/memory.limit_in_bytes", "104857600\n")
+    _write(tmp_path, "sys/fs/cgroup/memory/memory.usage_in_bytes", "987654321\n")
+    _write(tmp_path, "sys/fs/cgroup/memory/memory.stat",
+           "total_inactive_file 3000000\ninactive_anon 123\n")
+    assert memory_bytes(str(tmp_path)) == 987654321 - 3000000
+
+
+def test_working_set_no_stat_falls_back_to_raw(tmp_path):
+    # 有 cgroup 上限但没有 memory.stat：工作集退回原始读数（不扣缓存）
+    _write(tmp_path, "sys/fs/cgroup/memory.max", "256\n")
+    _write(tmp_path, "sys/fs/cgroup/memory.current", "123456789\n")
+    assert memory_bytes(str(tmp_path)) == 123456789
+    assert mem.memory_current_bytes(str(tmp_path)) == 123456789
+
+
+def test_working_set_no_limit_returns_raw(tmp_path, monkeypatch):
+    # 无 cgroup 上限（进程读数本身不含可回收文件缓存）→ 工作集 = 原始 statm
+    _write(tmp_path, "proc/self/statm", "5000 1234 200 0 0 1000 0\n")
+    monkeypatch.setattr(mem, "_page_size", lambda: 4096)
+    assert memory_bytes(str(tmp_path)) == 1234 * 4096
+
+
+def test_working_set_clamps_at_zero(tmp_path):
+    # inactive_file 超过原始读数（异常数据）→ 工作集不为负，钳到 0
+    _write(tmp_path, "sys/fs/cgroup/memory.max", "256\n")
+    _write(tmp_path, "sys/fs/cgroup/memory.current", "1000\n")
+    _write(tmp_path, "sys/fs/cgroup/memory.stat", "inactive_file 9999\n")
+    assert memory_bytes(str(tmp_path)) == 0
+
+
 # ---- memory_bytes：无上限退回 statm ----
 
 def test_v2_no_limit_falls_back_to_statm(tmp_path, monkeypatch):
@@ -101,15 +163,15 @@ def test_limit_but_usage_missing_falls_back_to_statm(tmp_path, monkeypatch):
 
 # ---- 健壮性：全缺返回 0、乱码不抛 ----
 
-def test_all_missing_no_fake_data(tmp_path):
+def test_all_missing_no_fake_data(tmp_path, monkeypatch):
     # 全缺时不返回伪造值：非 Windows 没有 WorkingSet 兜底 → 0；Windows 退回真实的
     # WorkingSetSize（> 0，T8b）——不能断言 == 0，否则把"Windows 恒 0"的旧 bug 锁死。
-    if sys.platform == "win32":
-        v1, v2 = mem._windows_working_set(), mem._windows_working_set()
-    else:
-        v1 = v2 = 0
-    assert memory_bytes(str(tmp_path)) == v1
-    assert memory_bytes(str(tmp_path / "不存在")) == v2
+    # 用固定替身而不是连读两次真实值：WorkingSetSize 会随进程内存浮动，两次读数
+    # 可能不相等（T10b 发现该写法在 Windows 上时好时坏）。
+    expected = 7_000_000 if sys.platform == "win32" else 0
+    monkeypatch.setattr(mem, "_windows_working_set", lambda platform=None: expected)
+    assert memory_bytes(str(tmp_path)) == expected
+    assert memory_bytes(str(tmp_path / "不存在")) == expected
 
 
 def test_garbage_files_do_not_raise(tmp_path):

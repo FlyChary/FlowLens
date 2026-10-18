@@ -1,15 +1,15 @@
-# 不进镜像的东西：版本库、测试、文档、基准/实验脚本、缓存、构建产物、虚拟环境
+# 不进镜像的东西：版本库、文档、缓存、构建产物、虚拟环境
 .git
 .gitignore
 .dockerignore
 Dockerfile
 run.sh
-tests/
 docs/
-tools/
 README.md
 AI_LOG.md
 CLAUDE.md
+# tests/ 与 tools/ 只进 test 构建阶段（Dockerfile 的 test 目标，跑 Python 3.12 全量
+# 测试），正式镜像（app 目标）不使用它们。
 
 # Python 缓存与构建产物
 __pycache__/

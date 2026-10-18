@@ -119,8 +119,9 @@ def test_healthz():
         assert body["ok"] is True
         assert body["events_ingested"] == 0
         # 全部字段
-        for f in ("memory_bytes", "memory_limit_bytes", "degraded", "deduped",
-                  "late", "invalid", "tick_errors", "last_tick_ms", "sse"):
+        for f in ("memory_bytes", "memory_current_bytes", "memory_limit_bytes",
+                  "degraded", "deduped", "late", "invalid", "tick_errors",
+                  "last_tick_ms", "sse"):
             assert f in body, f"healthz 缺字段 {f}"
         # 测试注入假内存读数 (0, None)（见 _fake_memory_reader）
         assert body["memory_bytes"] == 0

@@ -74,18 +74,44 @@ def test_random_mode_no_duplicates():
 
 
 def test_raw_url_normalizes_to_key():
-    """对大量随机样本，normalize_url(raw_url(key_of(i))) == key_of(i)。"""
+    """对大量随机样本，normalize_url(raw_url(key_of(i))) == key_of(i)。
+
+    T10b：key_of 现在约一半是含 {id} 段的模板，raw_url 会把 {id} 替换成随机值、
+    并按比例加 scheme://host、query、fragment——所有变化形式归一化后都还原成
+    key_of(i)。断言 id 模板确实出现了（特性真被覆盖）、且两种模板都验证到。
+    """
     g = EventGen(mode="长尾", seed=99)
     evs = []
     for _ in range(20):
         evs += g.batch(1000, sent_ms=1_750_000_000_000)
     checked = 0
+    saw_id_key = False       # 至少一条 key 模板含 {id}
+    saw_scheme_host = False  # 至少一条 raw_url 带了 scheme://host
     for e in evs:
         if e.etype in (NORMAL, LATE, FUTURE):
+            k = key_of(e.url_idx)
+            if "{id}" in k:
+                saw_id_key = True
             d = g.raw(e)
-            assert normalize_url(d["url"]) == key_of(e.url_idx), d["url"]
+            if d["url"].startswith("https://"):
+                saw_scheme_host = True
+            assert normalize_url(d["url"]) == k, d["url"]
             checked += 1
     assert checked > 3000
+    assert saw_id_key, "没有覆盖到含 {id} 段的 key 模板"
+    assert saw_scheme_host, "没有覆盖到带 scheme://host 的 raw_url"
+
+
+def test_id_key_templates_diverse():
+    """含 {id} 的模板确实用了多个不同路径，且约一半编号启用 {id} 模板。"""
+    # 两个模板都应出现（i % len 轮转）
+    keys = [key_of(i) for i in range(100)]
+    id_keys = [k for k in keys if "{id}" in k]
+    assert len(id_keys) > 40, f"含 {{id}} 模板比例偏低: {len(id_keys)}/100"
+    prefixes = {k.split("/x")[0] for k in id_keys}
+    assert len(prefixes) >= 2, f"含 {{id}} 的模板路径不够多样: {prefixes}"
+    # key_of 是编号的注入映射：不同编号 → 不同 key
+    assert len(set(keys)) == len(keys)
 
 
 def test_ts_avoids_decision_boundaries():
@@ -213,9 +239,12 @@ def test_exact_half_open_boundaries():
         nbytes=np.array([10, 20, 30, 40]),
         sent_ms=np.array([100, 200, 300, 400]),
     )
-    assert sol.topk("url", 200, 300, 5) == [("/api/item/x2", 1)]  # 200 含、300 不含
-    assert sol.topk("url", 0, 500, 5) == [
-        ("/api/item/x2", 2), ("/api/item/x1", 1), ("/api/item/x3", 1)]
+    # key 由 key_of 生成（含 {id} 模板），不能硬编码 /api/item/x{i}
+    k1, k2, k3 = key_of(1), key_of(2), key_of(3)
+    assert sol.topk("url", 200, 300, 5) == [(k2, 1)]  # 200 含、300 不含
+    # (0,500)：x1=1、x2=2、x3=1；x2 次数最高在前，x1 与 x3 次数并列、按 key 字典序
+    exp = sorted([(1, k1), (2, k2), (1, k3)], key=lambda p: (-p[0], p[1]))
+    assert sol.topk("url", 0, 500, 5) == [(k, c) for c, k in exp]
     assert sol.distinct_users(0, 500) == 4
     assert sol.quantile_bytes(0, 500, 1.0) == 40.0
     assert sol.quantile_bytes(600, 700, 0.5) != sol.quantile_bytes(600, 700, 0.5)
@@ -234,6 +263,20 @@ def test_compare_tie_rule():
     r2 = compare([{"key": "a", "count": 10.0, "lower": 0, "upper": 9.5}],
                  exact, k=4)
     assert r2["in_bounds"] is False
+
+
+def test_compare_empty_service_answer():
+    """服务返回空 top-k：精确非空时召回应为 0（不是 1.0），两皆空才是 1.0。
+
+    T10b 发现：降级期服务返回空响应，若按"分母为 0 记 1.0"会被误判成完美精度。
+    """
+    exact = [("a", 10), ("b", 9), ("c", 8)]
+    r = compare([], exact, k=10)
+    assert r["recall"] == 0.0
+    assert r["in_bounds"] is True  # 没有返回 key，界判空平凡成立
+    # 精确答案也为空（区间无数据）：全命中
+    r2 = compare([], [], k=10)
+    assert r2["recall"] == 1.0
 
 
 # ---------------- 四、发送器（对测试里启动的服务）----------------

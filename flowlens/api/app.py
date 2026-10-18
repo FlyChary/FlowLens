@@ -41,7 +41,7 @@ from ..degrade import DegradeController
 from ..engine import Engine
 from ..errors import FlowLensError, Overloaded, PayloadTooLarge
 from ..ingest import Admission, IngestService
-from ..memstat import memory_bytes, memory_limit_bytes
+from ..memstat import memory_bytes, memory_current_bytes, memory_limit_bytes
 from ..model import clear_norm_cache
 from ..query import QueryService
 from ..ticker import Ticker
@@ -77,8 +77,13 @@ memory_reader_key = web.AppKey("memory_reader", Callable)
 
 
 def _default_memory_reader() -> tuple[int, int | None]:
-    """默认内存读数：memstat（cgroup / statm / Windows WorkingSet）。"""
+    """默认内存读数：memstat 的工作集（cgroup 扣文件缓存 / statm / Windows WorkingSet）。"""
     return memory_bytes(), memory_limit_bytes()
+
+
+def _default_memory_current_reader() -> int:
+    """原始内存读数（不扣文件缓存），/healthz 的 memory_current_bytes 用它对照。"""
+    return memory_current_bytes()
 
 
 def create_app(engine: Engine, ingest_service: IngestService,
@@ -343,7 +348,8 @@ async def _healthz(request: web.Request) -> web.Response:
     return _json_response({
         "ok": True,
         "events_ingested": c.events_ingested,
-        "memory_bytes": mem_bytes,
+        "memory_bytes": mem_bytes,  # 工作集（降级判断用它）
+        "memory_current_bytes": _default_memory_current_reader(),  # 原始读数，便于对照
         "memory_limit_bytes": mem_limit,  # 无上限时为 null
         "degraded": ctrl.degraded,
         "degrade": ctrl.status(),
