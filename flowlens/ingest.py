@@ -114,6 +114,10 @@ class Admission:
 
     limit: int = MAX_PENDING_BYTES
     _pending: int = 0
+    # 因预留失败（额度满）被拒绝的请求数（503 来源之一）。供 /healthz 暴露，
+    # 诊断 S1 高 503 到底是"在途额度"（本实例，ingest_service.admission）还是
+    # "原始请求体额度"（app.py 的 raw_budget 实例）在拒。
+    rejected: int = 0
 
     @property
     def pending(self) -> int:
@@ -136,6 +140,7 @@ class Admission:
     def try_reserve(self, n: int) -> bool:
         """预留 n 字节；放不下返回 False（调用方应整体拒绝，不写任何去重状态）。"""
         if not self.can_reserve(n):
+            self.rejected += 1
             return False
         self._pending += n
         return True

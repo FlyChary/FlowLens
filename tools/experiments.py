@@ -65,9 +65,30 @@ S5_OVERLOAD_SEC = 60
 S5_OBSERVE_SEC = 60
 
 # 核的分配（写入 meta，供判读）。docker 目标下 --cpuset-cpus 用 WSL 宿主机核号。
+# P1（多核）由 --svc-cpus/--load-cpus/--load-workers 覆盖（main() 里改这几个全局）。
 SVC_CORE = "0"
 LOAD_CORES = "1-6"
 AUX_CORE = "7"
+LOAD_WORKERS = 4
+
+
+def expand_cpus(spec: str) -> list[int]:
+    """把 "0,2,4,6" 或 "0-3,8" 这样的核规格展开成核号列表。"""
+    out: list[int] = []
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
+def svc_ncpu() -> int:
+    """服务容器可用的逻辑核数（用于 cgroup CPU 上限：多核时 CPU% 可超过 100）。"""
+    return len(expand_cpus(SVC_CORE))
 
 # 保留期（秒），与 timewin.RETENTION_SEC 一致——S3 抽样区间必须落在保留期内
 RETENTION_SEC = 600
@@ -140,6 +161,38 @@ def mem_timeline(healthz_samples: list[dict]) -> dict:
     }
 
 
+def proc_timeline(samples: list[dict]) -> dict:
+    """从监控采样的 `procs` 字段汇总每类进程（main/各 parse 子进程）的 CPU 峰值与
+    常驻内存峰值（MiB），P1 判"瓶颈在服务还是压测端"与 S4 报各进程常驻内存用。
+
+    返回 {"main": {cpu_peak_pct, rss_peak_mb}, "parse": [每子进程 {pid, cpu_peak_pct,
+    rss_peak_mb}], "parse_count": int}；无 procs 数据时返回空结构。
+    """
+    main = {"cpu_peak_pct": None, "rss_peak_mb": None}
+    by_pid: dict[int, dict] = {}
+    for s in samples:
+        for p in (s.get("procs") or []):
+            if p["name"] == "main":
+                cpu = p.get("cpu_pct")
+                rss = p.get("rss_mb")
+                if cpu is not None and (main["cpu_peak_pct"] is None or cpu > main["cpu_peak_pct"]):
+                    main["cpu_peak_pct"] = cpu
+                if rss is not None and (main["rss_peak_mb"] is None or rss > main["rss_peak_mb"]):
+                    main["rss_peak_mb"] = rss
+            else:
+                d = by_pid.setdefault(p["pid"], {"pid": p["pid"],
+                                                 "cpu_peak_pct": None,
+                                                 "rss_peak_mb": None})
+                if p.get("cpu_pct") is not None and (
+                        d["cpu_peak_pct"] is None or p["cpu_pct"] > d["cpu_peak_pct"]):
+                    d["cpu_peak_pct"] = p["cpu_pct"]
+                if p.get("rss_mb") is not None and (
+                        d["rss_peak_mb"] is None or p["rss_mb"] > d["rss_peak_mb"]):
+                    d["rss_peak_mb"] = p["rss_mb"]
+    return {"main": main, "parse": sorted(by_pid.values(), key=lambda x: x["pid"]),
+            "parse_count": len(by_pid)}
+
+
 def parse_loadgen_lines(lines: list[str]) -> tuple[dict | None, list[dict]]:
     """解析 loadgen 的标准输出：逐秒行（type=second）与汇总行（type=summary）。
 
@@ -178,10 +231,20 @@ def merge_timeline(healthz_samples: list[dict], loadgen_seconds: list[dict]
     for sec in secs:
         lg = lg_by_sec.get(sec)
         src = rss_by_sec.get(sec) or {}
+        # 逐秒的 main / 解析进程 CPU（占单核 %）与解析进程数，P1 判瓶颈在哪端
+        procs = src.get("procs") or []
+        main_cpu = sum(p["cpu_pct"] for p in procs if p["name"] == "main"
+                       and p.get("cpu_pct") is not None)
+        parse_cpu = sum(p["cpu_pct"] for p in procs if p["name"] == "parse"
+                        and p.get("cpu_pct") is not None)
+        parse_n = sum(1 for p in procs if p["name"] == "parse")
         row = {"t": sec, "sent": 0, "accepted": 0, "rejected": 0, "errors": 0,
                "lat_p50_ms": None, "lat_p95_ms": None, "lat_p99_ms": None,
                "rss_anon_mb": mem_mb(src.get("rss_anon_bytes")),
                "vm_rss_mb": mem_mb(src.get("vm_rss_bytes")),
+               "main_cpu_pct": round(main_cpu, 1) or None,
+               "parse_cpu_pct": round(parse_cpu, 1) or None,
+               "parse_n": parse_n or None,
                "healthz": hz_by_sec.get(sec)}
         if lg is not None:
             row["sent"] = lg["sent"]; row["accepted"] = lg["accepted"]
@@ -330,17 +393,22 @@ async def sample_service_cpu(svc: Service, last: dict) -> float | None:
     dt = now - prev_t
     if dt <= 0:
         return None
+    # docker：usage 单位是**微秒**（cgroup v2 cpu.stat 的 usage_usec），一个核满速是
+    # 1e6 µs/秒；local：utime+stime 单位是 clock tick（clk_tck=100Hz）。
     frac = (usage - prev_usage) / (
-        (10_000 if svc.kind == "docker" else svc._clk_tck) * dt)
-    return round(min(frac, 1.0) * 100.0, 1)
+        (1_000_000 if svc.kind == "docker" else svc._clk_tck) * dt)
+    # 上限 = 服务核数（多核容器里服务 CPU% 可超过 100，如 4 核打满 = 400%）
+    return round(min(frac, svc_ncpu()) * 100.0, 1)
 
 
 # ===================== 负载 / 查询 驱动 =====================
 
 async def _loadgen_args(svc: Service, *, rate: int, duration: float,
                         batch: int, gzip: bool, mode: str, seed: int,
-                        archive: str | None = None, workers: int = 4,
+                        archive: str | None = None, workers: int | None = None,
                         conc: int = 8) -> list[str]:
+    if workers is None:
+        workers = LOAD_WORKERS
     args = [sys.executable, os.path.join(TOOLS, "loadgen.py"),
             "--url", svc.url, "--workers", str(workers), "--conc", str(conc),
             "--rate", str(rate), "--batch", str(batch),
@@ -639,21 +707,98 @@ async def sample_service_rss(svc: Service) -> dict:
     return d
 
 
+def _parse_proc_stat(text: str) -> tuple[int, int] | None:
+    """从 /proc/<pid>/stat 读出 (utime+stime, 父 pid)。comm 可能带括号/空格，取最后一个 ')'。"""
+    r = text.rfind(")")
+    if r < 0:
+        return None
+    fields = text[r + 1:].split()
+    if len(fields) < 14:  # state 起算；utime=field 11、stime=field 12、ppid=field 1（相对 fields）
+        return None
+    try:
+        return (int(fields[11]) + int(fields[12]), int(fields[1]))
+    except (ValueError, IndexError):
+        return None
+
+
+async def sample_proc_all(svc: Service, last: dict, dt: float) -> list[dict]:
+    """容器内所有 python 进程的 CPU%（占单核）与 VmRSS（MiB）。
+
+    用一次 `docker exec` 抓 /proc 下所有 stat（utime+stime、ppid）与 status（VmRSS），
+    两次采样差算 CPU%，只保留服务进程（ppid==1）——即主进程 + 各解析子进程。
+    多核容器里 CPU% 上限 = 核数 × 100（不再 clamp 到 100），P1 判"哪个进程跑满"用。
+    返回 [{"pid":..,"name":"main|parse","cpu_pct":..,"rss_mb":..}, ...]；读不到返回 []。
+    """
+    if svc.kind != "docker" or not svc.container:
+        return []
+    out = await _run(["docker", "exec", svc.container, "sh", "-c",
+                      "for p in /proc/[0-9]*; do pid=${p#/proc/}; "
+                      "st=$(cat $p/stat 2>/dev/null); [ -z \"$st\" ] && continue; "
+                      "rs=$(awk '/^VmRSS:/{print $2}' $p/status 2>/dev/null); "
+                      "cl=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); "
+                      "echo \"$pid|$st|$rs|$cl\"; done"])
+    now = time.monotonic()
+    prev = last.get("procs") or {}
+    cur: dict[int, tuple] = {}
+    res: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        parsed = _parse_proc_stat(parts[1])
+        if parsed is None:
+            continue
+        utime, ppid = parsed
+        try:
+            rss_kb = int(parts[2]) if parts[2].strip() else 0
+        except ValueError:
+            rss_kb = 0
+        # 只保留 ppid==1 的服务进程（主进程 pid 1 + 解析子进程）。健康检查
+        # （python -c "…urlopen('…/healthz'…)"）也是 ppid==1，按 cmdline 排除。
+        if ppid != 1 and pid != 1:
+            continue
+        cmdline = parts[3] if len(parts) > 3 else ""
+        if "healthz" in cmdline or "urllib.request" in cmdline:
+            continue
+        cur[pid] = (utime, now, rss_kb)
+    for pid, (utime, t, rss_kb) in cur.items():
+        if pid in prev:
+            pu, pt, _ = prev[pid]
+            ddt = t - pt
+            if ddt > 0:
+                cpu = (utime - pu) / (svc._clk_tck * ddt) * 100.0
+                name = "main" if pid == 1 else "parse"
+                res.append({"pid": pid, "name": name,
+                            "cpu_pct": round(min(cpu, 100 * svc_ncpu() + 1), 1),
+                            "rss_mb": round(rss_kb / 1024.0, 1)})
+    last["procs"] = cur
+    return res
+
+
 async def _monitor(svc: Service, stop_event: asyncio.Event,
                    samples: list[dict]) -> None:
     """每秒采样 /healthz、服务 CPU 与服务进程 RssAnon/VmRSS。"""
     import aiohttp
     last = {}
+    last_t = time.monotonic()
     async with aiohttp.ClientSession(
             trust_env=False, timeout=aiohttp.ClientTimeout(total=5)) as ses:
         while not stop_event.is_set():
             st, _, hz = await _get(ses, svc.url + "/healthz")
             cpu = await sample_service_cpu(svc, last)
             rss = await sample_service_rss(svc)
+            dt = time.monotonic() - last_t
+            last_t = time.monotonic()
+            procs = await sample_proc_all(svc, last, dt)
             samples.append({"t": int(time.time() * 1000),
                             "healthz": hz, "svc_cpu_pct": cpu,
                             "rss_anon_bytes": rss.get("RssAnon"),
-                            "vm_rss_bytes": rss.get("VmRSS")})
+                            "vm_rss_bytes": rss.get("VmRSS"),
+                            "procs": procs})
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -717,7 +862,8 @@ async def run_s1(svc: Service, outdir: str, *, gzip: bool, rates: list[int],
                  merge_timeline(samples, all_lg_seconds))
     ms = max_sustainable(levels)
     summary = {"scenario": "S1", "gzip": gzip, "levels": levels,
-               "max_sustainable": ms, "memory": mem_timeline(samples)}
+               "max_sustainable": ms, "memory": mem_timeline(samples),
+               "procs": proc_timeline(samples)}
     write_summary(outdir, summary)
     return summary
 
@@ -925,6 +1071,7 @@ async def run_sustained(svc: Service, outdir: str, *, rate: int,
         "scenario": "SUSTAINED", "rate": rate, "mode": mode,
         "duration_s": duration, "tail_s": tail_sec,
         "load": lg_summary, "memory": mem_timeline(samples),
+        "procs": proc_timeline(samples),
         "rss_anon": rss_trip,
         "trim_calls_total": trim_calls[-1] if trim_calls else 0,
         "trim_total_ms": trim_total_ms[-1] if trim_total_ms else 0.0,
@@ -1110,6 +1257,7 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
 
 
 def main() -> None:
+    global SVC_CORE, LOAD_CORES, LOAD_WORKERS
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
@@ -1126,6 +1274,12 @@ def main() -> None:
     p.add_argument("--pip-index", default=None,
                    help="docker build 的 PIP_INDEX_URL（可选，走国内源）")
     p.add_argument("--results", default="results", help="结果根目录")
+    p.add_argument("--svc-cpus", default=SVC_CORE,
+                   help="服务容器的 --cpuset-cpus（WSL 宿主核号），如 '0,2,4,6'")
+    p.add_argument("--load-cpus", default=LOAD_CORES,
+                   help="压测 loadgen 的 taskset 核（WSL 宿主核号），如 '8-15'")
+    p.add_argument("--load-workers", type=int, default=LOAD_WORKERS,
+                   help="loadgen 的 --workers 进程数（默认 = --load-cpus 的逻辑核数）")
     p.add_argument("--extra-env", action="append", default=[],
                    metavar="K=V",
                    help="额外注入服务进程的环境变量（可多次）。C3 实验组用它"
@@ -1133,6 +1287,14 @@ def main() -> None:
                         "（FLOWLENS_INTERN_USER_CAP/URL_CAP=0）、在途额度"
                         "（FLOWLENS_MAX_PENDING_BYTES）。")
     args = p.parse_args()
+
+    # P1 多核核分配：把命令行覆盖写进全局（start_service/_loadgen_args 在调用时读）
+    SVC_CORE = args.svc_cpus
+    LOAD_CORES = args.load_cpus
+    if args.load_workers > 0:
+        LOAD_WORKERS = args.load_workers
+    else:
+        LOAD_WORKERS = len(expand_cpus(LOAD_CORES))  # 默认 = 压测核的逻辑核数
 
     extra_env = {}
     for kv in args.extra_env:

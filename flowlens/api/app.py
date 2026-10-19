@@ -31,6 +31,7 @@ _read_raw_body 里 try_reserve、finally release，预算借还是单一 owner�
 
 import asyncio
 import logging
+import os
 from typing import Callable
 
 import orjson
@@ -57,8 +58,24 @@ log = logging.getLogger(__name__)
 
 # 单个请求体（原始、压缩后）上限：超过直接 413
 MAX_RAW_BODY_BYTES = 4 * 1024 * 1024
-# RawBudget 总上限：所有正在读取/持有的原始请求体字节数之和
-RAW_BUDGET_LIMIT = 8 * 1024 * 1024
+# RawBudget 总上限：所有正在读取/持有的原始请求体字节数之和。P1 诊断：可用
+# FLOWLENS_RAW_BUDGET_BYTES 环境变量覆盖（进程池开启后在途解析增多，需要更大原始额度）；
+# 缺省/非法/非正数退回默认 8 MB。
+DEFAULT_RAW_BUDGET_LIMIT = 8 * 1024 * 1024
+
+
+def _read_raw_budget_limit() -> int:
+    raw = os.environ.get("FLOWLENS_RAW_BUDGET_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_RAW_BUDGET_LIMIT
+    try:
+        v = int(raw)
+    except ValueError:
+        return DEFAULT_RAW_BUDGET_LIMIT
+    return v if v > 0 else DEFAULT_RAW_BUDGET_LIMIT
+
+
+RAW_BUDGET_LIMIT = _read_raw_budget_limit()
 # 第 3 级降级（收紧内存）时的上限：Admission 由 4 MB 降到 2 MB，RawBudget 由 8 MB 降到 4 MB
 TIGHT_ADMISSION_LIMIT = 2 * 1024 * 1024
 TIGHT_RAW_BUDGET_LIMIT = 4 * 1024 * 1024
@@ -255,6 +272,7 @@ async def _ingest_expect(request: web.Request) -> web.StreamResponse | None:
         # 分块传输（cl 为 None）在 expect 阶段无法判断预留量，一律先放行发 100，
         # 由 _read_raw_body 边读边核对 4MB 与预算。
         if cl is not None and not budget.can_reserve(cl):
+            budget.rejected += 1  # 原始请求体额度拒绝（与 _read_raw_body 的 try_reserve 同源）
             resp = _json_response({"error": "overloaded"}, status=503)
             resp.headers["Retry-After"] = "1"
             return resp
@@ -364,6 +382,9 @@ async def _healthz(request: web.Request) -> web.Response:
         "deduped": c.deduped,
         "late": c.late,
         "invalid": c.invalid,
+        # 503 来源计数（P1 诊断用）：在途额度 vs 原始请求体额度分别拒了多少请求
+        "ingest_rejected": request.app[ingest_service_key].admission.rejected,
+        "raw_rejected": request.app[raw_budget_key].rejected,
         "tick_errors": t.error_count,
         "last_tick_ms": t.last_tick_duration_ms,
         # 定期 malloc_trim 统计（C3）：非 Linux 上 enabled 为 False、call_count 恒 0
