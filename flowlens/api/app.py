@@ -41,6 +41,7 @@ from ..degrade import DegradeController
 from ..engine import Engine
 from ..errors import FlowLensError, Overloaded, PayloadTooLarge
 from ..ingest import Admission, IngestService
+from ..parse_pool import ParsePool
 from ..memstat import memory_bytes, memory_current_bytes, memory_limit_bytes
 from ..model import clear_norm_cache
 from ..query import QueryService
@@ -74,6 +75,7 @@ ticker_task_key = web.AppKey("ticker_task", asyncio.Task)
 stream_manager_key = web.AppKey("stream_manager", StreamManager)
 degrade_controller_key = web.AppKey("degrade_controller", DegradeController)
 memory_reader_key = web.AppKey("memory_reader", Callable)
+parse_pool_key = web.AppKey("parse_pool", ParsePool)
 
 
 def _default_memory_reader() -> tuple[int, int | None]:
@@ -88,7 +90,8 @@ def _default_memory_current_reader() -> int:
 
 def create_app(engine: Engine, ingest_service: IngestService,
                query_service: QueryService, *, tick_period: float = 1.0,
-               memory_reader: Callable[[], tuple[int, int | None]] | None = None
+               memory_reader: Callable[[], tuple[int, int | None]] | None = None,
+               parse_pool: "ParsePool | None" = None
                ) -> web.Application:
     # client_max_size=0（不限制）：4 MB 上限由 _read_raw_body 自己执行，
     # 否则 aiohttp 会在 handler 之前以自己的 413 拒绝，RawBudget 预留就没机会了
@@ -130,6 +133,11 @@ def create_app(engine: Engine, ingest_service: IngestService,
         write_timeout=DEFAULT_WRITE_TIMEOUT_SEC,
     )
     app[stream_manager_key] = manager
+    # 解析进程池（P1）：挂在 app 上，应用关闭（含 SIGTERM）时 _stop_parse_pool 关闭，
+    # 不残留子进程。IngestService 已持有同一个 pool 实例（make_engine 里传入）。
+    if parse_pool is not None:
+        app[parse_pool_key] = parse_pool
+        app.on_shutdown.append(_stop_parse_pool)
     app.on_startup.append(_start_ticker)
     app.on_shutdown.append(_stop_ticker)
     app.on_shutdown.append(_stop_stream)
@@ -434,9 +442,20 @@ async def _stop_stream(app: web.Application) -> None:
     await app[stream_manager_key].close()
 
 
-def make_engine(clock=None) -> tuple[Engine, IngestService, QueryService]:
-    """按默认 Config 组装 engine + 服务（__main__ 用）。"""
+async def _stop_parse_pool(app: web.Application) -> None:
+    # 应用关闭（含 SIGTERM）：关闭解析进程池，不残留子进程（P1 §3.5）。
+    # on_shutdown handler 必须是 async（aiohttp 会 await 它）；只在传入了进程池时才注册。
+    app[parse_pool_key].close()
+
+
+def make_engine(clock=None, parse_pool: "ParsePool | None" = None
+                ) -> tuple[Engine, IngestService, QueryService]:
+    """按默认 Config 组装 engine + 服务（__main__ 用）。
+
+    parse_pool 非 None 时 IngestService 走进程池路径（把解压后的字节交给子进程解析），
+    否则走现有单进程路径（核数不足 / FLOWLENS_PARSE_WORKERS=0）。
+    """
     from ..config import Config
     from ..timewin import Clock
     engine = Engine(Config(), clock or Clock())
-    return engine, IngestService(engine, Admission()), QueryService(engine)
+    return engine, IngestService(engine, Admission(), parse_pool=parse_pool), QueryService(engine)

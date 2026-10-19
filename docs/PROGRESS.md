@@ -25,10 +25,17 @@
 | T10c 调试接口与控制台页面 | 调试接口已完成（支线 B1：GET /debug/structure，FLOWLENS_DEBUG=1 门控）；控制台页面未开始 |
 | Docker/部署（支线 B1+B1b） | 已完成（constraints.txt 固定版本、__main__.py 处理 SIGTERM、非 root、单阶段 pip install 装完删源码） |
 | T11 性能 | 进行中（T11a-2 完成等审查；T11b 缩小范围：第零/一/二节完成等审查，第三～六节留作提交后优化） |
+| P1 解析进程池（支线 lane-c） | 检查点一完成（第一～三节：parse_pool + 引擎拆分 + 写入并发限制 + 等价性/正确性测试），等审查；第四节容器实测留检查点二 |
 
 ## 进行中
 
-（T11b 已缩小范围完成：第零、一、二节已做，汇报后等审查。第三～六节留作提交后的优化，见"未解决的问题"第 9 条。支线 B1/C1/C2/C3 的代码已合并进 main，本节为 F2 收尾合并支线笔记时补记。）
+**P1 检查点一已完成（支线 lane-c，分支 lane-c，已合并 origin/main）**：按 docs/instructions/P1.md 完成第一～三节。改动：新建 `flowlens/parse_pool.py`（ParsedBatch + parse_body + spawn 进程池 ParsePool，哈希自检、按实际核数算 worker 数、崩溃重建、关闭）；`flowlens/engine.py` 写入核心拆成 `ingest`（外层算三列哈希）→ `_ingest_core`（classify/去重/采样/写桶，哈希改由调用方传入、内部不再 key_hashes）+ 新入口 `ingest_parsed`；`flowlens/ingest.py` 拆 `_ingest_inproc`（现有路径，块 5000→2000）与 `_ingest_pooled`（解压后字节交子进程→切块写引擎），写引擎用 `asyncio.Semaphore(1)` 保护；`api/app.py` 关闭时关进程池（`_stop_parse_pool`）；`__main__.py` 在创建引擎**之前**启动并预热进程池。
+
+1. **等价性（不依赖子进程，稳定跑）**：同一 body 经单进程路径（decode→validate→ingest）与进程池路径（decode→parse_body→ingest_parsed→2000 切块）写两个全新引擎，topk(url/user)/stats/计数器逐项相等，覆盖长尾/全随机/含非法+重复/全非法/gzip/NDJSON。`ingest_parsed(ParsedBatch)` 与 `ingest(parse_events)` 两入口亦逐项相等。
+2. **正确性**：503 后重试不判重（预留在池提交前）、BrokenProcessPool→重建→恢复、worker 数计算（核数 1/2/4 + env 覆盖/非法/夹 [0,3]）、自检不一致→构造期 BrokenProcessPool、close 无残留子进程（e2e SIGTERM 测试 Linux-only）。
+3. **验证**：Windows `pytest -q` **366 passed, 4 skipped, 9 deselected**（PYTHONHASHSEED=0，真子进程用例生效）；`-m slow` **9 passed**。基准（Windows 单次）：`bench_core 长尾` 约 29.9 万/秒（T10b 30.0 持平）、`bench_engine 每批5000 engine.ingest` 2.31 μs/条（拆分后未变慢）。**第四节容器实测（S1/S2/S3/S4/单核）留检查点二**。
+
+（T11b 已缩小范围完成：第零、一、二节已做，汇报后等审查。第三～六节留作提交后的优化，见"未解决的问题"第 9 条。支线 B1/C1/C2/C3 的代码已合并进 main。）
 
 ---
 

@@ -9,6 +9,7 @@ import signal
 from aiohttp import web
 
 from .api.app import create_app, make_engine
+from .parse_pool import ParsePool, resolve_worker_count
 from .timewin import Clock
 
 log = logging.getLogger("flowlens")
@@ -30,8 +31,19 @@ def main() -> None:
         log.warning("PYTHONHASHSEED 未固定（或为 random），哈希结果每次启动不同，"
                     "落盘数据将来无法合并。请固定为具体值（推荐 0）。")
 
-    engine, ingest_service, query_service = make_engine(Clock())
-    app = create_app(engine, ingest_service, query_service)
+    # 解析进程池（P1，用户决定三）：在创建引擎**之前**启动并预热。spawn 上下文不继承
+    # 主进程内存，但子进程要在主进程分配大块统计内存（Ring/Tree/Bloom）之前"真的"存在，
+    # 所以先 ParsePool（内部提交空任务迫使 n 个子进程启动）再 make_engine。核数不足
+    # （resolve_worker_count < 1）或 FLOWLENS_PARSE_WORKERS=0 时为 None，退回单进程路径。
+    pool = None
+    n_workers = resolve_worker_count()
+    if n_workers > 0:
+        pool = ParsePool(n_workers)
+        log.info("解析进程池已启动：%d 个子进程（哈希自检通过）", n_workers)
+
+    engine, ingest_service, query_service = make_engine(Clock(), parse_pool=pool)
+    app = create_app(engine, ingest_service, query_service,
+                     parse_pool=pool)
 
     async def run():
         # auto_decompress=False：不在传输层自动解压 gzip 请求体。请求体保持压缩，

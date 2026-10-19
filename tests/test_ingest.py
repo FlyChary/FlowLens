@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import sys
 import zlib
 
@@ -12,7 +13,7 @@ import pytest
 import flowlens.ingest as ing_mod
 from flowlens.config import Config
 from flowlens.dims import Dim
-from flowlens.engine import Engine
+from flowlens.engine import Engine, IngestResult
 from flowlens.errors import BadRequest, Overloaded, PayloadTooLarge, UnsupportedEncoding
 from flowlens.ingest import Admission, IngestService, MAX_DECOMPRESSED_BYTES, MAX_PENDING_BYTES
 from flowlens.model import EventBatch
@@ -323,6 +324,191 @@ def test_arr_elements_released_after_processing():
         assert len(arr) == 12000
         assert all(x is None for x in arr), "全部已处理元素应已置 None 以便释放"
     asyncio.run(main())
+
+
+# ---- P1：解析进程路径的等价性与正确性（决定一/五）----
+
+def _hash_seed_fixed() -> bool:
+    s = os.environ.get("PYTHONHASHSEED", "")
+    return bool(s) and s != "random"
+
+
+requires_seed = pytest.mark.skipif(
+    not _hash_seed_fixed(), reason="真子进程用例需要固定 PYTHONHASHSEED")
+
+
+def _body_rand(n: int, seed: int = 0) -> bytes:
+    """长尾 + query 不同的 body（跨块、含归一化路径）。"""
+    r = random.Random(seed)
+    evs = [{"event_id": f"e{seed * 100000 + i}", "user_id": f"u{r.randrange(50)}",
+            "url": f"/api/item/x{r.randrange(30)}?q={i}",
+            "ts": NOW - 1000 - (i % 900), "bytes": 10 + (i % 40)} for i in range(n)]
+    return json.dumps(evs).encode()
+
+
+def _snap_sig(eng) -> tuple:
+    s = eng.refresh_snapshot()
+    return (s.tops, s.distinct_users, s.p95_bytes)
+
+
+def _cnt_sig(eng) -> tuple:
+    c = eng.counters
+    return (c.events_ingested, c.deduped, c.late, c.invalid)
+
+
+def test_ingest_parsed_equals_ingest():
+    """P1 §3.1 核心（不依赖子进程）：同一 body，IngestService 单进程路径 vs 进程池路径
+    的"已解析结果"，写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
+
+    这里直接用 IngestService 的两条路径（in-proc 与 ParsedBatch），等价于"同一请求体
+    分别走进程池与单进程"（解析部分逻辑一致，只是 in-proc 用 validate、pooled 用
+    parse_body——两者产出同构，见 test_parse_pool）。覆盖长尾 / 全随机 / 含非法 / 批内重复。
+    """
+    from flowlens.parse_pool import parse_body
+    from flowlens.ingest import decode_body as _decode
+    CE = ing_mod.CHUNK_EVENTS
+
+    def run(body):
+        e1 = Engine(Config(), FakeClock(NOW))
+        s1 = IngestService(e1, Admission())
+        e2 = Engine(Config(), FakeClock(NOW))
+        # 进程池路径 = 本进程 parse_body + ingest_parsed（与子进程 parse_body 同一函数）
+        parsed = parse_body(_decode(body, None))
+
+        async def both():
+            r1 = await s1.ingest(body, None)
+            # 进程池路径的分块写入口径（与 _ingest_pooled 一致：ingest_parsed + 2000 切块，
+            # 整批 invalid 放首块，让引擎计数器也计到）
+            chunks = [parsed.chunk(i, i + CE) for i in range(0, len(parsed), CE)]
+            if not chunks:
+                chunks = [parsed.chunk(0, 0)]
+            chunks[0].invalid = parsed.invalid
+            total = IngestResult(0, 0, 0, 0)
+            for ch in chunks:
+                total = IngestService._add(total, e2.ingest_parsed(ch))
+            return r1, total
+        r1, r2 = asyncio.run(both())
+        assert r1 == r2, f"计数不一致 {r1} vs {r2}"
+        assert _snap_sig(e1) == _snap_sig(e2)
+        assert _cnt_sig(e1) == _cnt_sig(e2)
+
+    run(_body_rand(6000))                       # 长尾，跨 3 个块
+    r = random.Random(3)                        # 全随机不重复
+    rnd = [{"event_id": f"r{r.getrandbits(60)}", "user_id": f"ru{r.getrandbits(20)}",
+            "url": f"/r/{r.getrandbits(30)}", "ts": NOW - 1000, "bytes": 100} for _ in range(4000)]
+    run(json.dumps(rnd).encode())
+    bad = json.loads(_body_rand(3000))          # 含非法 + 批内重复
+    bad[7] = {"user_id": "x", "url": "/x", "ts": NOW - 100, "bytes": 1}   # 缺 event_id
+    bad[8] = dict(bad[0])
+    run(json.dumps(bad).encode())
+    # 全非法
+    run(json.dumps([5, "str", None]).encode())
+
+
+def test_ingest_pooled_503_then_retry_not_deduped():
+    """P1 §3.2 / 规则 2：进程池路径下在途额度满 → 503（预留在池提交之前），释放后重试不判重。"""
+    eng = Engine(Config(), FakeClock(NOW))
+    adm = Admission()
+    svc = IngestService(eng, adm, parse_pool=_FakePool())
+    body = _body_rand(100)
+
+    async def main():
+        assert adm.try_reserve(MAX_PENDING_BYTES)
+        try:
+            await svc.ingest(body, None)
+            raise AssertionError("应抛 Overloaded")
+        except Overloaded as e:
+            assert e.retry_after == 1
+        # 被拒的 e* 不应写进 Bloom（预留在解析与池提交之前）。释放后重试必须被正常接受
+        adm.release(MAX_PENDING_BYTES)
+        r = await svc.ingest(body, None)
+        assert r.accepted == 100 and r.deduped == 0
+    asyncio.run(main())
+
+
+def _FakePool():
+    """一个恒返回单进程 parse 结果的"进程池"替身（不真起子进程），让 svc 走 _ingest_pooled。"""
+    from flowlens.parse_pool import parse_body
+
+    class _FakePool:
+        available = True
+        num_workers = 1
+
+        def __init__(self):
+            self.rebuilt = False
+
+        def submit(self, raw):
+            import concurrent.futures as cf
+            f = cf.Future()
+            f.set_result(parse_body(raw))
+            return f
+
+        def rebuild(self):
+            self.rebuilt = True
+
+        def close(self):
+            pass
+
+    return _FakePool()
+
+
+def test_pool_path_full_equivalence():
+    """P1 §3.1（经 IngestService 的完整路径）：同一请求体分别走进程池路径（替身池，走
+    decode_body→parse_body→ingest_parsed→2000 切块→invalid 放首块）与单进程路径
+    （decode_body→validate→ingest），写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
+    覆盖 P1 点名的长尾、gzip、NDJSON、全随机。"""
+    eng, svc = _svc()
+    svc._pool = _FakePool()
+    svc._parse_inproc = False          # 强制走 _ingest_pooled（替身池）
+    eng2 = Engine(Config(), FakeClock(NOW))
+    s2 = IngestService(eng2, Admission())  # 单进程路径
+
+    async def run(body, enc):
+        r_pooled = await svc.ingest(body, enc)
+        r_inproc = await s2.ingest(body, enc)
+        assert r_pooled == r_inproc
+        assert _snap_sig(eng) == _snap_sig(eng2)
+        assert _cnt_sig(eng) == _cnt_sig(eng2)
+
+    async def main():
+        plain = _body_rand(6000)
+        await run(plain, None)                                   # 长尾，跨 3 个块
+        await run(_gzip(plain), "gzip")                          # gzip（解压后等价）
+        # NDJSON（逐行）
+        evs = json.loads(plain)
+        ndjson = b"\n".join(json.dumps(e).encode() for e in evs)
+        await run(ndjson, None)
+        r = random.Random(7)                                     # 全随机不重复
+        rnd = [{"event_id": f"r{r.getrandbits(60)}", "user_id": f"ru{r.getrandbits(20)}",
+                "url": f"/r/{r.getrandbits(30)}", "ts": NOW - 1000, "bytes": 100} for _ in range(4000)]
+        await run(json.dumps(rnd).encode(), None)
+    asyncio.run(main())
+
+
+def test_engine_write_semaphore_serializes():
+    """决定五：写入引擎受 Semaphore(1) 保护——两个并发请求的"写引擎"区间不重叠。"""
+    eng = Engine(Config(), FakeClock(NOW))
+    svc = IngestService(eng, Admission())
+    overlaps = {"n": 0}
+    active = {"n": 0}
+    orig = eng.ingest
+
+    def spy(batch, *a, **k):
+        active["n"] += 1
+        if active["n"] > 1:
+            overlaps["n"] += 1
+        try:
+            return orig(batch, *a, **k)
+        finally:
+            active["n"] -= 1
+
+    eng.ingest = spy
+
+    async def main():
+        body = _body_rand(3000)
+        await asyncio.gather(svc.ingest(body, None), svc.ingest(body, None))
+    asyncio.run(main())
+    assert overlaps["n"] == 0, "Semaphore(1) 应串行化写引擎，两请求写区间不重叠"
 
 
 # ---- Ticker ----

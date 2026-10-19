@@ -512,3 +512,19 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - 方案：malloc_trim 放 Ticker（`_maybe_trim` 到点触发、记 `TrimStat`）+ `/healthz` 暴露；`intern.py` 提供 `Intern`（满则整体清空）+ user/url 单例 + 环境变量开关；`engine.ingest` 写桶前 `np.fromiter` 驻留 user；`model.normalize_url` 返回前驻留结果；`ingest.py` 的 `MAX_PENDING_BYTES` 改读环境变量。实验用 `SUST`（持续负载+停发尾巴）+ `S4`（全随机攻击）场景、`--extra-env` 切特性。
 - **用户修改/否决点**：① 用户确认"主线未跑实验，可以跑容器"；② 用户确认"允许改 app.py 的 `_healthz` 加 `malloc_trim` 只读字段"（原清单不允许改 app.py，例外放行）；③ 用户追加 **glibc mmap/trim 阈值对照实验（g5）** 并**批准改 Dockerfile**（例外放行）固化 `MALLOC_MMAP_THRESHOLD_=131072`/`MALLOC_TRIM_THRESHOLD_=131072`——实测峰值 −57.7 MiB、246/246s 全程第 0 级，是本组实验最大单项收益；S3/S4 不重跑、等合并后在最终代码上统一跑。
 - 消融结论：trim 是主杠杆（进 L4 拒写 → 不拒写、接受率 87.8%→100%）、驻留是次杠杆（中后段水位降 ~11 MiB、把"贴 3 级"压成"偶发尖峰"）、在途降 2 MB 无增益（保留为实验变量）。**T9b-B（缩 Bloom/Count-Min，需改冻结 config.py）不需要**——g5 已全程 0 级、无内存压力，且 C1 已证缩 Bloom/HLL 都是拿精度换内存。
+
+### 2026-10-19 P1：解析进程池与写入并发限制（flowlens/parse_pool.py 新建、engine.py、ingest.py、api/app.py、__main__.py、tests/test_parse_pool.py、tests/test_ingest.py、tests/e2e/test_parse_pool_e2e.py）
+
+- **目标**：把"逐条处理"里可并行的纯计算（load_array、validate 含归一化、三列 64 位哈希，约 9.5 μs/条）搬到多个解析子进程，主进程只留必须单写者的 classify/Bloom/采样/写桶/tick（约 3.5 μs）。统计状态仍只在主进程，单写者、无锁、去重语义不变。
+- **用户五个关键决定（直接照做）**：① gzip 解压留在主进程（在途额度按解压后字节预留，解压后大小只有解压完才知道，解压进子进程会破坏"先预留再解析再去重"顺序）；② 解析进程数按"实际能用的核"算（`len(os.sched_getaffinity(0))` 与 cgroup cpu.max/cfs_quota 取小，`min(3, 核数−1)`，<1 不启用，FLOWLENS_PARSE_WORKERS 可覆盖）；③ 进程池在引擎创建**之前**启动并预热（spawn 上下文，initializer 做哈希自检）；④ 引擎写入核心只写一份（`ingest` 外层算哈希 → `_ingest_core`；新 `ingest_parsed` 组装 EventBatch 走同一核心；驻留在核心里、写桶前做）；⑤ 写引擎用 `asyncio.Semaphore(1)` 保护、按 2000 条分块、块间让出。
+- **AI 方案被修正/踩坑**：
+  1. **`BrokenProcessPool` 从 `concurrent.futures` 顶层 import 失败**——它在 `concurrent.futures.process`，改 import 路径。
+  2. **整批 invalid 的计数口径**：初版把 ParsedBatch 各子块 invalid 都设 0、只在响应上 `+extra_invalid`，导致**响应与引擎计数器不一致**（`counters.invalid` 没计到，`test_ingest_parsed_equals_ingest` 断言 `(…,1) == (…,0)` 挂）。改为**整批 invalid 放第一个块**（`engine.ingest_parsed` 会像单进程 `engine.ingest` 一样把它计入 counters），全非法时切不出块则用单空块承载，响应与计数器口径自然一致。
+  3. **子进程崩溃检测**：池已坏时 `submit()` 是**同步**抛 BrokenProcessPool（不是等到 await 才抛），初版 try 只包了 `await`、没包 `submit`，导致崩溃测试里异常直接漏出。改为 try 包住 `submit` 与 `await` 两步。
+  4. **`_build` 半成品池泄漏**：自检失败时 ProcessPoolExecutor 已建但预热抛异常，会留下管理线程与残留子进程。加 try/except 在失败时 `shutdown(wait=False, cancel_futures=True)` 并置 `_executor=None` 再抛。
+  5. **单进程路径不能"先 validate 全部再统一写"**：初版为了对称把 in-proc 也改成"先切块 validate 完、再统一写"，丢了原"逐块 validate→ingest→释放 dict→让出"的交错结构（大请求体会一次性 validate 全部才写、事件循环让出被破坏）。按决定五"不启用进程池时走现有路径"改回：in-proc 保持原交错结构、只是块大小 5000→2000 且写引擎段包进信号量；pooled 才走"子进程一次解析→主进程切块写"。
+  6. **`_stop_parse_pool` 忘了 async**：aiohttp 的 `on_shutdown` handler 会被 `await`，写成同步函数导致 `app.shutdown()` 时 `TypeError: NoneType can't be used in await`。改为 `async def`。
+- **等价性（核心，不依赖子进程，稳定跑）**：同一 body 经 `IngestService` 单进程路径（decode→validate→ingest）与进程池路径（decode→parse_body→ingest_parsed→2000 切块→invalid 放首块）写两个全新引擎，topk(url/user)/stats(distinct_users,p95)/计数器逐项相等；覆盖长尾（跨 3 块）、全随机不重复、含非法+批内重复、全非法、gzip、NDJSON。另 `test_ingest_parsed_equals_ingest` 直接对比 `ingest(parse_events)` 与 `ingest_parsed(ParsedBatch)` 两入口。
+- **正确性**：503 后重试不判重（预留在池提交之前）、BrokenProcessPool→重建→恢复、worker 数计算（核数 1/2/4 与 env 覆盖/非法/夹到 [0,3]）、自检不一致→构造期 BrokenProcessPool、close 后无残留子进程（join + is_alive）。
+- **验证**：Windows `pytest -q` **366 passed, 4 skipped, 9 deselected**（PYTHONHASHSEED=0，真子进程用例生效）；`-m slow` **9 passed**（engine 写入核心改了、保险起见跑）。基准（Windows 单次）：`bench_core 长尾` 约 29.9 万/秒（与 T10b 30.0 持平）、`bench_engine 每批 5000 engine.ingest` 2.31 μs/条（T10b 4.13、T8b 4.65——engine.ingest 拆分后更快，属本机时段波动，未变慢）。**容器实测（第四节）留待检查点二，本提交只到第三节等价性与正确性**。
+- **未做**：第四节容器实测（S1/S2/S3/S4/单核）、PROGRESS 容器数字，按 P1 时间盒留到检查点二。镜像标签 `flowlens:p1` 未动（容器阶段才用）。
