@@ -1,9 +1,10 @@
 """事件模型：JSON 解析、逐条校验、URL 归一化。
 
-解析与校验分两步：load_array（orjson 解析出顶层数组）+ validate（逐条校验与归一化），
-parse_events = validate(load_array(body))。这样大请求可以解析一次后按块逐块 validate，
-不必一次性占住事件循环。validate 返回按列存放的 EventBatch；单条不合法只计入 invalid
-并剔除，不影响同批其他事件。只有顶层不是合法 JSON 数组时才抛 BadRequest。
+解析与校验分两步：load_array（请求体解析成元素列表：顶层 JSON 数组或 NDJSON）+
+validate（逐条校验与归一化），parse_events = validate(load_array(body))。这样大请求
+可以解析一次后按块逐块 validate，不必一次性占住事件循环。validate 返回按列存放的
+EventBatch；单条不合法只计入 invalid 并剔除，不影响同批其他事件。只有既不是合法
+JSON 数组、也没有任何一行是合法 JSON（NDJSON）时才抛 BadRequest。
 """
 
 import re
@@ -65,21 +66,48 @@ class EventBatch:
 
 
 def load_array(body: bytes) -> list:
-    """orjson 解析请求体为顶层数组。顶层不是数组或 JSON 不合法时抛 BadRequest。
+    """请求体解析成元素列表：顶层是 JSON 数组时按数组解析（现有路径），否则按
+    NDJSON（每行一条）解析。两种格式都没有可解析内容时抛 BadRequest。
 
-    大请求分块处理时，先解析出数组、再按块逐块 validate，避免一次性占住事件循环。
+    NDJSON 规则：跳过开头的空白；按换行切分、跳过空行；每行 orjson 解析一个
+    元素。某一行不是合法 JSON 时放入占位值 None——由 validate 计为 invalid，
+    不影响其他行，不抛 BadRequest。单个 JSON 对象（不是数组、也不是多行）
+    就是一个单行 NDJSON 文档。整个请求体既不是数组、也没有任何一行是合法
+    JSON 时，仍抛 BadRequest。
+
+    大请求分块处理时，先解析出元素列表、再按块逐块 validate，避免一次性占住
+    事件循环。
     """
-    try:
-        arr = orjson.loads(body)
-    except orjson.JSONDecodeError:
-        raise BadRequest("请求体不是合法 JSON") from None
-    if not isinstance(arr, list):
-        raise BadRequest("顶层必须是 JSON 数组")
-    return arr
+    body = body.lstrip()
+    if body[:1] == b"[":  # JSON 数组（现有路径，行为不变）
+        try:
+            arr = orjson.loads(body)
+        except orjson.JSONDecodeError:
+            raise BadRequest("请求体不是合法 JSON") from None
+        if not isinstance(arr, list):
+            raise BadRequest("顶层必须是 JSON 数组")
+        return arr
+    # NDJSON：按换行切分（rstrip 掉行尾的 \r，兼容 \r\n），跳过空行，逐行解析。
+    # 只要有一行是合法 JSON 就接受（坏行放 None 占位、由 validate 计 invalid）；
+    # 一行都解析不出来（整个请求体没有任何合法 JSON）才抛 BadRequest。
+    out: list = []
+    any_valid = False
+    for line in body.split(b"\n"):
+        line = line.rstrip(b"\r")
+        if not line.strip():
+            continue
+        try:
+            out.append(orjson.loads(line))
+            any_valid = True
+        except orjson.JSONDecodeError:
+            out.append(None)  # 占位：validate 把它计为 invalid
+    if not any_valid:
+        raise BadRequest("请求体不是合法 JSON")
+    return out
 
 
 def parse_events(body: bytes) -> EventBatch:
-    """解析并校验一批事件。顶层不是 JSON 数组或 JSON 不合法时抛 BadRequest。"""
+    """解析并校验一批事件（JSON 数组或 NDJSON）。无可解析内容时抛 BadRequest。"""
     return validate(load_array(body))
 
 

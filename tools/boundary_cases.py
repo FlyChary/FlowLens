@@ -171,9 +171,13 @@ async def c02_bad_json(t: Target):
 
 
 async def c03_not_array(t: Target):
+    # F2 起请求体同时接受 NDJSON：单个 JSON 对象按一行 NDJSON 处理，不再是 400。
+    # 这里 {"a":1} 不是合法事件（字段不全）→ 计 1 条 invalid、202。
+    # "既不是数组也没有任何一行是合法 JSON" 才 400（见 c19 的 NDJSON 用例与 c02）。
     r = await t.post_ingest(b'{"a": 1}')
-    ok = r.status == 400 and "error" in _strict_json(await r.text())
-    return f"status={r.status}", ok
+    b = await r.json()
+    ok = r.status == 202 and b.get("invalid") == 1 and b.get("accepted") == 0
+    return f"status={r.status}, {b}", ok
 
 
 async def c04_partial_invalid(t: Target):
@@ -361,10 +365,25 @@ async def c18_sse_frames_and_reconnect(t: Target):
         resp2.close()
 
 
+async def c19_ndjson_body(t: Target):
+    # F2：请求体同时支持 NDJSON（每行一条）。混合法规行、空行、\r\n 行尾与一行
+    # 非法 JSON（应计 invalid、不影响其他行）。
+    now = now_ms()
+    import orjson
+    good = [orjson.dumps(_ev(i, "/ndj", now - 100, eid=f"ndj-{now}-{i}"))
+            for i in range(2)]
+    body = b"\r\n".join([good[0], b"", b"   ", b"not valid json here",
+                         good[1]]) + b"\r\n"
+    r = await t.post_ingest(body)
+    b = await r.json()
+    ok = r.status == 202 and b.get("accepted") == 2 and b.get("invalid") == 1
+    return f"status={r.status}, {b}", ok
+
+
 CASES: list[tuple[str, str, object]] = [
     ("空数组", "202，各计数 0", c01_empty_array),
     ("非法 JSON", "400", c02_bad_json),
-    ("顶层不是数组", "400", c03_not_array),
+    ("单个 JSON 对象（非事件）", "F2 起按一行 NDJSON 处理：202，invalid=1", c03_not_array),
     ("部分事件非法", "202，invalid=2，其余 2 条被接受", c04_partial_invalid),
     ("批内重复", "deduped=1，accepted=2", c05_intra_batch_dup),
     ("跨批重复", "第二次全部计为 deduped", c06_cross_batch_dup),
@@ -380,6 +399,7 @@ CASES: list[tuple[str, str, object]] = [
     ("不存在的路径", "404，响应体是 JSON", c16_not_found_404),
     ("区间无数据 /v1/stats", "approx_p95_bytes 为 null，严格 JSON", c17_stats_empty_p95_null),
     ("SSE 帧 + Last-Event-ID 重连", "帧格式正确；重连后 id 连续", c18_sse_frames_and_reconnect),
+    ("NDJSON 请求体（F2）", "202，accepted=2，invalid=1（空行/\\r\\n/非法行）", c19_ndjson_body),
 ]
 
 
