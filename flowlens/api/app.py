@@ -474,9 +474,14 @@ def make_engine(clock=None, parse_pool: "ParsePool | None" = None
     """按默认 Config 组装 engine + 服务（__main__ 用）。
 
     parse_pool 非 None 时 IngestService 走进程池路径（把解压后的字节交给子进程解析），
-    否则走现有单进程路径（核数不足 / FLOWLENS_PARSE_WORKERS=0）。
+    且**在途额度默认 8 MB**（pooled_pending_limit；P1c 一.3，池开时解析并行、
+    4 MB 会过早拒绝，环境变量仍可覆盖），否则走现有单进程路径（核数不足 /
+    FLOWLENS_PARSE_WORKERS=0，在途额度默认 4 MB 不变）。
     """
     from ..config import Config
+    from ..ingest import pooled_pending_limit
     from ..timewin import Clock
     engine = Engine(Config(), clock or Clock())
-    return engine, IngestService(engine, Admission(), parse_pool=parse_pool), QueryService(engine)
+    admission = Admission(limit=pooled_pending_limit()) if parse_pool is not None \
+        else Admission()
+    return engine, IngestService(engine, admission, parse_pool=parse_pool), QueryService(engine)

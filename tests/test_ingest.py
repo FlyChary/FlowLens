@@ -132,6 +132,21 @@ def test_pending_limit_env_override(monkeypatch):
     assert _read_pending_limit() == DEFAULT_PENDING_BYTES
 
 
+def test_pooled_pending_limit_env_override(monkeypatch):
+    """P1c 一.3：进程池开启时在途额度默认 8 MB；FLOWLENS_MAX_PENDING_BYTES 仍可覆盖。"""
+    from flowlens.ingest import pooled_pending_limit, POOLED_PENDING_BYTES
+    assert POOLED_PENDING_BYTES == 8 * 1024 * 1024  # 默认 8 MB
+    monkeypatch.delenv("FLOWLENS_MAX_PENDING_BYTES", raising=False)
+    assert pooled_pending_limit() == 8 * 1024 * 1024
+    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "6291456")  # 6 MB
+    assert pooled_pending_limit() == 6 * 1024 * 1024
+    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "not-a-number")
+    assert pooled_pending_limit() == 8 * 1024 * 1024
+    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "-5")
+    assert pooled_pending_limit() == 8 * 1024 * 1024
+    monkeypatch.delenv("FLOWLENS_MAX_PENDING_BYTES")
+
+
 def test_raw_budget_limit_env_override(monkeypatch):
     """FLOWLENS_RAW_BUDGET_BYTES 覆盖原始请求体额度上限：合法值生效，非法/空/非正退回默认 8 MB。"""
     from flowlens.api.app import _read_raw_budget_limit, DEFAULT_RAW_BUDGET_LIMIT

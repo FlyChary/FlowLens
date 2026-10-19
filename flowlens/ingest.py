@@ -44,6 +44,31 @@ def _read_pending_limit() -> int:
 
 
 MAX_PENDING_BYTES = _read_pending_limit()
+
+# 进程池开启时的在途额度默认值（P1c 一.3，8 MB）：池开时解析并行、在途解析增多，
+# 4 MB 会过早拒绝（P1b 里 12 万/秒档主进程 CPU 已 ~80%，在途窗口要放得下"解析比
+# 写入慢"时的排队）。依据（P1c 一.3）：同时在途的请求数 = 每秒请求数 × 每个请求
+# 占额度的时长——每秒 10 万条约 20 个请求、每个请求占额度约 0.2~0.3 秒，约 4~6
+# 个请求、3~5 MB，8 MB 留有余量。单进程路径仍用 DEFAULT_PENDING_BYTES（4 MB）。
+POOLED_PENDING_BYTES = 8 * 1024 * 1024
+
+
+def pooled_pending_limit() -> int:
+    """进程池开启时的在途额度（字节）：FLOWLENS_MAX_PENDING_BYTES 已设置且为正数
+    时用环境变量的值，否则 8 MB（P1c 一.3）。
+
+    环境变量对单进程路径与进程池路径都可覆盖（后者不设时默认 8 MB 而不是 4 MB，
+    见 POOLED_PENDING_BYTES 的依据）。
+    """
+    raw = os.environ.get("FLOWLENS_MAX_PENDING_BYTES", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return POOLED_PENDING_BYTES
 # 每次让出事件循环前写入引擎的事件数（P1 第 2 节 / 用户决定五）：从 5000 降到 2000。
 # 依据：写入引擎每条约 2.5 μs，单块 2000 条约 5 ms；混合负载下查询 p99 高的原因是
 # 查询排在多个写入块之后，缩短单块同步耗时能压低事件循环被独占的时间。
@@ -192,8 +217,9 @@ class IngestService:
         # 2. 按解压后字节数预留容量：必须在解析和任何去重之前（CLAUDE.md 规则 2）
         n_bytes = len(raw)
         if not self.admission.try_reserve(n_bytes):
-            # 第 3 级把在途上限从 4 MB 收紧到 2 MB：这期间解压后 2~4 MB 的请求预留
-            # 不下，走这里的 503（而不是 413）——有意的、暂时性的，退出降级即可成功。
+            # 第 3 级把在途上限收紧到 2 MB（单进程 4 MB→2 MB，池开 8 MB→2 MB）：
+            # 这期间超出 2 MB 的请求预留不下，走这里的 503（而不是 413）——有意的、
+            # 暂时性的，退出降级即可成功。
             if self.admission.limit < MAX_PENDING_BYTES:
                 mb = self.admission.limit // (1024 * 1024)
                 raise Overloaded(

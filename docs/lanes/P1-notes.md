@@ -218,3 +218,12 @@ base 阶段 ENV 加 `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1`
 
 空闲内存（调整 1 之上的增量）：池开 2 = **121.2 MiB**（池开 3 为 139.8，
 每个 worker 约省 18.6 MiB 工作集）；池关 70.2 不变。
+
+### 6.4 调整 3：进程池开启时在途额度默认 8 MB（ingest.pooled_pending_limit）
+
+新增 `POOLED_PENDING_BYTES = 8 MB` 与 `pooled_pending_limit()`（环境变量
+FLOWLENS_MAX_PENDING_BYTES 仍可覆盖，单进程路径不变、仍 4 MB）；`make_engine`
+在 parse_pool 非 None 时用它初始化 Admission。依据写入注释（每秒 10 万条约
+20 个请求 × 占额度 0.2~0.3 秒 ≈ 4~6 个请求、3~5 MB，8 MB 留余量）。
+测试：`test_pooled_pending_limit_env_override`（默认 8 MB、覆盖生效、非法回默认）。
+空闲内存不受影响（额度只在负载下起作用）。
