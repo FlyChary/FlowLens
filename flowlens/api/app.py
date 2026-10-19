@@ -46,7 +46,7 @@ from ..parse_pool import ParsePool
 from ..memstat import memory_bytes, memory_current_bytes, memory_limit_bytes
 from ..model import clear_norm_cache
 from ..query import QueryService
-from ..ticker import Ticker
+from ..ticker import Ticker, malloc_trim
 from . import debug
 from .params import QueryParams
 from .stream import (DEFAULT_HEARTBEAT_SEC, DEFAULT_MAX_GROUPS,
@@ -197,6 +197,14 @@ def _make_degrade_change_hook(app: web.Application):
                 admission.limit = normal_adm
                 raw_budget.limit = normal_raw
         # 第 1/2/4 级没有需要延迟执行的副作用（暂停回放/采样/拒写都是读属性即得）
+        # 进入第 3 或第 4 级的**那一刻**立即归还一次 glibc 碎片（P1c 一.4，修"降级棘轮"）：
+        # 第 4 级拒写本身不会让内存下降，负载不撤就退不出去（P1b §4）；实测一次
+        # malloc_trim 可回收数十 MB，把内存拉回退出线以下，让降级能自己退出。
+        # 条件是"级别升到 ≥3"（0/1/2→3、→4、3→4 都算进入）；在 3 与 4 之间回落
+        # （4→3）不算进入、不 trim。复用 ticker.py 的 malloc_trim（非 Linux
+        # 什么都不做、不报错）。
+        if new >= 3 and old < new:
+            malloc_trim()
 
     return on_change
 

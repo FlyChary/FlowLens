@@ -227,3 +227,24 @@ FLOWLENS_MAX_PENDING_BYTES 仍可覆盖，单进程路径不变、仍 4 MB）；
 20 个请求 × 占额度 0.2~0.3 秒 ≈ 4~6 个请求、3~5 MB，8 MB 留余量）。
 测试：`test_pooled_pending_limit_env_override`（默认 8 MB、覆盖生效、非法回默认）。
 空闲内存不受影响（额度只在负载下起作用）。
+
+### 6.5 调整 4：进入第 3/4 级那一刻立即 malloc_trim（api/app.py）
+
+`_make_degrade_change_hook` 的 on_change 里，`new >= 3 and old < new`（级别升到
+≥3：0/1/2→3、→4、3→4）时调一次 `ticker.malloc_trim()`（复用现有实现，非 Linux
+无操作）。依据：第 4 级拒写不降内存、负载不撤就退不出（P1b §4 棘轮），实测一次
+trim 可回收数十 MB。测试：`test_entering_level3_calls_malloc_trim_once`（e2e，
+可控内存读数进第 3 级 → 恰好 trim 一次、级别不变不重复调、退出后再进再调一次）。
+空闲内存不受影响（只在降级进入时触发）。
+
+**四项完成后空闲内存汇总**（256 MB 容器、空闲 5 秒、服务核 0,2,4,6）：
+
+| 配置 | 基线（调整前） | 四项调整后 | 主进程 RssAnon |
+|---|---|---|---|
+| 池关 | 71.5 MiB | **70.2 MiB** | 67.7 MiB |
+| 池开 3 个 | 141.7 MiB | **139.8 MiB**（worker 各 18.9） | 69.8 MiB |
+| 池开 2 个（新默认） | — | **121.2 MiB**（worker 各 18.9） | 69.8 MiB |
+
+（调整 1 的增量：−1.3/−1.9 MiB；调整 2 的增量：3→2 进程省 ~18.6 MiB；调整 3/4
+只在负载下起作用，空闲无变化。）
+
