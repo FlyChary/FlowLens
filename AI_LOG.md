@@ -512,3 +512,10 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - 方案：malloc_trim 放 Ticker（`_maybe_trim` 到点触发、记 `TrimStat`）+ `/healthz` 暴露；`intern.py` 提供 `Intern`（满则整体清空）+ user/url 单例 + 环境变量开关；`engine.ingest` 写桶前 `np.fromiter` 驻留 user；`model.normalize_url` 返回前驻留结果；`ingest.py` 的 `MAX_PENDING_BYTES` 改读环境变量。实验用 `SUST`（持续负载+停发尾巴）+ `S4`（全随机攻击）场景、`--extra-env` 切特性。
 - **用户修改/否决点**：① 用户确认"主线未跑实验，可以跑容器"；② 用户确认"允许改 app.py 的 `_healthz` 加 `malloc_trim` 只读字段"（原清单不允许改 app.py，例外放行）；③ 用户追加 **glibc mmap/trim 阈值对照实验（g5）** 并**批准改 Dockerfile**（例外放行）固化 `MALLOC_MMAP_THRESHOLD_=131072`/`MALLOC_TRIM_THRESHOLD_=131072`——实测峰值 −57.7 MiB、246/246s 全程第 0 级，是本组实验最大单项收益；S3/S4 不重跑、等合并后在最终代码上统一跑。
 - 消融结论：trim 是主杠杆（进 L4 拒写 → 不拒写、接受率 87.8%→100%）、驻留是次杠杆（中后段水位降 ~11 MiB、把"贴 3 级"压成"偶发尖峰"）、在途降 2 MB 无增益（保留为实验变量）。**T9b-B（缩 Bloom/Count-Min，需改冻结 config.py）不需要**——g5 已全程 0 级、无内存压力，且 C1 已证缩 Bloom/HLL 都是拿精度换内存。
+
+
+### 2026-10-19 F2 收尾：去掉 tools 里写死的本机路径（tools/profile_server.py、tools/exp/run_matrix.sh）
+
+- 背景：F2 提交前检查发现 tools 里残留本机 WSL/Windows 绝对路径，换机器（如评测方全新克隆）会失效。
+- 改动：① profile_server.py 的 REPO_ROOT 改由 Path(__file__).resolve().parents[1] 推算，OUT_ROOT 默认落到仓库内 results/T11a（新增 --out-root 覆盖），LOADGEN_PY 默认 sys.executable（新增 --loadgen-py 与 FLOWLENS_LOADGEN_PY 环境变量覆盖，路径不存在时回退当前解释器）；② run_matrix.sh 的 cd 改为 (dirname $0)/../..，venv 激活改为仅在设置 FLOWLENS_VENV 时 source，否则用当前 python。
+- 验证：git grep 复查 tools/、tests/、flowlens/、Dockerfile、run.sh、README.md 无残留执行代码级本机路径（docs/AI_LOG/注释里的历史路径保留）；pytest -q 全过（350 passed, 3 skipped, 9 deselected）。未触及热路径，未跑基准。

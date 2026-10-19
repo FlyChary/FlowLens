@@ -26,10 +26,13 @@ serve 模式（容器内运行）：
     /prof/start → 预热 → 清零计数开始测量 → 写 JSON 退出。这样测量窗口与
     loadgen 稳态对齐（预热期 loadgen 已在发，测量期 loadgen 仍在发）
 
-run 模式（WSL 宿主上运行）：
+run 模式（宿主上运行）：
   - 启动容器（serve 模式、--memory=256m、固定 1 个服务核），等 /prof/state 就绪，
     用 taskset 在压测核上后台起 loadgen，再通知 serve 开始预热/测量，docker wait
     容器退出后读取 JSON 并汇总
+  - 路径均可移植：仓库根按本文件位置推算；结果默认写仓库内 results/T11a
+    （--out-root 可覆盖）；loadgen 解释器默认当前 Python（--loadgen-py 或
+    环境变量 FLOWLENS_LOADGEN_PY 可覆盖）
 
 核的分配与 T10b 相同：服务 0 号核，压测 1-6 号核。宿主端口 9000（本机 WSL2 的
 80xx 段被保留，见 docs/PROGRESS.md 决策）。容器以非 root（uid 10001）运行，输出
@@ -700,11 +703,12 @@ def serve_entry(args) -> None:
 SVC_CORE = "0"
 LOAD_CORES = "1-6"
 HOST_PORT = 9000
-REPO_ROOT = "/mnt/d/dhy/code/flowlens"
-REPO_TOOLS = f"{REPO_ROOT}/tools"
+# 仓库根目录按本文件位置推算（tools/ 的上一级），不写死任何机器上的路径
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_TOOLS = REPO_ROOT / "tools"
 IMAGE = "flowlens:latest"
-OUT_ROOT = "/tmp/flowlens_t11a"
-LOADGEN_PY = "/home/user/flowlens-venv/bin/python"
+# 结果默认落到仓库下的 results/T11a，可用 --out-root 覆盖
+DEFAULT_OUT_ROOT = REPO_ROOT / "results" / "T11a"
 
 
 def _has(cmd):
@@ -770,8 +774,15 @@ def _wait_phase(port, want, timeout=60.0):
     return False
 
 
-def _loadgen_python():
-    return LOADGEN_PY if os.path.exists(LOADGEN_PY) else sys.executable
+def _loadgen_python(override: str | None = None) -> str:
+    """loadgen 的 Python 解释器：默认当前解释器（sys.executable）。
+
+    优先级：命令行 --loadgen-py > 环境变量 FLOWLENS_LOADGEN_PY > sys.executable。
+    覆盖的路径不存在时回退到当前解释器，保证换机器不报错。
+    """
+    candidate = (override or os.environ.get("FLOWLENS_LOADGEN_PY")
+                 or sys.executable)
+    return candidate if os.path.exists(candidate) else sys.executable
 
 
 def _parse_loadgen_summary(stdout: str) -> dict | None:
@@ -789,9 +800,9 @@ def _parse_loadgen_summary(stdout: str) -> dict | None:
     return None
 
 
-def _loadgen_base_cmd(rate: int) -> list[str]:
+def _loadgen_base_cmd(rate: int, loadgen_py: str | None = None) -> list[str]:
     """loadgen 基础命令（不含时长），压测进程固定到压测核。"""
-    loadgen = _loadgen_python()
+    loadgen = _loadgen_python(loadgen_py)
     cmd = [loadgen, "tools/loadgen.py", "--url", f"http://127.0.0.1:{HOST_PORT}",
            "--workers", "4", "--conc", "8", "--mode", "长尾",
            "--rate", str(rate), "--batch", str(RUN_BATCH)]
@@ -803,7 +814,8 @@ def _loadgen_base_cmd(rate: int) -> list[str]:
 
 
 async def _run_once(rate: int, run_name: str, query_probe: bool, warmup, measure,
-                    dry=False) -> dict:
+                    dry=False, out_root: str | None = None,
+                    loadgen_py: str | None = None) -> dict:
     """单次固定速率测量（rate / RUN_BATCH / 不 gzip）。
 
     起容器（serve）→ 等 ready → 起 loadgen（跑 启动延迟+warmup+measure+余量）→
@@ -813,7 +825,7 @@ async def _run_once(rate: int, run_name: str, query_probe: bool, warmup, measure
     """
     import uuid
     cname = f"flowlens-probe-{uuid.uuid4().hex[:8]}"
-    outdir = os.path.join(OUT_ROOT, run_name)
+    outdir = os.path.join(out_root or DEFAULT_OUT_ROOT, run_name)
     os.makedirs(outdir, exist_ok=True)
     try:
         os.chmod(outdir, 0o777)
@@ -827,7 +839,7 @@ async def _run_once(rate: int, run_name: str, query_probe: bool, warmup, measure
                   "--memory=256m", "--memory-swap=256m",
                   f"--cpuset-cpus={SVC_CORE}",
                   "-p", f"{HOST_PORT}:8080",
-                  "-v", f"{REPO_TOOLS}:/probe:ro",
+                  "-v", f"{REPO_TOOLS.as_posix()}:/probe:ro",
                   "-v", f"{outdir}:/out",
                   IMAGE,
                   "python", "/probe/profile_server.py", "serve",
@@ -853,7 +865,7 @@ async def _run_once(rate: int, run_name: str, query_probe: bool, warmup, measure
                PYTHONHASHSEED="0")
     proc = None
     try:
-        cmd = _loadgen_base_cmd(rate) + ["--duration", str(loadgen_dur)]
+        cmd = _loadgen_base_cmd(rate, loadgen_py) + ["--duration", str(loadgen_dur)]
         print(f"[run] {run_name} rate={rate} batch={RUN_BATCH} "
               f"loadgen_dur={loadgen_dur}s", flush=True)
         if not dry:
@@ -892,27 +904,32 @@ async def _run_once(rate: int, run_name: str, query_probe: bool, warmup, measure
     return report
 
 
-async def run_main(warmup, measure, dry=False, only: str | None = None) -> None:
+async def run_main(warmup, measure, dry=False, only: str | None = None,
+                   out_root: str | None = None,
+                   loadgen_py: str | None = None) -> None:
     """跑 T11a-2 的两组（10 万/秒、6 万/秒），依次各起一个全新容器。
 
     每组独立：全新容器（serve）、全新 loadgen、结果各自落盘。--only 可只跑其中
-    一组（按 run_name 前缀过滤），便于单独重跑某组。
+    一组（按 run_name 前缀过滤），便于单独重跑某组。out_root 为 None 时用
+    默认的仓库内 results/T11a。
     """
+    out_root = out_root or str(DEFAULT_OUT_ROOT)
     if not dry:
         chk = _run(["docker", "image", "inspect", IMAGE])
         if chk.returncode != 0:
             print(f"[run] 镜像 {IMAGE} 不存在，构建中（--target app）...", flush=True)
             b = _run(["docker", "build", "--target", "app", "-t", IMAGE,
-                      REPO_ROOT])
+                      str(REPO_ROOT)])
             if b.returncode != 0:
                 raise RuntimeError(f"构建失败: {b.stderr[-500:]}")
     runs = [(n, r, q) for n, r, q in RUNS if only is None or n == only]
-    os.makedirs(OUT_ROOT, exist_ok=True)
+    os.makedirs(out_root, exist_ok=True)
     for run_name, rate, query_probe in runs:
-        r = await _run_once(rate, run_name, query_probe, warmup, measure, dry=dry)
+        r = await _run_once(rate, run_name, query_probe, warmup, measure, dry=dry,
+                            out_root=out_root, loadgen_py=loadgen_py)
         status = "OK" if "error" not in r else r["error"][:120]
         print(f"[run] {run_name} 完成: {status}", flush=True)
-        out_path = os.path.join(OUT_ROOT, f"{run_name}.json")
+        out_path = os.path.join(out_root, f"{run_name}.json")
         Path(out_path).write_text(json.dumps(r, ensure_ascii=False, indent=2),
                                   encoding="utf-8")
         print(f"[run] 结果写入 {out_path}", flush=True)
@@ -932,6 +949,11 @@ def main() -> None:
     p.add_argument("--only", default=None,
                    choices=[n for n, _, _ in RUNS],
                    help="run：只跑指定的一组（默认两组都跑）")
+    p.add_argument("--out-root", default=None,
+                   help=f"run：结果根目录（默认 {DEFAULT_OUT_ROOT}）")
+    p.add_argument("--loadgen-py", default=None,
+                   help="run：loadgen 用的 Python 解释器"
+                        f"（默认当前解释器，也可用环境变量 FLOWLENS_LOADGEN_PY）")
     p.add_argument("--dry-run", action="store_true", help="run：只打印，不真正跑")
     args = p.parse_args()
 
@@ -941,7 +963,8 @@ def main() -> None:
         serve_entry(args)
     else:
         asyncio.run(run_main(args.warmup, args.measure, dry=args.dry_run,
-                             only=args.only))
+                             only=args.only, out_root=args.out_root,
+                             loadgen_py=args.loadgen_py))
 
 
 if __name__ == "__main__":

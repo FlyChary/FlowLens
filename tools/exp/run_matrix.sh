@@ -2,14 +2,18 @@
 # 在 WSL(Linux) 里跑对比矩阵：对每个 lingering_time 值(0/1/10)，启动服务端，
 # 用三种客户端各测 20 次，汇总 413 稳定性 / 连接被重置数 / 耗时 / 拒绝后新连接可用性。
 # 用法: run_matrix.sh
-# 依赖: ~/flowlens-venv 已装 numpy/orjson/aiohttp；big5mb.bin 已生成。
+# 依赖: 当前环境的 python 已装 numpy/orjson/aiohttp（或设置 FLOWLENS_VENV 指向
+# 一个 venv，脚本会 source 其 bin/activate）；big5mb.bin 运行时自动生成。
 set -u
-cd /mnt/d/dhy/code/flowlens
+cd "$(dirname "$0")/../.."
 # WSL 有系统级 HTTP 代理(127.0.0.1:7890)：清掉，并显式让 localhost/127.0.0.1 不走代理，
 # 保证客户端直连服务端、测到的是真实 TCP 行为（代理会在大 body 转发时偶发 502，污染结果）
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
 export NO_PROXY=localhost,127.0.0.1
-source ~/flowlens-venv/bin/activate
+# 可选 venv：仅在设置了 FLOWLENS_VENV 时激活，否则直接用当前环境的 python
+if [ -n "${FLOWLENS_VENV:-}" ]; then
+  source "$FLOWLENS_VENV/bin/activate"
+fi
 BIG=tools/exp/big5mb.bin
 OUT=tools/exp/results
 mkdir -p "$OUT"
