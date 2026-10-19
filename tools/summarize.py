@@ -215,6 +215,24 @@ def _read_accuracy(dirpath: str) -> list:
     return lines
 
 
+def summarize_sustained(d: dict, out: list) -> None:
+    out.append(f"\n### {d.get('scenario')}（{d.get('mode')}，{d.get('rate')} 事件/秒，"
+               f"{d.get('duration_s')}s + 停发 {d.get('tail_s')}s）\n")
+    out += _mem_line(d.get("memory", {}))
+    # 每分钟一行：工作集峰值 MiB / 降级级别 / 接受率 / trim 累计调用与耗时
+    pm = d.get("per_minute")
+    if pm:
+        rows = [[r["minute"], _f(r.get("ws_peak_mb")), r.get("level"),
+                 _fmt_pct(r.get("accept_ratio")), r.get("trim_call_count"),
+                 _fmt_ms(r.get("trim_total_ms"))] for r in pm]
+        out.append(_md_table(
+            ["分钟", "工作集峰值 MiB", "降级", "接受率", "trim 累计次数", "trim 累计耗时 ms"],
+            rows))
+    peak = d.get("memory", {}).get("peak_degrade_level", 0)
+    if peak >= 3:
+        out.append(f"- **⚠ 该负载下进入第 {peak} 级**（峰值工作集见上）\n")
+
+
 def summarize_s5(d: dict, out: list) -> None:
     out.append(f"\n### S5 过载与恢复（过载 {d.get('overload_rate')} 事件/秒）\n")
     out.append(f"- 恢复时间（停发后回到 0 级）：**{d.get('recover_seconds')} 秒**\n")
@@ -269,6 +287,8 @@ def main() -> None:
             summarize_s2(s, out)
         elif sc == "S3":
             summarize_s3(s, out, d)
+        elif sc in ("S4", "SUSTAINED"):
+            summarize_sustained(s, out)
         elif sc == "S5":
             summarize_s5(s, out)
         else:

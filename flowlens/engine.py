@@ -17,6 +17,7 @@ from .degrade import DegradeController
 from .dims import ALL_DIMS, Dim
 from .errors import TooOld
 from .hashing import key_hashes
+from .intern import user_intern
 from .model import EventBatch
 from .ring import Bucket, Ring
 from .segtree import Cover, LeafInput, Tree
@@ -225,6 +226,10 @@ class Engine:
                 a_ts2 = ts[k_idx]
                 # dtype=object：定长字符串数组会把短串补 '\x00'，既改变哈希值，又比 object 慢约 7 倍
                 users = np.asarray(batch.users, dtype=object)[k_idx]
+                if user_intern is not None:
+                    # 写入秒桶前对 user_id 驻留（C3）：相同内容返回同一字符串对象，
+                    # 长尾流量下各秒桶、叶子、节点共享同一份，减少重复对象
+                    users = np.fromiter((user_intern.intern(u) for u in users), dtype=object)
                 urls = np.asarray(batch.urls, dtype=object)[k_idx]
                 # 采样按 event_id 哈希取模判取舍（确定性、与时间无关）：同一事件无论
                 # 重试多少次、何时重试，取舍都一致；与"这次是不是重复"解耦。哈希直接

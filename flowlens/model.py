@@ -13,6 +13,7 @@ import numpy as np
 import orjson
 
 from .errors import BadRequest
+from .intern import url_intern
 
 # event_id 长度上限（字节），超过视为非法
 EVENT_ID_MAX_BYTES = 256
@@ -151,12 +152,19 @@ def normalize_url(raw: str) -> str:
 
     路径部分超过 NORM_CACHE_MAX_KEY_LEN 字符时照常归一化，但不写入缓存
     （键是无界的路径串，缓存它们可能占用大量内存）。
+
+    返回前对归一化结果做驻留（intern.url_intern）：路径带不同 ID 的原始 URL
+    （如 /order/1 与 /order/2）归一化后内容相同，但若不驻留每次都会生成新的
+    字符串对象，各秒桶、叶子、节点里会存很多份。驻留只改"是否同一对象"，
+    不改内容，归一化逻辑本身不变。
     """
     head = _strip_query_fragment(raw)
     hit = _norm_cache.get(head)
     if hit is not None:
         return hit
     out = _normalize_url(head)
+    if url_intern is not None:
+        out = url_intern.intern(out)
     if len(head) <= NORM_CACHE_MAX_KEY_LEN:
         if len(_norm_cache) >= NORM_CACHE_CAP:
             _norm_cache.clear()

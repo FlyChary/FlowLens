@@ -358,6 +358,15 @@ async def _healthz(request: web.Request) -> web.Response:
         "invalid": c.invalid,
         "tick_errors": t.error_count,
         "last_tick_ms": t.last_tick_duration_ms,
+        # 定期 malloc_trim 统计（C3）：非 Linux 上 enabled 为 False、call_count 恒 0
+        "malloc_trim": {
+            "enabled": t.trim.enabled,
+            "period_sec": t.trim.period_sec,
+            "call_count": t.trim.call_count,
+            "total_ms": round(t.trim.total_ms, 3),
+            "last_ms": round(t.trim.last_ms, 3),
+            "last_freed_mb": round(t.trim.last_freed_bytes / 1048576, 2),
+        },
         "sse": mgr.stats(),
     })
 
