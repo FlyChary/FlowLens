@@ -19,7 +19,15 @@ FROM python:3.12-slim AS base
 WORKDIR /app
 ENV PYTHONHASHSEED=0 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MALLOC_MMAP_THRESHOLD_=131072 \
+    MALLOC_TRIM_THRESHOLD_=131072
+# 固定 glibc 的"大块"门槛与 trim 触发门槛为 128 KB（不随每次大块归还自动上调）。
+# 依据（C3 g5 对照实验，docs/lanes/C3-report.md §二-B）：默认门槛下，几轮归还后
+# ~650 KB 的请求体改从普通堆分配、用完变成 glibc 保留的碎片，满载工作集峰值
+# 236.8 MiB、中后段贴第 3/4 级、4.6% 请求被拒；固定 128 KB 后这类大块走 mmap、
+# free 即还 OS，峰值 179.1 MiB（−57.7，−24%）、32 连接满载 5 分钟全程第 0 级、
+# 接受率 100%。
 # PIP_INDEX_URL 默认为空；构建方可用 --build-arg PIP_INDEX_URL=... 指定包源（不写死
 # 任何国内源或代理地址，保持镜像可移植）。有值时追加 --index-url 传给 pip。
 ARG PIP_INDEX_URL

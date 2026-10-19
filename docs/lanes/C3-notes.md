@@ -92,8 +92,57 @@ RssAnon 随时间、降级级别、接受率、trim 回收量（/healthz 的 mal
 3. **在途额度可配**：DESIGN 把在途上限 4 MB 写死。需注明可用
    `FLOWLENS_MAX_PENDING_BYTES` 覆盖（实验/调参用）。
 4. **/healthz 的 malloc_trim 字段**：响应字段清单补一条。
+5. **glibc mmap/trim 阈值（已固化进镜像，DESIGN 待补）**：C3 实测
+   `MALLOC_MMAP_THRESHOLD_=131072` + `MALLOC_TRIM_THRESHOLD_=131072` 使满载峰值
+   −57.7 MiB、全程第 0 级。用户已批准在 Dockerfile base 阶段加这两个 ENV（本支线
+   例外放行，注释写明 g5 依据）；`docker run` 不显式 `-e` 时继承镜像 ENV，评测容器
+   自动生效。DESIGN 需补一句"部署时固定 glibc 大块/trim 门槛为 128 KB（Dockerfile
+   ENV）"及依据。
 
-## 四-B、最终结果摘要（实验已全部跑完）
+## 四-A、追加对照：glibc mmap/trim 阈值（用户追加指令，2026-10-19）
+
+用户在首份汇报后追加一组对照：在 g3（trim + 驻留）基础上，容器加
+`-e MALLOC_MMAP_THRESHOLD_=131072 -e MALLOC_TRIM_THRESHOLD_=131072`。依据（用户）：
+glibc 默认会在每次归还大块后自动调高"大块"门槛，几轮之后 ~650 KB 的请求体就改从
+普通堆分配、用完变碎片；固定门槛 128 KB 让这类大块走 mmap、用完立即归还 OS。
+只改 docker run 参数，不改服务代码（但监控侧补了 RssAnon 逐秒采样 + /healthz 的
+trim 累计回收 total_freed_mb，见"四-C"）。
+
+- **S3 暂停**：用户明确"内存问题解决后再做"。已提交的 g3 配置 S3 数据（200/200 有效、
+  召回 1.0）保留作参考；mmap 配置下的 S3 不做。
+- 旧 g3 的 timeline 没有 RssAnon 采样 → **同批重跑 g3_recheck（无变量）** 作对照，
+  g5_mmap（带变量）同场同机，消除时段差异。两组参数与 C2 基线相同（长尾 3 万/秒、
+  每批 5000、4 进程 × 8 并发、5 分钟 + 停发 60s）。结果 `results/c3/g3_recheck`、
+  `results/c3/g5_mmap`。
+
+**结果（2026-10-19 跑完）**：
+- g3_recheck：WS 78.4/**236.8**/175.2 MiB，逐秒 0 级 85s / 3 级 138s / 4 级 24s，
+  接受率 95.4%；trim 33 次累计回收 **972.8 MiB**（churn 一直在被 glibc 从普通堆留）。
+- g5_mmap：WS 68.8/**179.1**/144.7 MiB，**逐秒 0 级 246s（100% 全程第 0 级）**，
+  接受率 100%；RssAnon 峰 165.9；trim 34 次累计只回收 **31.9 MiB**（churn 消失）。
+- **峰值 −57.7 MiB（−24%）、"贴 3/4 级"变"全程 0 级"**——本组实验最大单项收益。
+  机制印证用户判断：固定 128 KB 门槛后 ~650 KB 请求体走 mmap、free 即还 OS。
+- 推荐组合升级为 **g5 = trim + 驻留 + 两个 mmap/trim 环境变量**；**T9b-B 不需要**
+  （无内存压力可解决，且 C1 已证缩 Bloom/HLL 都是拿精度换内存）。
+- **待办（内存问题解决后）**：g5 配置下重做 S3（全程 0 级下的最终精度数据）。
+- **ENV 固化（用户已批准，本支线改 Dockerfile）**：用户批准在 base 阶段加
+  `ENV MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072`（注释写明 g5 依据）。
+  镜像 ENV 会被 `docker run` 继承（不显式 `-e` 也生效），所以评测容器自动带上，收益固化。
+  `docker build --target test` 复验通过。**S3/S4 不重跑**——用户指令：等合并后在最终
+  代码上统一跑。
+
+## 四-C、工具补充（为对照实验）
+
+- `tools/experiments.py`：`_monitor` 每秒多采服务进程 RssAnon/VmRSS
+  （docker 目标 `docker exec cat /proc/1/status`、local 目标宿主 /proc/<pid>/status），
+  timeline 加 `rss_anon_mb`/`vm_rss_mb` 两列；`run_sustained` summary 加
+  `rss_anon`（起始/峰值/结束）、`trim_freed_total_mb`；per_minute 加
+  `rss_anon_peak_mb`、`trim_freed_total_mb`。
+- `flowlens/ticker.py` TrimStat 加 `total_freed_bytes`（累计回收）；
+  `flowlens/api/app.py` /healthz 的 malloc_trim 加 `total_freed_mb`。
+  均向后兼容（旧数据读不到这些字段按 0/None 处理）。
+
+## 四-B、最终结果摘要（首轮实验跑完）
 
 - **四组消融**（长尾 3 万/秒 × 5 分钟，256 MB 容器，同机对照）：
   - g1 基线：峰值 233.4 MiB、**进 L4 拒写**、接受率 87.8%（复现 C2 的 232.6/101s 进 L3、拒写行为）
@@ -105,9 +154,12 @@ RssAnon 随时间、降级级别、接受率、trim 回收量（/healthz 的 mal
   行为，印证"随机不比长尾更糟"——吃内存的成分都与分布无关）。
 - **S3 精度**（g3 配置，200/200 全有效）：召回 url/user 均 **1.000**、计数误差 0.05%/0.09%、
   落界率 100%、去重 0.92%、p95 0.14%——**T9b 首份有效精度数据**（C2 那次全落降级期无效）。
-- **推荐**：g3 = trim(10s) + 驻留(user 8192/url 32768)。**T9b-B 不作首选**（缩 Bloom FPR×56、
-  缩 HLL 误差翻倍，都是拿 S3 刚验证的精度换内存）；要彻底稳 0 级优先客户端降并发/单批
-  1000/调 M_MMAP_THRESHOLD（不碰冻结模块）。是否进 T9b-B 交用户决定。
+- **首轮推荐**：g3 = trim(10s) + 驻留(user 8192/url 32768)。**T9b-B 不作首选**（缩 Bloom
+  FPR×56、缩 HLL 误差翻倍，都是拿 S3 刚验证的精度换内存）；要彻底稳 0 级优先客户端降并发/
+  单批 1000/调 M_MMAP_THRESHOLD（不碰冻结模块）。是否进 T9b-B 交用户决定。
+- **追加对照后（mmap，用户追加）**：推荐升级为 **g5 = g3 + MALLOC_MMAP_THRESHOLD_=131072 +
+  MALLOC_TRIM_THRESHOLD_=131072**（峰值 −57.7 MiB、246/246s 全程 0 级、接受率 100%）。
+  **T9b-B 不需要**。待办：g5 下重做 S3（内存问题解决后）；ENV 固化进 Dockerfile 留给主线。
 
 ## 五、AI 使用记录
 
@@ -121,5 +173,7 @@ RssAnon 随时间、降级级别、接受率、trim 回收量（/healthz 的 mal
   - 用户确认"主线未跑实验，可以跑容器"。
   - 用户确认"允许改 app.py 的 _healthz 加 malloc_trim 只读字段"（原清单不允许改
     app.py，属支线规则外的必要放行）。
+  - 用户追加 mmap 阈值对照实验（g5），并**批准改 Dockerfile**（原清单不允许，例外
+    放行）固化两个 glibc ENV；S3/S4 不重跑、等合并后在最终代码上统一跑。
 - 若后续审查认为驻留应只 user 侧（C1 的原始建议）而非 user+url 两侧，url 侧的
   `url_intern` 可在 `FLOWLENS_INTERN_URL_CAP=0` 下关闭，不影响 user 侧。

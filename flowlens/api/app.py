@@ -366,6 +366,7 @@ async def _healthz(request: web.Request) -> web.Response:
             "total_ms": round(t.trim.total_ms, 3),
             "last_ms": round(t.trim.last_ms, 3),
             "last_freed_mb": round(t.trim.last_freed_bytes / 1048576, 2),
+            "total_freed_mb": round(t.trim.total_freed_bytes / 1048576, 2),
         },
         "sse": mgr.stats(),
     })
