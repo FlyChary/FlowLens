@@ -528,3 +528,8 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - **正确性**：503 后重试不判重（预留在池提交之前）、BrokenProcessPool→重建→恢复、worker 数计算（核数 1/2/4 与 env 覆盖/非法/夹到 [0,3]）、自检不一致→构造期 BrokenProcessPool、close 后无残留子进程（join + is_alive）。
 - **验证**：Windows `pytest -q` **366 passed, 4 skipped, 9 deselected**（PYTHONHASHSEED=0，真子进程用例生效）；`-m slow` **9 passed**（engine 写入核心改了、保险起见跑）。基准（Windows 单次）：`bench_core 长尾` 约 29.9 万/秒（与 T10b 30.0 持平）、`bench_engine 每批 5000 engine.ingest` 2.31 μs/条（T10b 4.13、T8b 4.65——engine.ingest 拆分后更快，属本机时段波动，未变慢）。**容器实测（第四节）留待检查点二，本提交只到第三节等价性与正确性**。
 - **未做**：第四节容器实测（S1/S2/S3/S4/单核）、PROGRESS 容器数字，按 P1 时间盒留到检查点二。镜像标签 `flowlens:p1` 未动（容器阶段才用）。
+
+### 2026-10-19 支线 P1c：空闲内存基线（tools/idle_mem.py 新建）
+
+- 按 P1c 一的要求先测基线（池关 / 池开 3，256 MB 容器、空闲 5 秒）：池关工作集 71.5 MiB、池开 3 为 141.7 MiB，每个解析进程 RssAnon 约 18.8 MB（工作集增量约 23.5 MB/个，含碎片），与背景"约 25 MB"一致。
+- 测量工具 `tools/idle_mem.py`（WSL 宿主运行，与 s1_measure 同口径读宿主 /proc，不进容器）：主进程与各解析进程 RssAnon + /healthz 工作集/原始读数，断言解析进程数与期望一致。
