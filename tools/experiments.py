@@ -68,6 +68,9 @@ S5_OBSERVE_SEC = 60
 # P1（多核）由 --svc-cpus/--load-cpus/--load-workers 覆盖（main() 里改这几个全局）。
 SVC_CORE = "0"
 LOAD_CORES = "1-6"
+# 服务容器是否加 --cpuset-cpus（§7 多核对照：False = 不加、让服务看到宿主全部核，
+# 与评测方最可能的启动方式一致）。main() 里由 --no-cpuset 置 False。
+NO_CPUSET = False
 AUX_CORE = "7"
 LOAD_WORKERS = 4
 
@@ -137,7 +140,7 @@ def mem_timeline(healthz_samples: list[dict]) -> dict:
 
     供汇报用（T10b 追加要求）：每个场景的工作集随时间变化 + 降级级别是否变化。
     """
-    ws, cur, levels = [], [], []
+    ws, cur, levels, threads = [], [], [], []
     for s in healthz_samples:
         hz = s.get("healthz") or {}
         if "memory_bytes" in hz:
@@ -147,6 +150,8 @@ def mem_timeline(healthz_samples: list[dict]) -> dict:
         lvl = (hz.get("degrade") or {}).get("level")
         if lvl is not None:
             levels.append(lvl)
+        if s.get("threads") is not None:
+            threads.append(s["threads"])
     def _trip(arr):
         if not arr:
             return {"start_mb": None, "peak_mb": None, "end_mb": None}
@@ -158,6 +163,8 @@ def mem_timeline(healthz_samples: list[dict]) -> dict:
         "degrade_changed": len(set(levels)) > 1,
         "degrade_levels_seen": sorted(set(levels)) if levels else [],
         "peak_degrade_level": max(levels) if levels else 0,
+        # 主进程线程数（诊断可见核数→OpenBLAS 线程→内存）
+        "threads_peak": max(threads) if threads else None,
     }
 
 
@@ -317,10 +324,11 @@ async def start_service(target: str, port: int, image: str, workdir: str,
         env_args = []
         for k, v in extra_env.items():
             env_args += ["-e", f"{k}={v}"]
+        cpuset_args = [] if NO_CPUSET else [f"--cpuset-cpus={SVC_CORE}"]
         proc = await asyncio.create_subprocess_exec(
             "docker", "run", "--rm", "-d", "--name", name,
             "--memory=256m", "--memory-swap=256m",
-            f"--cpuset-cpus={SVC_CORE}",
+            *cpuset_args,
             *env_args,
             "-p", f"{port}:8080", image,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -704,6 +712,13 @@ async def sample_service_rss(svc: Service) -> dict:
                 d[line.split()[0].rstrip(":")] = int(line.split()[1]) * 1024
             except (ValueError, IndexError):
                 pass
+        elif line.startswith("Threads:"):
+            # 主进程线程数（/proc/<pid>/status）。诊断"可见核数→内存"用：
+            # OpenBLAS 在 import 时按可见核数建线程，Threads 是那条链的直接读数。
+            try:
+                d["Threads"] = int(line.split()[1])
+            except (ValueError, IndexError):
+                pass
     return d
 
 
@@ -798,6 +813,7 @@ async def _monitor(svc: Service, stop_event: asyncio.Event,
                             "healthz": hz, "svc_cpu_pct": cpu,
                             "rss_anon_bytes": rss.get("RssAnon"),
                             "vm_rss_bytes": rss.get("VmRSS"),
+                            "threads": rss.get("Threads"),
                             "procs": procs})
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1.0)
@@ -1140,14 +1156,19 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
                         image: str, workdir: str, batch: int,
                         rates: list[int], s1_level_sec: int,
                         mode: str, pip_index: str | None,
-                        results_root: str, extra_env: dict | None = None) -> dict:
+                        results_root: str, extra_env: dict | None = None,
+                        no_build: bool = False) -> dict:
     rng = __import__("numpy").random.default_rng(1234)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     root = os.path.join(results_root, stamp)
-    cpu_alloc = {"service": SVC_CORE, "loadgen": LOAD_CORES, "aux": AUX_CORE}
+    cpu_alloc = {"service": SVC_CORE if not NO_CPUSET else "no-cpuset",
+                 "loadgen": LOAD_CORES, "aux": AUX_CORE}
     out: dict = {}
     if target == "docker":
-        await _build_image(image, pip_index)
+        if no_build:
+            print(f"[experiments] --no-build：不重建，直接用现成镜像 {image}", flush=True)
+        else:
+            await _build_image(image, pip_index)
 
     s1_plain_max = None
     if "S1" in names:
@@ -1286,9 +1307,17 @@ def main() -> None:
                         "开/关 malloc_trim（FLOWLENS_MALLOC_TRIM_SEC）、驻留"
                         "（FLOWLENS_INTERN_USER_CAP/URL_CAP=0）、在途额度"
                         "（FLOWLENS_MAX_PENDING_BYTES）。")
+    p.add_argument("--no-cpuset", action="store_true",
+                   help="服务容器不加 --cpuset-cpus（让服务看到宿主全部核；"
+                        "§7 多核对照用，与评测方最可能的启动方式一致）。")
+    p.add_argument("--no-build", action="store_true",
+                   help="不重建镜像，直接用 --image 指定的现成镜像（§7 用"
+                        "预先从 origin/main 构建的 flowlens:submitted）。")
     args = p.parse_args()
 
     # P1 多核核分配：把命令行覆盖写进全局（start_service/_loadgen_args 在调用时读）
+    global NO_CPUSET
+    NO_CPUSET = args.no_cpuset
     SVC_CORE = args.svc_cpus
     LOAD_CORES = args.load_cpus
     if args.load_workers > 0:
@@ -1309,7 +1338,7 @@ def main() -> None:
         args.scenarios, target=args.target, port=args.port, image=args.image,
         workdir=workdir, batch=args.batch, rates=args.s1_rates,
         s1_level_sec=args.s1_level_sec, mode=args.mode, pip_index=args.pip_index,
-        results_root=args.results, extra_env=extra_env))
+        results_root=args.results, extra_env=extra_env, no_build=args.no_build))
     dt = time.monotonic() - t0
     print(f"\n[experiments] 完成，用时 {dt:.0f}s，结果目录：{result['root']}", flush=True)
     for name, r in result["results"].items():
