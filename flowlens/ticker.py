@@ -85,6 +85,7 @@ class TrimStat:
     period_sec: float                   # 触发间隔（秒）
     call_count: int = 0                 # 累计调用次数
     total_ms: float = 0.0               # 累计调用耗时（毫秒）
+    total_freed_bytes: int = 0          # 累计回收的字节数（非 Linux 恒 0）
     last_ms: float = 0.0                # 最近一次调用耗时（毫秒）
     last_freed_bytes: int = 0           # 最近一次回收的字节数（非 Linux 恒 0）
 
@@ -205,6 +206,7 @@ class Ticker:
         self.trim.last_ms = dt_ms
         if ok:
             self.trim.last_freed_bytes = max(0, before - after)
+            self.trim.total_freed_bytes += self.trim.last_freed_bytes
 
     async def _wait_until(self, at: float) -> None:
         """睡到绝对时刻 at（已过期则只让出一次）；期间若 stop() 被调用立即返回。"""

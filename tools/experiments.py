@@ -171,13 +171,17 @@ def merge_timeline(healthz_samples: list[dict], loadgen_seconds: list[dict]
      "healthz": {...}}（该秒的 healthz 完整内容；缺则 None）。
     """
     hz_by_sec = {s["t"] // 1000: s.get("healthz") for s in healthz_samples}
+    rss_by_sec = {s["t"] // 1000: s for s in healthz_samples}
     secs = sorted(set(hz_by_sec) | {d["t"] for d in loadgen_seconds})
     lg_by_sec = {d["t"]: d for d in loadgen_seconds}
     out = []
     for sec in secs:
         lg = lg_by_sec.get(sec)
+        src = rss_by_sec.get(sec) or {}
         row = {"t": sec, "sent": 0, "accepted": 0, "rejected": 0, "errors": 0,
                "lat_p50_ms": None, "lat_p95_ms": None, "lat_p99_ms": None,
+               "rss_anon_mb": mem_mb(src.get("rss_anon_bytes")),
+               "vm_rss_mb": mem_mb(src.get("vm_rss_bytes")),
                "healthz": hz_by_sec.get(sec)}
         if lg is not None:
             row["sent"] = lg["sent"]; row["accepted"] = lg["accepted"]
@@ -610,9 +614,34 @@ def write_summary(outdir: str, obj: dict) -> None:
 
 # ===================== 场景 =====================
 
+async def sample_service_rss(svc: Service) -> dict:
+    """服务进程的 RssAnon / VmRSS（/proc/<pid>/status）。
+
+    docker：容器内 PID 1 就是服务，`docker exec cat /proc/1/status`（与
+    sample_service_cpu 的 cgroup 采样同一通道）；local：宿主 /proc/<svc.pid>/status。
+    读不到返回 {}。用于"工作集（cgroup 口径）+ 进程堆（RssAnon）"双口径对照。
+    """
+    if svc.kind == "docker" and svc.container:
+        out = await _run(["docker", "exec", svc.container, "cat", "/proc/1/status"])
+    else:
+        try:
+            with open(f"/proc/{svc.pid}/status") as f:
+                out = f.read()
+        except OSError:
+            return {}
+    d = {}
+    for line in out.splitlines():
+        if line.startswith(("RssAnon:", "VmRSS:")):
+            try:
+                d[line.split()[0].rstrip(":")] = int(line.split()[1]) * 1024
+            except (ValueError, IndexError):
+                pass
+    return d
+
+
 async def _monitor(svc: Service, stop_event: asyncio.Event,
                    samples: list[dict]) -> None:
-    """每秒采样 /healthz 与服务 CPU。"""
+    """每秒采样 /healthz、服务 CPU 与服务进程 RssAnon/VmRSS。"""
     import aiohttp
     last = {}
     async with aiohttp.ClientSession(
@@ -620,8 +649,11 @@ async def _monitor(svc: Service, stop_event: asyncio.Event,
         while not stop_event.is_set():
             st, _, hz = await _get(ses, svc.url + "/healthz")
             cpu = await sample_service_cpu(svc, last)
+            rss = await sample_service_rss(svc)
             samples.append({"t": int(time.time() * 1000),
-                            "healthz": hz, "svc_cpu_pct": cpu})
+                            "healthz": hz, "svc_cpu_pct": cpu,
+                            "rss_anon_bytes": rss.get("RssAnon"),
+                            "vm_rss_bytes": rss.get("VmRSS")})
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -864,6 +896,8 @@ async def run_sustained(svc: Service, outdir: str, *, rate: int,
                 continue
             ws = [(s.get("healthz") or {}).get("memory_bytes") for s in win]
             ws = [w for w in ws if w is not None]
+            rss = [s.get("rss_anon_bytes") for s in win]
+            rss = [r for r in rss if r is not None]
             lvl = (win[-1].get("healthz") or {}).get("degrade", {}).get("level", 0)
             acc = [s.get("accepted", 0) for s in win]
             sent = [s.get("sent", 0) for s in win]
@@ -871,18 +905,30 @@ async def run_sustained(svc: Service, outdir: str, *, rate: int,
             per_minute.append({
                 "minute": m,
                 "ws_peak_mb": mem_mb(max(ws)) if ws else None,
+                "rss_anon_peak_mb": mem_mb(max(rss)) if rss else None,
                 "level": lvl,
                 "accepted": sum(acc), "sent": sum(sent),
                 "accept_ratio": round(sum(acc) / sum(sent), 4) if sum(sent) else None,
                 "trim_call_count": tm.get("call_count", 0),
                 "trim_total_ms": tm.get("total_ms", 0.0),
+                "trim_freed_total_mb": tm.get("total_freed_mb", 0.0),
             })
+    # RssAnon（进程堆，/proc 口径）的起始/峰值/结束，与工作集（cgroup 口径）对照
+    rss_anon = [s["rss_anon_bytes"] for s in samples
+                if s.get("rss_anon_bytes") is not None]
+    rss_trip = ({"start_mb": mem_mb(rss_anon[0]), "peak_mb": mem_mb(max(rss_anon)),
+                 "end_mb": mem_mb(rss_anon[-1])} if rss_anon else
+                {"start_mb": None, "peak_mb": None, "end_mb": None})
+    trim_freed_mb = [(s.get("healthz") or {}).get("malloc_trim", {}).get("total_freed_mb", 0.0)
+                     for s in samples if (s.get("healthz") or {}).get("malloc_trim")]
     summary = {
         "scenario": "SUSTAINED", "rate": rate, "mode": mode,
         "duration_s": duration, "tail_s": tail_sec,
         "load": lg_summary, "memory": mem_timeline(samples),
+        "rss_anon": rss_trip,
         "trim_calls_total": trim_calls[-1] if trim_calls else 0,
         "trim_total_ms": trim_total_ms[-1] if trim_total_ms else 0.0,
+        "trim_freed_total_mb": trim_freed_mb[-1] if trim_freed_mb else 0.0,
         "per_minute": per_minute,
         "degrade_level_seq": level_seq,
     }
