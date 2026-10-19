@@ -41,7 +41,7 @@ async def _serve_and_run(run):
 
 
 def test_all_boundary_cases():
-    """18 条边界用例（与 tools/selftest.py 同一套 CASES）。"""
+    """19 条边界用例（与 tools/selftest.py 同一套 CASES，F2 加 NDJSON）。"""
 
     async def run(t):
         results = await bc.run_all(t)

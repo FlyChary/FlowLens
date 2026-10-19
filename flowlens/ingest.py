@@ -159,7 +159,7 @@ class IngestService:
                     f"降级期间单个请求的上限暂时为 {mb} MB，请稍后重试", retry_after=1)
             raise Overloaded(retry_after=1)
         try:
-            # 3. 解析出顶层数组（不合法抛 BadRequest）
+            # 3. 解析成元素列表（JSON 数组或 NDJSON，没有任何可解析内容时抛 BadRequest）
             arr = load_array(raw)
             n = len(arr)
             # 4. 分块处理，块间让出事件循环
@@ -167,14 +167,17 @@ class IngestService:
             for i in range(0, n, CHUNK_EVENTS):
                 j = min(i + CHUNK_EVENTS, n)
                 batch = validate(arr[i:j])
-                if batch:
-                    res = self.engine.ingest(batch)
-                    total = IngestResult(
-                        total.accepted + res.accepted,
-                        total.deduped + res.deduped,
-                        total.late + res.late,
-                        total.invalid + res.invalid,
-                    )
+                # 总是调用 engine.ingest：整块全非法时 batch 为空，engine.ingest
+                # 仍会返回 batch.invalid（其 invalid = batch.invalid + 未来事件），
+                # 用 `if batch:` 跳过会丢掉这块的 invalid 计数（F2 发现：NDJSON 让
+                # "全非法"请求体能走到这里；纯 JSON 数组 [5,"str",null] 同样受影响）
+                res = self.engine.ingest(batch)
+                total = IngestResult(
+                    total.accepted + res.accepted,
+                    total.deduped + res.deduped,
+                    total.late + res.late,
+                    total.invalid + res.invalid,
+                )
                 # 已处理的元素置 None（等长切片赋值），让这些 dict 尽早释放
                 arr[i:j] = [None] * (j - i)
                 if j < n:

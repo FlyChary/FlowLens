@@ -2,11 +2,48 @@
 
 > 草稿，由 AI 根据对话整理，提交前请本人核对和修改。
 
+## 摘要（提交前核对）
+
+### 1. 使用的工具与分工
+
+- 设计讨论、方案审查、指令编写：Claude（对话）；代码实现：Claude Code。绝大部分代码由 AI 生成。
+- 本人的工作：提出与筛选需求、做关键决策、审查 AI 的方案与代码、组织任务与验证流程。
+- 本人在使用 AI 之前做过独立的算法调研（HyperLogLog、HyperLogLog++ 等），见 [docs/research/初期调研.md](docs/research/初期调研.md)。
+
+### 2. 本人做出的关键决定
+
+- **实现语言由 Go 改为 Python**：AI 最初用 Go 写核心代码，因答辩需讲清代码、本人不熟悉 Go，要求全部改用 Python。
+- **坚持回放支持 1 秒精度**：推翻 AI"按 10 秒对齐也可以"的建议，改为稀疏线段树（`at` 是毫秒参数）。
+- **历史层用"堆加缺席上界"代替 Count-Min**：推翻 AI 原方案在历史层保留 Count-Min，省约 15 MB、误差区间变确定性。
+- **冻结已审查的基础代码**：config/dims/hashing/timewin/sketch/dedup/bounds/segtree/ring 定稿后不得修改，只在批准范围内解冻（`bounds.top_k`、`heavy.py` 各做过一次"输出不变"的性能修改，已重新冻结）。
+- **要求在 Linux 与 Docker 中验证**：T8b 起每个任务结束都在 WSL（Linux）跑全量 `pytest -q`；评测以 Docker 镜像（Linux、Python 3.12）为唯一标准环境。
+- **调整任务顺序**：压测工具（T10a/T10b）先于内存与性能优化（T9/T11），控制台页面放到提交之后。
+- **提交当天缩小 T11b 的范围、以验证为先**：只完成第零/一/二节，第三~六节留作提交后优化。
+
+### 3. AI 方案被推翻或修正的例子
+
+1. **Python 版改为单进程单写者**：AI 原"每个分片一个线程/多进程"的并发模型因 Python GIL 与"每进程几十 MB 基础内存、256 MB 开不了几个"而不成立，改为单事件循环、单写者（不加锁），性能靠按批处理 + numpy 向量化。
+2. **写入预留必须先于去重**：AI 初版解析后才预留、去重与预留顺序有误；改为先为整个请求预留待处理队列容量、预留成功后才去重，否则被 503 拒绝的 event_id 已写进 Bloom、调用方重试会被当成重复丢掉。
+3. **64 MB 请求上限实测后改为 4 MB**：实测 orjson 解析后 Python 对象约为原始 JSON 的 3.4 倍，64 MB 的请求解析后约 215 MB 直接超 256 MB 容器，且条数上限挡不住"解析本身"的内存；改为解压后 4 MB、按解压后字节在解析前预留。
+4. **内存读数从 `memory.current` 改为工作集**：原口径（T7b"保持 `memory.current` 原值"）空闲即 66%、离第 3 级阈值 78% 只差 12 个百分点、稍有负载就降级；T10b 实测约 36% 是不活跃页缓存，改为工作集（`current − inactive_file`）推翻该决定。
+5. **C1 的内存估算被容器实测推翻（用实测推翻估算）**：C1 进程内模拟 3 万/秒×11 分钟常驻增量仅 ~97 MB，容器实测 ~229 MiB，差 ~90 MB——C1 账本没算进真实 HTTP 层与分配器行为。C2 用容器探针判定**不是泄漏**、而是"分配器保留已释放页（碎片）+ 并发瞬时峰值叠加"（口径对齐后真实负载增量差 ~49 MiB）；C3 加 malloc_trim + 字符串驻留 + 固定 glibc 大块分配阈值（`MALLOC_MMAP_THRESHOLD_=128KB`），峰值下降约 58 MiB、从"贴 3/4 级"变全程第 0 级、接受率 87.8%→100%。
+
+### 4. AI 犯的错被发现的例子
+
+6. **numpy 定长字符串数组吞掉末尾的空字符**：`np.asarray` 默认生成 `<U..` 定长串、短串补 `\x00`，改变 `key_hash`（`hash("userA\x00") != hash("userA")`）且比 object 数组慢约 7 倍；改为 `dtype=object`，补 `test_user_with_trailing_nul_char` 锁住。
+7. **Windows 上内存读数恒为 0**：`memstat` 读不到 cgroup/statm 时返回 0，导致第 3/4 级内存降级逻辑在本地一次都没真正执行过、问题只在 Linux 上暴露；T8b 改用 psapi 的 `WorkingSetSize`（并修了 `GetCurrentProcess` 未声明 `restype` 把 64 位伪句柄截断成 `-1` 的坑）。
+8. **打包配置漏掉 `flowlens.api`**：`pyproject.toml` 手工列举 packages 漏了 `api` 子包，`pip install .` 装出缺子包的坏包、Docker 里 import 失败；改为 `packages.find`（`include = ["flowlens*"]`）自动发现，`tests/test_packaging.py` 用真实 `pip wheel .` 比对守护。
+9. **对比函数把空结果算作召回 100%**：`exact.compare` 原实现 `hits/n if n else 1.0` 在服务返回空（n=0）时记 1.0，把降级期空响应误判成完美精度（T10b 的 S3"召回 1.0/误差 0"即此假象）；改为"服务空、精确非空"记 0，两皆空才 1.0。
+
+---
+
+> 以上由 AI 根据正文整理，**请本人核对**（每条都对应正文中的记录，未写正文之外的内容）。核对无误后即可作为提交材料。
+
 ## 使用的工具与分工
 
-- Claude（对话）：方案讨论、设计文档与配图、核心模块代码（config、dims、hashing、timewin、sketch、dedup、bounds、segtree、ring）及其测试。
-- Claude Code：按 docs/TASKS.md 实现其余模块，每完成一个任务在本文末尾追加记录。
-- 本人：提出并决定关键取舍（见下），审阅所有 AI 生成的代码与文档。
+- Claude网页版（对话）：方案讨论、设计文档与配图、核心模块代码（config、dims、hashing、timewin、sketch、dedup、bounds、segtree、ring）及其测试。
+- Claude Code：使用qwen3.8-27B-F8精度作为基座模型，按 docs/TASKS.md 实现其余模块，每完成一个任务在本文末尾追加记录。与Claude通过Github进行协助开发。共使用3个CC窗口并行开发，管理两个分支代码（主分支、辅助试验分支）与git提交与合并操作。
+- 本人：提出并决定关键取舍（见下），审阅所有 AI 生成的代码与文档。精确设计与审阅核心模块代码后，由于开发工作量大工程细节多，协调Claude与qwen完成最终程序工程实现开发与调试验证。
 
 ## 关键交互
 
@@ -448,3 +485,30 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 3. 用户补充指令（第五节第 1 项由 lane-c 做、先 `git pull` 确认 Dockerfile、跑容器前问支线）——本任务缩小范围后不涉及第五/六节，未跑容器实验，Dockerfile 未动。
 
 **八、验证**：Windows `pytest -q` **340 passed, 3 skipped, 9 deselected** + 1 个 `tests/test_memstat.py::test_windows_working_set_reads_real_value` 偶发失败（Windows 专属、读两次 `WorkingSetSize` 差 4 KB，重跑 2 过 1 挂，与本任务改动无关，本任务未碰 memstat.py）；Docker（WSL，Python 3.12）`docker build --target test` **342 passed, 2 skipped, 9 deselected** 全过。`bench_model` 见上。**未走退路**（等价性测试全部通过，未 `git checkout` model.py）。
+
+### 2026-10-18 支线 B1/B1b：Docker 与调试接口（Dockerfile、.dockerignore、run.sh、flowlens/api/debug.py、flowlens/api/app.py、tests/e2e/test_debug.py、tests/e2e/test_signals.py）
+
+- 调试接口 `GET /debug/structure`（`FLOWLENS_DEBUG=1` 门控）由 AI 起草。**被否决/修正**：① `_plan_summary` 初版"自己判断环/树边界"被否——指令要求复用 `engine._plan`（真实查询唯一的划分入口），改为直接调 `_plan` 转出 `ring_buckets`/`history`/`edges`；② "前 3 个 key"初版直接读 `IndexedMinHeap` 私有字段 `q.prios`/`q.vals` 做 `heapq.nlargest`，被改为走 `TopK.top(n)` 公开接口（冻结模块能走公开接口就不碰私有堆字段）。
+- **Docker 多阶段 → 单阶段**：初版写 builder/runtime 多阶段，实测 `pip install .` 因 pyproject 漏 `flowlens.api` 装出坏包，遂改"单阶段装三个依赖 + 拷源码"；B1b 再改回 `pip install -c constraints.txt .` 装完删源码（`packages.find` 修复后）。
+- **优雅停机**：AI 定位"PID 1 忽略 SIGTERM"（用"纯 sleep 当 PID 1"对照实验证明与业务无关），B1 方案是镜像内加信号转发 init（heredoc 在经典构建器下 0 字节失败，改 base64 内嵌 + `py_compile` 校验）；B1b 把 SIGTERM 处理移进 `__main__.py`（`loop.add_signal_handler`）、去掉 init、CMD 改回 `python -m flowlens`。
+- 测试数据装载：`test_debug.py::_load_tree` 逐秒写入并推进 `FakeClock`（`advance()` 只在 watermark 越过该秒时定稿）。初版想"倒序写旧秒"被否（旧秒判迟到、不进树）。
+- 只读使用冻结模块内部属性（`Tree.levels`/`Tree.builders`/`Ring.slots`、`_Plan`/`_PlanEdge` 字段等，只读不改、清单见 docs/lanes/B1-notes.md）。
+
+### 2026-10-18 支线 C1（T9a）：内存账本（tools/mem_report.py、tests/test_mem_report.py）
+
+- 方案：满载走完整真实写入路径（flowgen → orjson → `IngestService.ingest` → `engine.tick()`）；记账用"按对象 id 去重的深度遍历 + 组件有向遍历"（共享 seen、先到达者记账）。**被修正/发现**：① 初版把"组件"当遍历 owner，发现 `ring.finalize` 绑定方法经 `__self__` 向上走到 engine 导致大量对象提前归错（"活跃环·其他结构"虚高 8 MB），改为"每组件从自己子结构出发 + 跳过方法对象"；② 初版用"绝对 RSS"交叉核对，发现 Python 堆不归还已释放页（RSS 高水位），改"RSS 增量（相对空载基线）"。
+- **事故：首轮全部数据作废**——conda editable install 指向主仓库，`python tools/mem_report.py` 脚本模式下 CWD 不在 sys.path，`import flowlens` 解析到主线（model.py 已被 T10b 改成"先剥 query 再查缓存"、url 字符串天然共享），首轮对象图/驻留测算全是主线行为。修复：启动时把项目根显式插到 sys.path 最前 + 打印 `flowlens.__file__` 自检。教训：worktree 的独立 tools/*.py 必须显式把项目根放 sys.path 最前，不能依赖 CWD。
+- 被否决：曾考虑用 `objgraph` 第三方库做遍历，被"不引入新依赖"规则否决，自己写了 40 行 `MemWalker`；驻留方案用静态测算（值→对象集合直接算节省）而非双引擎重跑。
+
+### 2026-10-18 支线 C2（T9b）：容器内查清内存增长原因（tools/mem_probe.py、tests/test_mem_probe.py）
+
+- 方案：容器内探针逐 10s 采三层读数（cgroup 工作集 / 进程 RssAnon / Python 层 gc+allocated_blocks）以**区分**碎片 vs 泄漏 vs 并发；用 C1 的 `MemWalker` 统计"存活结构"，与工作集对照，两者之差 = "非存活 anon"（分配器保留 + 解释器 + HTTP 层）。
+- **事故：探针自身 OOM**——满负载下探针的 30s `gc.get_objects()`+MemWalker 把 `memory.current` 从 243 MiB 推过 256 MiB 上限，内核 OOM 杀掉探针（dmesg 确认）。修复：`memory.current > 上限×0.80` 时跳过记账。教训：**探针自己也是容器里的一个进程，其测量开销会挤占被测进程本就紧张的上限**；被测系统近上限时，测量必须让位于保命。
+- **被修正的结论**：初版报告把"90 MB 差距"直接归因"glibc 保留 + HTTP 层"（不拆口径）。复盘发现 C1 的 97 是**增量**口径、容器 229 是**绝对值**口径，直接相减混了口径——改为先对齐口径（增量 vs 增量 = 49 MiB 真实差距），结论从"碎片为主因"修正为"并发瞬时峰值叠加 ~45 是 C1 差距的最大单一成分、碎片 ~21 被存活结构差 −30 部分抵消"。教训：**跨实验对比内存数字前先核对口径（增量 vs 绝对值、事件数、平台）**。
+- `MALLOC_ARENA_MAX=2` 假设（"多线程 arena 计数导致保留"）被实测否决（单连接也复现 ~53 MiB churn 保留、arena2 无改善）。踩坑：`taskset` 的 env 前缀（`NO_PROXY=...` 被当命令名执行、loadgen 没跑，第一次"基线"是无流量空跑）。
+
+### 2026-10-19 支线 C3（T9b-A）：内存加固（flowlens/intern.py、ticker.py、engine.py、model.py、ingest.py、api/app.py、tools/experiments.py、tools/summarize.py、tests/）
+
+- 方案：malloc_trim 放 Ticker（`_maybe_trim` 到点触发、记 `TrimStat`）+ `/healthz` 暴露；`intern.py` 提供 `Intern`（满则整体清空）+ user/url 单例 + 环境变量开关；`engine.ingest` 写桶前 `np.fromiter` 驻留 user；`model.normalize_url` 返回前驻留结果；`ingest.py` 的 `MAX_PENDING_BYTES` 改读环境变量。实验用 `SUST`（持续负载+停发尾巴）+ `S4`（全随机攻击）场景、`--extra-env` 切特性。
+- **用户修改/否决点**：① 用户确认"主线未跑实验，可以跑容器"；② 用户确认"允许改 app.py 的 `_healthz` 加 `malloc_trim` 只读字段"（原清单不允许改 app.py，例外放行）；③ 用户追加 **glibc mmap/trim 阈值对照实验（g5）** 并**批准改 Dockerfile**（例外放行）固化 `MALLOC_MMAP_THRESHOLD_=131072`/`MALLOC_TRIM_THRESHOLD_=131072`——实测峰值 −57.7 MiB、246/246s 全程第 0 级，是本组实验最大单项收益；S3/S4 不重跑、等合并后在最终代码上统一跑。
+- 消融结论：trim 是主杠杆（进 L4 拒写 → 不拒写、接受率 87.8%→100%）、驻留是次杠杆（中后段水位降 ~11 MiB、把"贴 3 级"压成"偶发尖峰"）、在途降 2 MB 无增益（保留为实验变量）。**T9b-B（缩 Bloom/Count-Min，需改冻结 config.py）不需要**——g5 已全程 0 级、无内存压力，且 C1 已证缩 Bloom/HLL 都是拿精度换内存。

@@ -17,15 +17,18 @@
 | T7 SSE + T7b 修正 | 已审查通过 |
 | T8 过载降级 | 已完成，等审查 |
 | T8b 测试与运行环境解耦、Linux 验证 | 已完成，等审查 |
-| T9 驻留表 | 未开始 |
+| T9 驻留表 | 已完成（支线 C3/T9b-A：intern.py 驻留表，engine.ingest 写桶前驻留 user、model.normalize_url 驻留 url 结果；C1 论证与冻结 segtree 无冲突） |
+| T9a 内存账本（支线 C1） | 已完成（tools/mem_report.py 满载账本 + 方案测算，见 C1-report.md） |
+| T9b 内存专项（支线 C2 调查 + C3 加固） | 已完成（C2 定位"非泄漏、碎片+并发"；C3 加固 malloc_trim + 驻留 + glibc mmap/trim 阈值固化进 Dockerfile，见 C2/C3-report.md） |
 | T10a 压测工具、离线精确解、边界用例 | 已完成，等审查 |
 | T10b 实验场景与端到端粗测 | 已完成，等审查 |
-| T10c 调试接口与控制台页面 | 未开始 |
+| T10c 调试接口与控制台页面 | 调试接口已完成（支线 B1：GET /debug/structure，FLOWLENS_DEBUG=1 门控）；控制台页面未开始 |
+| Docker/部署（支线 B1+B1b） | 已完成（constraints.txt 固定版本、__main__.py 处理 SIGTERM、非 root、单阶段 pip install 装完删源码） |
 | T11 性能 | 进行中（T11a-2 完成等审查；T11b 缩小范围：第零/一/二节完成等审查，第三～六节留作提交后优化） |
 
 ## 进行中
 
-（T11b 已缩小范围完成：第零、一、二节已做，汇报后等审查。第三～六节留作提交后的优化，见"未解决的问题"第 9 条。）
+（T11b 已缩小范围完成：第零、一、二节已做，汇报后等审查。第三～六节留作提交后的优化，见"未解决的问题"第 9 条。支线 B1/C1/C2/C3 的代码已合并进 main，本节为 F2 收尾合并支线笔记时补记。）
 
 ---
 
@@ -168,6 +171,22 @@ T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 - 多 worker 的 event_id 互不冲突（T10a）：每个 worker 用不相交的序号区间（`seq_offset = wid × SEQ_STRIDE`，SEQ_STRIDE=10⁸），event_id=`e{seq}` 全局唯一；worker 随机种子 = `seed + wid`。存档按 shard 写、`finalize_archive` 把各 shard 文件按 (shard,seq) 排序合并——同一 worker 内按发送序、跨 worker 的 id 不冲突，"保留第一次出现"去重直接按此序。
 - 本机 WSL2 的 80xx 端口段 bind 报 errno 98（被保留，`ss` 里也看不到占用者），9000/12345 等可用（T10a 实测）：实验脚本端口改用 9000。这不是服务问题，是开发机 WSL2 环境特性；评测容器 `--memory` 启动走 8080 不受影响。
 
+### 支线 B1/B1b（Docker 与调试接口）
+
+- 依赖版本由 `constraints.txt` 固定（B1b）：`aiohttp` 不同版本的行为差异已两次影响本项目（中间件写法、传输层自动解压），评测方构建必须装到测试过的版本。`constraints.txt` 写入 WSL 测试环境 `numpy`/`orjson`/`aiohttp` 及其全部间接依赖的确切版本；Dockerfile 与 run.sh 都用 `pip install -c constraints.txt .` 安装；`pyproject.toml` 的依赖保留版本范围、不写死。`pyproject.toml` 的包列表改自动发现（`[tool.setuptools.packages.find] include = ["flowlens*"]`），不再手工列举（曾漏 `flowlens.api` 导致 `pip install .` 装出坏包，`tests/test_packaging.py` slow 守护）。
+- 容器优雅停机（B1b）：`__main__.py` 用 `loop.add_signal_handler` 为 SIGTERM 与 SIGINT 注册处理器、收到即置位停止事件、随后照常 `runner.cleanup()`（退出码 0）；Windows 不支持 `add_signal_handler`，保留 Ctrl+C（KeyboardInterrupt）路径、不报错。Docker CMD 直接用 `python -m flowlens`，PID 1 就是服务进程，不需要 B1 的信号转发 init（`tests/e2e/test_signals.py` 用真实子进程 + SIGTERM 守护）。
+- Dockerfile 装完删源码（B1b）：`pip install -c constraints.txt .` 后 `rm -rf /app/flowlens /app/pyproject.toml`，运行时从 site-packages import、与 CWD 无关（从 /tmp 验证过）。非 root（`useradd --uid 10001 appuser`）、`HEALTHCHECK` 用 Python 标准库（镜像无 curl）、`ARG PIP_INDEX_URL` 默认为空（有值才 `--index-url`，不写死国内源）沿用 B1。
+- 调试接口只读、现读现算（B1）：`GET /debug/structure`（`FLOWLENS_DEBUG=1` 门控，未设置走正常 404）的返回完全由只读数据现场组装，不修改任何统计状态、不缓存。时间划分复用 `engine._plan`（真实查询唯一的划分入口），环内整秒、线段树节点（`engine._cover`）、边缘秒都从 `_Plan` 读出，保证页面展示与真实查询一致；事件数统一取 url 维叶子的 DDSketch 总计数（`dd.n`）；秒桶"前 3 个 key"用 `TopK.top(n)` 公开接口。满载耗时用 slow 测试（`tests/e2e/test_debug.py::test_debug_perf_full_tree`）。
+
+### 支线 C1/C2/C3（内存账本、增长调查、加固）
+
+- 内存加固推荐组合 = **g5**（C3）：① Ticker 定期 `malloc_trim(0)`（默认每 10s，`FLOWLENS_MALLOC_TRIM_SEC` 可配、0/负数关闭、非 Linux no-op；`/healthz` 暴露 `malloc_trim` 只读字段）；② 字符串驻留（`flowlens/intern.py` 的 `Intern`，满则整体清空、上限 user 8192 / url 32768 为模块常量、**不进 config.py**；user 在 `engine.ingest` 写秒桶前 `np.fromiter` 驻留、url 在 `model.normalize_url` 返回前驻留结果——不改归一化逻辑）；③ Dockerfile base 阶段固化 `ENV MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072`（用户批准、例外放行；`docker run` 不显式 `-e` 也继承镜像 ENV）。实测（256 MB 容器、长尾 3 万/秒、32 连接）：g5 峰值工作集 **179.1 MiB**、246/246s **全程第 0 级**、接受率 100%（对比 g1 基线峰值 233.4、进 L4 拒写、接受率 87.8%）。
+- 在途额度做成环境变量 `FLOWLENS_MAX_PENDING_BYTES`（C3，默认 4 MB 不变）：本负载下降到 2 MB 无增益也无额外 503（在途窗口不是内存瓶颈），故保留为实验变量、供"大请求突发"场景按需收紧。
+- 内存增长**不是泄漏**，是"分配器保留已释放页（碎片）"+"并发瞬时峰值叠加"（C2 判定）：`gc.get_objects()` 全程平稳、`getallocatedblocks()` 震荡、MemWalker 各结构 `walked` 平台化——无对象结构持续增长。碎片证据：负载中 RssAnon 爬升、停发后基线 0 回落、`malloc_trim` 一停发就回收 ~60 MiB；`MALLOC_ARENA_MAX=2` 与 `PYTHONMALLOC=malloc` 均无改善（排除 arena 计数与 CPython 私有块分配器）。并发：32 连接比单连接多 ~45 MiB（in-flight 解析临时对象 + 每连接 aiohttp/TCP 栈 ~1.4 MiB）。**T9b-B（缩 Bloom/Count-Min，需改冻结 config.py）不需要**——g5 已全程 0 级、无内存压力可解决，且 C1 已证缩 Bloom/HLL 都是拿精度换内存。
+- 内存读数口径：降级判断与 `/healthz` 的 `memory_bytes` 用**工作集**（T10b 已定）；C1/C2 的账本用"纯服务端稳态 RSS 增量"交叉核对，三层口径（对象图=存活、RSS 增量=容器看到的常驻、EventGen 驱动 RSS=被模拟工具污染）分开用，不混。
+- 记账类工具的身份自检（C1 事故教训）：worktree 开发的独立 tools/*.py 必须显式把项目根插到 `sys.path` 最前（脚本模式 CWD 不在 path、conda editable install 不随 worktree 变化）；出数前打印 `flowlens.__file__` 自检，出现与写入路径模型矛盾的数字（如"每值仅 1 个对象"）立即停手排查。C1 首轮因 import 解析到主仓库、全部数据作废重跑。
+- 探针自保（C2 事故教训）：被测系统已近内存上限时，测量必须让位于保命——`memory.current > 上限×0.80` 时跳过 `gc.get_objects()`+MemWalker 深度遍历（瞬时对象会把 current 推过上限、内核 OOM 杀掉探针本身）。
+
 ## 基准数据
 
 各任务结束时重跑全部测试与性能基准并追加一列（以后每个任务都一样）。每项各跑 3 次取中位（单次波动大）。"上一版"为 T6c 前后对照；"T7b"为提交 `d2d5c8e`；"T8"、"T8b"分别为对应任务结束时的本机（T8b 机器）中位数。
@@ -221,29 +240,33 @@ T10a 列与 T8b 列**同一台机器**（本机）采集。T10a 同样**未触�
 ## 未解决的问题
 
 9. **T11b 第三～六节（性能/内存收尾）留作提交后的优化**（T11b 因提交截止缩小范围，只完成第零/一/二节）：
-   - **第三节 写入分块大小**：`ingest.py` 的 `CHUNK_EVENTS` 仍为 5000。需按 T11a 结论用新每条耗时重测 1000/2000/5000，选单块同步耗时 ≤15 ms 的最大块（预计能解锁回放查询 p99<50 ms）。
+   - **第三节 写入分块大小**：`ingest.py` 的 `CHUNK_EVENTS` 仍为 5000。需按 T11a 结论用新每条耗时重测 1000/2000/5000，选单块同步耗时 ≤15 ms 的最大块（预计能解锁回放查询 p99<50 ms）。C2 实测单批 5000→1000 还能把解析高水位从 ~58 降到 ~12 MiB，与查询 p99 同向。
    - **第四节 垃圾回收调优**：`gc.freeze()` + 调高 gen0 阈值 + Ticker 定期再 freeze，削 gen2 单次 13～19 ms 停顿（事件循环 p99/max 的次级来源）。
-   - **第五节 内存收尾（T9b-B）**：归一化缓存上限 10 万→2 万（`NORM_CACHE_CAP`）、Bloom `per_gen` 容量（需用户批准改 config.py）、`/healthz` 加 Bloom 当前代已插入条数。注：第五节第 1 项（Dockerfile 固定 glibc 大块分配阈值 `MALLOC_MMAP_THRESHOLD_`/`MALLOC_TRIM_THRESHOLD_`）由支线 lane-c 做对照实验中，等其合并后再定。
-   - **第六节 容器验证**：profile_server（6/10 万每秒）、S1（最大可持续吞吐）、S2（混合负载查询 p99）、S3（长尾精度）、S4（全随机工作集）全部留待提交后在容器（真实内存读数）中跑。
+   - **第五节 内存收尾（T9b-B）**：~~归一化缓存上限 10 万→2 万、Bloom `per_gen` 容量（需用户批准改 config.py）~~ **已不需要**——支线 C3（T9b-A）用 malloc_trim + 驻留 + glibc mmap/trim 阈值固化（ENV）后，3 万/秒满载已全程第 0 级、无内存压力，T9b-B（拿精度换内存）不做了（见"已定的决策"支线 C1/C2/C3 与"未解决的问题"第 8 条的解决）。归一化缓存上限（`NORM_CACHE_CAP` 10 万）仍可按需下调，非必需。
+   - **第六节 容器验证**：profile_server（6/10 万每秒）、S1（最大可持续吞吐）、S2（混合负载查询 p99）、S3（长尾精度）、S4（全随机工作集）留待提交后在容器（真实内存读数）上统一重跑（C3 用户指令：等合并后在最终代码上统一跑）。
    - T11b 已做的第零/一/二节（编码修正 + 归一化未命中快路径 + validate 列式快路径）只改 `model.py`/`ingest.py` 上游的校验归一化路径与编码，未触及写入分块/GC/内存上限，故上面各项仍按原方案进行。
 
-8. **【主要发现，T10b】内存随持续写入增长，3 万/秒×5 分钟就进第 4 级，S3 精度数据因此无效；且与 C1 账本矛盾，差 ~90 MB，T9b 专门查。**
-   - 现象（`results/20261018_190021/`，工作集口径）：S1_plain 峰值 204.6 MiB（进 3 级）、S1_gzip 190.6（1 级）、S2 210.5（3 级）、**S3 229.4（3 级 @90s、4 级 @200s，结束后仍贴 4 级）**、S5 190.1（1 级）。
-   - 关键：内存增长由**持续写入填满 600s 保留期**驱动，与瞬时速率无关——S3 累积 588 万条后工作集 ~218 MiB 并长期不回落；S5 虽然 7.5 万/秒（1.5×）但只跑 60s、累积少，只到 1 级。
-   - 影响：S3 结束时服务处于 3~4 级，回放查询暂停（503）或返回空 topk，200 个抽样区间全部落在降级期，**召回 1.0 / 误差 0 / stats 全 null 是空响应的假象，精度数据无效**（`exact.compare` 已修：空服务答案对非空精确答案召回记 0，不再记 1.0；S3 抽样分 valid/degraded/rejected 三桶）。**精度实验留 T9b 解决内存问题后重做。**
-   - 与 C1 账本矛盾：支线 C1 在**进程内**模拟同样 3 万/秒、持续 11 分钟，服务常驻增量仅 **~97 MB**；容器实测工作集 **~229 MiB**，差 **~90 MB**。怀疑方向（未定）：① 频繁解析大请求的内存碎片 / 分配器未退还；② 并发请求的瞬时峰值叠加；③ 某处对象泄漏。**本任务不做任何内存优化，T9b 专门调查。**
+8. ~~**【主要发现，T10b】内存随持续写入增长，3 万/秒×5 分钟就进第 4 级，S3 精度数据因此无效；且与 C1 账本矛盾，差 ~90 MB，T9b 专门查。**~~ **（支线 C2 调查 + C3 加固已解决）**
+   - **原因判定（C2，容器探针三层读数）**：**不是泄漏**（`gc.get_objects()` 平稳、`getallocatedblocks()` 震荡、MemWalker 各结构 `walked` 平台化，无对象结构持续增长）。是**"分配器保留已释放页（碎片）"+"并发瞬时峰值叠加"**的组合：碎片证据 = 负载中 RssAnon 爬升、停发后基线 0 回落、`malloc_trim` 一停发就回收 ~60 MiB，且 `MALLOC_ARENA_MAX=2`/`PYTHONMALLOC=malloc` 均无改善；并发 = 32 连接比单连接多 ~45 MiB（in-flight 解析临时对象 + 每连接 aiohttp/TCP 栈 ~1.4 MiB）。**"90 MB 差距"对齐口径后实为 ~49 MiB 负载增量差**（①并发瞬时峰值 ~45 + ②glibc 保留比 MSVC 高 ~21 − ③存活结构差 −30 + ④工作集含 file 缓存 ~13），其余 ~43 是空载基线固有差（口径混用带入）。
+   - **解决方法（C3，推荐组合 g5）**：① Ticker 定期 `malloc_trim(0)`（默认 10s）；② 字符串驻留（user 写桶前 / url 归一化结果）；③ Dockerfile 固化 `MALLOC_MMAP_THRESHOLD_=131072`/`MALLOC_TRIM_THRESHOLD_=131072`。实测（256 MB、长尾 3 万/秒、32 连接）：**峰值工作集 233.4 → 179.1 MiB、进 L4 拒写变全程第 0 级、接受率 87.8% → 100%**。
+   - **S3 精度重做（g3 配置，T9b 首份有效精度数据）**：200/200 有效样本（degraded 0 / rejected 0）、Top-K url/user 召回均 **1.000**、计数误差 0.05%/0.09%、真实值 100% 落上下界、HLL 去重 0.92%、DDSketch p95 0.14%。C2 那次"召回 1.0/误差 0"的空响应假象已不复存在。
+   - **待办**：g5（含 mmap ENV）配置下的最终 S3 精度数据，等合并后在最终代码上统一跑（C3 用户指令）；S4/S1/S2 容器验证见第 9 条第六节。
 
 1. **查询延迟（T11a-2 已定位瓶颈，待优化实施）**：T10b 混合负载下各查询 p99 156~195 ms（当时受定稿+快照+内存降级拖累）。T11a-2 无降级、单核、分速率实测拆开了来源——
    - **默认查询（60 s 窗口、不带 `at`）走快照，p99 0.04 ms（亚毫秒）**，早已达标，不是问题。
    - **回放查询（带 `at`/非 60 s）**：计算本身 ~10～50 ms（`collect_parts + bounds.top_k`），6 万/秒核有余量（71.6%），但**事件循环延迟 p99 41 ms**——主因是 **5000 条写入同步块独占事件循环 54～61 ms**（`ingest.py` 块内不 yield），次因是 **gen2 GC 单次 13～19 ms**。所以回放查询 p99<50 ms 的瓶颈**不是 CPU 而是写入块的独占段**。
    - **待办（T11 优化，方向已排序，见 `docs/perf/T11a-report.md` 第六节）**：① 归一化未命中提速（validate 占核 60%，首要）② 写入块 5000→~1000（解锁查询 p99）③ `gc.freeze()`+阈值（削 gen2 停顿）④ 快照改维护窗口汇总 ⑤ gen2/tick 拆段。其中 ①② 是非冻结模块、风险低、收益最大。
-2. 内存尚未在 256 MB 容器里实测，估算常驻约 195 MB 加写入路径。T9 实测。
+2. ~~内存尚未在 256 MB 容器里实测，估算常驻约 195 MB 加写入路径。T9 实测。~~（支线 C1 进程内账本 + C2/C3 容器实测已解决，见第 8 条）
 3. 吞吐：纯统计核心每批 5000 条约 20.5 万/秒（bench_core，未计 HTTP/validate）。**T11a-2 端到端（容器、含 HTTP+validate、单核）实测可持续 ~7.5 万～8 万/秒**——差距全部在 validate（占核 60%，归一化缓存命中率仅 38.5%）与 HTTP 层，统计核心本身没变慢。T11 优化方向见 `docs/perf/T11a-report.md`。
-4. T9 的字符串驻留表与冻结的 segtree.py 冲突，开始 T9 前由用户决定做法。
+4. ~~T9 的字符串驻留表与冻结的 segtree.py 冲突，开始 T9 前由用户决定做法。~~（C1 论证冲突不存在：驻留发生在数据进引擎**之前**（`engine.ingest` 写秒桶前 / `model.normalize_url` 返回前），进引擎后各结构（秒桶堆、候选堆、叶子/节点 keys、快照）引用的都是同一字符串对象，冻结的 segtree 只是引用、无需修改。T9 已由 C3 落地，见"已定的决策"支线 C1/C2/C3。）
 5. ~~`memory_bytes` 在 WSL 里读数虚高~~（T7 前置小修已解决）：memstat 现在只在"当前进程所在 cgroup 设了内存上限"时才用 cgroup 读数，否则回退进程常驻集（statm）。WSL 的 cgroup 无上限（整个发行版共享）→ 回退 statm，读数不再虚高；评测容器 --memory 启动带上限 → 仍用 cgroup，读数准确。
 6. SSE 默认 60 秒窗口的帧目前走回放（collect_parts + top_k），没有复用刷新快照。**T11a-2 数据支持改复用快照**：60 s 窗口 k≤100 的查询走快照路径 p99 仅 0.04 ms（亚毫秒、预计算），而走回放的 60 s 帧要吃 `collect_parts + top_k`（~10～50 ms）并在事件循环里和写入块争抢。是否改在 T11 决定（改动落在 SSE 生产者，非冻结）。
 7. ~~全量 pytest 逐测内存增长 ~45 MB（Linux 上把服务打进第 4 级）~~（T8b 已定位并解决）：根因是 **aiohttp 的全局中间件缓存** `_cached_build_middleware`（`web_app.py`，`lru_cache(maxsize=1024)`）以 `(handler, match_info.apps)` 为键、`apps` 是含 `Application` 的元组，把每个 e2e 测试的 Application（连带 Engine ≈55 MB）用强引用挂进进程级缓存，逐测累积（实测 +54.6 MB/测、6 个测试 55→358 MB）。tracemalloc 确认是**对象未释放**（非分配器未退还）。修复：`tests/e2e/conftest.py` autouse fixture 每测后 `cache_clear()`（修复后 RSS 平台化 ~121 MB、存活分配净增 ≈0）。**生产单实例不受影响**（只建一个 app、缓存就一条、长驻运行）。另：T8b 顺带修复了"Windows 上 `memory_bytes()` 恒 0"（改用 psapi WorkingSetSize），此前第 3/4 级内存降级逻辑在本地从未真正执行过。
 
 ## 下一步
 
-T11a-2 汇报后停下等待审查。审查通过后继续 **T11 性能优化**——按 `docs/perf/T11a-report.md` 第六节的方向清单实施（① 归一化未命中提速、② 写入块 5000→~1000、③ `gc.freeze()`+阈值，①② 是非冻结模块、风险低收益最大，优先）；再按原顺序 **T9b 内存专项**（"未解决的问题"第 8 条，解决后重做 S3 精度实验）→ T10c 调试接口与控制台页面 → T9 驻留表 → 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。
+**今天是提交截止日，当前在做 F2（准备提交材料，见 docs/instructions/F2.md）**：请求体支持 NDJSON（代码改动）、合并支线笔记、重写 README、AI_LOG 加摘要、从全新克隆验证。**不改服务代码行为**（NDJSON 除外）。设计文档与配图由用户另行更新。
+
+提交后（按原计划）：① **T11 性能优化**——按 `docs/perf/T11a-report.md` 第六节方向清单实施（① 归一化未命中提速、② 写入块 5000→~1000、③ `gc.freeze()`+阈值，①② 是非冻结模块、风险低收益最大，优先）；② **T10c 控制台页面**（调试接口已由支线 B1 完成）；③ 容器里统一重跑 S3/S4/S1/S2（C3 用户指令，最终代码 + g5 配置）；④ 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。
+
+**支线（lane）状态**：B1/B1b（Docker + 调试接口）、C1（内存账本）、C2（内存增长调查）、C3（内存加固 + glibc mmap/trim 阈值）的代码均已合并进 main，本 F2 收尾把它们各自的决策/待解决/设计待改/AI 记录并入 PROGRESS / DESIGN_TODO / AI_LOG（见"已定的决策"支线小节、"未解决的问题"第 8 条、AI_LOG 末尾支线小节）。支线原始笔记保留在 `docs/lanes/`。

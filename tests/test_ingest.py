@@ -152,6 +152,21 @@ def test_ingest_empty_array():
     asyncio.run(main())
 
 
+def test_ingest_all_invalid_chunk_counted():
+    # F2 回归：整块全非法（validate 后 batch 为空）时 invalid 仍要计入。
+    # 此前 `if batch:` 跳过 engine.ingest 会丢掉这块的 invalid 计数。
+    async def main():
+        eng, svc = _svc()
+        # NDJSON 全非法：两行都不是事件对象（非 dict）
+        r = await svc.ingest(b'"not-an-object"\n[1,2,3]\n', None)
+        assert (r.accepted, r.deduped, r.late, r.invalid) == (0, 0, 0, 2)
+        # 纯 JSON 数组全非对象：同样要计数（该路径与 NDJSON 无关，一并守护）
+        r2 = await svc.ingest(b'[5, "str", null]', None)
+        assert (r2.accepted, r2.invalid) == (0, 3)
+        assert svc.admission.pending == 0
+    asyncio.run(main())
+
+
 def test_ingest_normal_batch_counts():
     async def main():
         eng, svc = _svc()

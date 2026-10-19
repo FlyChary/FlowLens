@@ -377,19 +377,75 @@ def test_parse_empty_array():
     assert b.ids == [] and b.ts.size == 0
 
 
-# ---- parse_events：整体不合法 → BadRequest ----
+# ---- parse_events：既不是数组、也没有任何一行是合法 JSON → BadRequest ----
+# （F2 起请求体同时接受 JSON 数组与 NDJSON；单个 JSON 值现在是一行合法 NDJSON，
+#   不再是 400，改由 validate 计为 invalid，见下）
 
 @pytest.mark.parametrize("body", [
-    b'{"a": 1}',       # 顶层是对象
-    b'"str"',          # 顶层是字符串
-    b"123",            # 顶层是数字
-    b"null",           # 顶层是 null
-    b"{not json",      # 非法 JSON
+    b"{not json",      # 非法 JSON，没有任何一行合法
     b"",               # 空输入
+    b"   \n\t  ",      # 只有空白
 ])
-def test_parse_rejects_non_array(body):
+def test_parse_rejects_no_valid_content(body):
     with pytest.raises(BadRequest):
         parse_events(body)
+
+
+# ---- parse_events：NDJSON（F2，每行一条） ----
+
+def test_parse_ndjson_normal_batch():
+    body = (orjson.dumps(_ev(eid="n1", ts=NOW)) + b"\n"
+            + orjson.dumps(_ev(eid="n2", ts=NOW + 1, url="/b")) + b"\n")
+    b = parse_events(body)
+    assert len(b) == 2 and b.invalid == 0
+    assert b.ids == ["n1", "n2"]
+    assert b.urls == ["/api/a", "/b"]  # 与数组路径同样归一化
+
+
+def test_parse_ndjson_empty_lines_and_crlf():
+    body = (orjson.dumps(_ev(eid="c1", ts=NOW)) + b"\r\n"
+            + b"\r\n"                       # 空行
+            + b"   \r\n"                    # 空白行
+            + orjson.dumps(_ev(eid="c2", ts=NOW + 1)) + b"\r\n"
+            + b"\r\n")                      # 行尾空行
+    b = parse_events(body)
+    assert len(b) == 2 and b.invalid == 0
+    assert b.ids == ["c1", "c2"]
+
+
+def test_parse_ndjson_leading_whitespace():
+    body = b"  \n\t " + orjson.dumps(_ev(eid="w1", ts=NOW))
+    b = parse_events(body)
+    assert len(b) == 1 and b.invalid == 0 and b.ids == ["w1"]
+
+
+def test_parse_ndjson_partial_invalid_line():
+    # 中间一行不是合法 JSON：占位 None 被 validate 计为 invalid，不影响其他行
+    body = (orjson.dumps(_ev(eid="g1", ts=NOW)) + b"\n"
+            + b"{not valid json on this line" + b"\n"
+            + orjson.dumps(_ev(eid="g2", ts=NOW + 1)))
+    b = parse_events(body)
+    assert len(b) == 2 and b.invalid == 1
+    assert b.ids == ["g1", "g2"]
+
+
+def test_parse_single_json_object_as_ndjson():
+    # 单个 JSON 对象（不是数组、也不是多行）按一行 NDJSON 处理
+    b = parse_events(orjson.dumps(_ev(eid="solo", ts=NOW)))
+    assert len(b) == 1 and b.invalid == 0 and b.ids == ["solo"]
+
+
+def test_parse_ndjson_line_not_object_counted_invalid():
+    # 一行是合法 JSON 但不是事件对象（顶层字符串）→ validate 计为 invalid，不抛
+    b = parse_events(orjson.dumps("not an object"))
+    assert len(b) == 0 and b.invalid == 1
+
+
+def test_parse_json_array_behavior_unchanged():
+    # JSON 数组路径行为完全不变（首字节是 '[' 走 orjson 整体解析）
+    body = orjson.dumps([_ev(eid="a1", ts=NOW), _ev(eid="a2", ts=NOW + 1)])
+    b = parse_events(body)
+    assert len(b) == 2 and b.invalid == 0 and b.ids == ["a1", "a2"]
 
 
 # ---- parse_events：单条不合法只计数，不影响其他 ----
@@ -675,6 +731,21 @@ def test_validate_equivalence_float_from_oversized_int():
     body = ("[" + raw(big, "100") + "," + raw(str(NOW), "200") + "]").encode()
     objs = load_array(body)  # ts 已被 orjson 转成 float
     _assert_same_batch(validate(objs), ref_validate(objs))
+
+
+def test_load_array_ndjson_placeholder_and_empty():
+    """F2：NDJSON 逐行解析——非法行放 None 占位、空行跳过；一行都没有时抛 BadRequest。"""
+    from flowlens.model import load_array
+    good = orjson.dumps(_ev(eid="z1", ts=NOW))
+    # 非法行 → None 占位；空行/空白行跳过
+    objs = load_array(good + b"\nnot json\n\n   \n" + good)
+    assert objs == [orjson.loads(good), None, orjson.loads(good)]
+    # 单行合法 JSON（对象）
+    assert load_array(good) == [orjson.loads(good)]
+    # 全空 / 只有空白 → BadRequest
+    for empty in (b"", b"   \n\t", b"\n\n"):
+        with pytest.raises(BadRequest):
+            load_array(empty)
 
 
 def test_validate_fast_vs_slow_path_agree_on_mixed():

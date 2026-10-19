@@ -176,6 +176,51 @@ def test_ingest_gzip():
     _serve(run)
 
 
+def test_ingest_ndjson():
+    async def run(client, engine, clock, app):
+        # NDJSON：每行一条，含空行与 \r\n 行尾（event_id 前缀 nd- 避免与其他用例撞）
+        evs = [{"event_id": f"nd-{i}", "user_id": "u", "url": "/nd",
+                "ts": NOW - 100, "bytes": 100} for i in range(3)]
+        lines = [json.dumps(e) for e in evs]
+        body = ("\r\n".join(lines) + "\r\n\r\n").encode()
+        r = await _post(client, "/v1/ingest", data=body)
+        assert r.status == 202
+        b = await r.json()
+        assert b["accepted"] == 3 and b["invalid"] == 0 and b["deduped"] == 0
+        # JSON 数组行为不变：另一批用数组发，同样被接受
+        evs2 = [{"event_id": f"nda-{i}", "user_id": "u", "url": "/nda",
+                 "ts": NOW - 100, "bytes": 100} for i in range(3)]
+        r2 = await _post(client, "/v1/ingest",
+                         data=json.dumps(evs2).encode())
+        b2 = await r2.json()
+        assert r2.status == 202 and b2["accepted"] == 3
+    _serve(run)
+
+
+def test_ingest_ndjson_gzip():
+    async def run(client, engine, clock, app):
+        lines = [json.dumps(e) for e in _evs(10, "/ndgz", NOW - 100)]
+        body = _gzip(("\n".join(lines) + "\n").encode())
+        r = await _post(client, "/v1/ingest", data=body,
+                              headers={"Content-Encoding": "gzip"})
+        assert r.status == 202
+        b = await r.json()
+        assert b["accepted"] == 10 and b["invalid"] == 0
+    _serve(run)
+
+
+def test_ingest_ndjson_partial_invalid_line():
+    async def run(client, engine, clock, app):
+        # 中间一行不是合法 JSON → 计 invalid，不影响其他行
+        good = [json.dumps(e) for e in _evs(2, "/pnd", NOW - 100)]
+        body = ("\n".join([good[0], "{broken json line", good[1]]) + "\n").encode()
+        r = await _post(client, "/v1/ingest", data=body)
+        assert r.status == 202
+        b = await r.json()
+        assert b["accepted"] == 2 and b["invalid"] == 1
+    _serve(run)
+
+
 # ---- 写入错误码 ----
 
 def test_ingest_error_codes():
@@ -184,12 +229,14 @@ def test_ingest_error_codes():
         r = await _post(client, "/v1/ingest", data=b"[]",
                               headers={"Content-Encoding": "br"})
         assert r.status == 415 and "error" in _strict_json(await r.text())
-        # 400 非法 JSON
+        # 400 非法 JSON（既不是数组，也没有任何一行是合法 JSON）
         r = await _post(client, "/v1/ingest", data=b"{not json")
         assert r.status == 400 and "error" in _strict_json(await r.text())
-        # 400 顶层不是数组
+        # F2 起单个 JSON 对象按一行 NDJSON 处理（不再是 400）：字段不完整 →
+        # 计为 invalid，响应 202
         r = await _post(client, "/v1/ingest", data=b'{"a": 1}')
-        assert r.status == 400
+        b = await r.json()
+        assert r.status == 202 and b["invalid"] == 1 and b["accepted"] == 0
         # 413 gzip 解压后超过 4 MB（压缩后很小，能过 RawBudget，
         # 走 decode_body 的分块解压上限）
         bomb = _gzip(b"\0" * (20 * 1024 * 1024))
