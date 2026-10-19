@@ -132,6 +132,20 @@ def test_pending_limit_env_override(monkeypatch):
     assert _read_pending_limit() == DEFAULT_PENDING_BYTES
 
 
+def test_raw_budget_limit_env_override(monkeypatch):
+    """FLOWLENS_RAW_BUDGET_BYTES 覆盖原始请求体额度上限：合法值生效，非法/空/非正退回默认 8 MB。"""
+    from flowlens.api.app import _read_raw_budget_limit, DEFAULT_RAW_BUDGET_LIMIT
+    assert DEFAULT_RAW_BUDGET_LIMIT == 8 * 1024 * 1024  # 默认 8 MB
+    monkeypatch.setenv("FLOWLENS_RAW_BUDGET_BYTES", "16777216")  # 16 MB
+    assert _read_raw_budget_limit() == 16 * 1024 * 1024
+    monkeypatch.setenv("FLOWLENS_RAW_BUDGET_BYTES", "not-a-number")
+    assert _read_raw_budget_limit() == DEFAULT_RAW_BUDGET_LIMIT
+    monkeypatch.setenv("FLOWLENS_RAW_BUDGET_BYTES", "-5")
+    assert _read_raw_budget_limit() == DEFAULT_RAW_BUDGET_LIMIT
+    monkeypatch.delenv("FLOWLENS_RAW_BUDGET_BYTES")
+    assert _read_raw_budget_limit() == DEFAULT_RAW_BUDGET_LIMIT
+
+
 def test_admission_limit_2mb_rejects_3mb():
     """在途上限 2 MB 时，3 MB 请求预留不下（503 路径），2 MB 可预留。"""
     adm = Admission(limit=2 * 1024 * 1024)
@@ -366,6 +380,12 @@ def test_ingest_parsed_equals_ingest():
     """
     from flowlens.parse_pool import parse_body
     from flowlens.ingest import decode_body as _decode
+    # 本用例验证的是"写入核心"：同一解析结果走 in-proc（validate→ingest）与进程池
+    # （parse_body→ingest_parsed）是否等价。两条路径**用同一块大小切块**——in-proc
+    # 内部用 CHUNK_EVENTS（2000），这里手动切块也取它。之所以不取 POOLED_CHUNK_EVENTS
+    # （10000）：Top-K 名单是近似结构、堆成员对"逐秒 observe 的分批顺序"敏感，块大小
+    # 不同会在高基数流量的名单深尾部产生少量差异（sketch 固有性质，非 bug），那会污染
+    # 本用例想验证的写入核心等价性。块大小是性能旋钮、不是写入核心的正确性不变量。
     CE = ing_mod.CHUNK_EVENTS
 
     def run(body):
@@ -377,8 +397,8 @@ def test_ingest_parsed_equals_ingest():
 
         async def both():
             r1 = await s1.ingest(body, None)
-            # 进程池路径的分块写入口径（与 _ingest_pooled 一致：ingest_parsed + 2000 切块，
-            # 整批 invalid 放首块，让引擎计数器也计到）
+            # 进程池写入核心口径：ingest_parsed + 与 in-proc 相同的块大小切块，整批
+            # invalid 放首块，让引擎计数器也计到
             chunks = [parsed.chunk(i, i + CE) for i in range(0, len(parsed), CE)]
             if not chunks:
                 chunks = [parsed.chunk(0, 0)]
@@ -452,11 +472,19 @@ def _FakePool():
     return _FakePool()
 
 
-def test_pool_path_full_equivalence():
+def test_pool_path_full_equivalence(monkeypatch):
     """P1 §3.1（经 IngestService 的完整路径）：同一请求体分别走进程池路径（替身池，走
-    decode_body→parse_body→ingest_parsed→2000 切块→invalid 放首块）与单进程路径
-    （decode_body→validate→ingest），写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
-    覆盖 P1 点名的长尾、gzip、NDJSON、全随机。"""
+    decode_body→parse_body→ingest_parsed→POOLED_CHUNK_EVENTS 切块→invalid 放首块）与单进程
+    路径（decode_body→validate→ingest），写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
+    覆盖 P1 点名的长尾、gzip、NDJSON、全随机。
+
+    两条路径**用同一块大小切块**才能逐项相等：进程池路径用 POOLED_CHUNK_EVENTS（10000），
+    单进程路径用 CHUNK_EVENTS（默认 2000）。块大小不同会在高基数流量的 Top-K 名单深尾部
+    产生差异（TopK 堆成员对"逐秒 observe 分批顺序"敏感，sketch 固有性质、非 bug）。本用例
+    验证的是"路径"（in-proc vs 进程池）等价，故临时把 CHUNK_EVENTS 对齐到
+    POOLED_CHUNK_EVENTS，把块大小这个性能旋钮固定住、只留路径变量。
+    """
+    monkeypatch.setattr(ing_mod, "CHUNK_EVENTS", ing_mod.POOLED_CHUNK_EVENTS)
     eng, svc = _svc()
     svc._pool = _FakePool()
     svc._parse_inproc = False          # 强制走 _ingest_pooled（替身池）

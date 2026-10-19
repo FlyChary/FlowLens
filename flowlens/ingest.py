@@ -48,6 +48,13 @@ MAX_PENDING_BYTES = _read_pending_limit()
 # 依据：写入引擎每条约 2.5 μs，单块 2000 条约 5 ms；混合负载下查询 p99 高的原因是
 # 查询排在多个写入块之后，缩短单块同步耗时能压低事件循环被独占的时间。
 CHUNK_EVENTS = 2000
+# 进程池路径的写入块大小（P1b 二点五）：跨进程传输可忽略（0.1 μs/条），主进程每条耗时
+# 严重依赖块大小（每块有按秒分组、逐维度去重统计、numpy 调用、筛选候选等固定开销）——
+# 审查方实测块 2000 约 2.98 μs/条、块 10000 约 1.88 μs/条。有写入信号量，同一时刻只写一块
+# （块 10000 约 25 ms），查询最多等一块，仍在 50 ms 内。故进程池路径取 10000。
+# 注意：Top-K 名单是近似结构、堆成员对"逐秒 observe 的分批顺序"敏感——不同块大小会在
+# 名单深尾部产生少量差异（见 test_ingest 的等价性用例说明），这是 sketch 的固有性质，非 bug。
+POOLED_CHUNK_EVENTS = 10000
 # "写入引擎"这一步同时进行的请求数上限（用户决定五）：写入引擎是单写者，串行化避免
 # 多个写入块背靠背独占事件循环、拖高查询 p99。
 DEFAULT_ENGINE_WRITE_CONCURRENCY = 1
@@ -226,7 +233,7 @@ class IngestService:
 
     async def _ingest_pooled(self, raw: bytes) -> IngestResult:
         """进程池路径：把**解压后**的字节交给子进程解析（load_array+validate+三列哈希），
-        拿回 ParsedBatch 后按 CHUNK_EVENTS 切块、分块写引擎（信号量保护、块间让出）。
+        拿回 ParsedBatch 后按 POOLED_CHUNK_EVENTS 切块、分块写引擎（信号量保护、块间让出）。
 
         解压已在主进程完成（决定一）；子进程只做纯计算，异常（BadRequest 等）原样传回。
         子进程崩溃（BrokenProcessPool）时重建进程池、当前请求 503（此时**尚未去重**，
@@ -244,8 +251,8 @@ class IngestService:
         # engine.ingest 更新 counters.invalid 口径一致）：把它放在第一个块上（chunk 默认
         # invalid=0，这里给首块赋上整批 invalid）。全非法请求体 parsed 为空、切不出块，
         # 用单块承载 invalid，保证计数器仍计到（test_ingest_all_invalid_chunked_counted）。
-        chunks = [parsed.chunk(i, i + CHUNK_EVENTS)
-                  for i in range(0, len(parsed), CHUNK_EVENTS)]
+        chunks = [parsed.chunk(i, i + POOLED_CHUNK_EVENTS)
+                  for i in range(0, len(parsed), POOLED_CHUNK_EVENTS)]
         if not chunks:
             chunks = [parsed.chunk(0, 0)]
         chunks[0].invalid = parsed.invalid
