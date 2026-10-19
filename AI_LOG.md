@@ -519,3 +519,9 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - 背景：F2 提交前检查发现 tools 里残留本机 WSL/Windows 绝对路径，换机器（如评测方全新克隆）会失效。
 - 改动：① profile_server.py 的 REPO_ROOT 改由 Path(__file__).resolve().parents[1] 推算，OUT_ROOT 默认落到仓库内 results/T11a（新增 --out-root 覆盖），LOADGEN_PY 默认 sys.executable（新增 --loadgen-py 与 FLOWLENS_LOADGEN_PY 环境变量覆盖，路径不存在时回退当前解释器）；② run_matrix.sh 的 cd 改为 (dirname $0)/../..，venv 激活改为仅在设置 FLOWLENS_VENV 时 source，否则用当前 python。
 - 验证：git grep 复查 tools/、tests/、flowlens/、Dockerfile、run.sh、README.md 无残留执行代码级本机路径（docs/AI_LOG/注释里的历史路径保留）；pytest -q 全过（350 passed, 3 skipped, 9 deselected）。未触及热路径，未跑基准。
+
+### 2026-10-19 F2 第五节：设计文档更新后打包提交材料
+
+- 用户推送设计文档后触发：先 git pull（合入 docs/DESIGN.md 终版 + 新增 docs/DESIGN.pdf），再 git archive HEAD 打包。
+- 产物：仓库外 D:/tmp/flowlens-submission.zip（3.4 MB，158 条目，zip 校验 OK）。顶层核对齐全：README.md、Dockerfile、run.sh、constraints.txt、pyproject.toml、AI_LOG.md、flowlens/、tests/、tools/、docs/DESIGN.md 及 docs/ 配图（DESIGN.pdf 与 4 张 png）；确认无 .git、无顶层 results/ 混入（git archive 只取已提交内容，results/T11a 亦被 gitignore）。
+- 备注：zip 用 HEAD 版本，工作区里两处未提交改动（README.md +2 行、docs/research/初期调研.md、新图 docs/research/Count-Min Sketch.png）未包含，符合 F2"只含已提交文件"；zip 未提交进仓库。未触及热路径，未跑基准。
