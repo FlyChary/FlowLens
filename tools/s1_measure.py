@@ -148,18 +148,28 @@ async def run_loadgen(url: str, rate: int, dur: float, batch: int,
     return summary
 
 
-async def mem_peak(url: str, stop: asyncio.Event) -> int:
-    """每秒读一次 healthz 的 memory_bytes，返回峰值（字节）；只用于工作集峰值。"""
-    peak = 0
+async def mem_sample(url: str, stop: asyncio.Event) -> dict:
+    """每秒读一次 healthz，返回本档窗口内的：工作集峰值（memory_bytes）、原始读数峰值
+    （memory_current_bytes）、达到的最大降级级别（degrade.level）。只用于记录，不参与其他计算。"""
+    ws = cur = 0
+    max_level = 0
     while not stop.is_set():
-        v = (await healthz(url)).get("memory_bytes")
-        if isinstance(v, (int, float)):
-            peak = max(peak, v)
+        d = await healthz(url)
+        for k in ("memory_bytes", "memory_current_bytes"):
+            v = d.get(k)
+            if isinstance(v, (int, float)):
+                if k == "memory_bytes":
+                    ws = max(ws, v)
+                else:
+                    cur = max(cur, v)
+        lvl = (d.get("degrade") or {}).get("level")
+        if isinstance(lvl, int):
+            max_level = max(max_level, lvl)
         try:
             await asyncio.wait_for(stop.wait(), timeout=1.0)
         except asyncio.TimeoutError:
             pass
-    return peak
+    return {"ws_peak": ws, "memcur_peak": cur, "max_level": max_level}
 
 
 async def measure_level(url, container, main_pid, rate, dur, batch, workers, load_cp, seed):
@@ -168,12 +178,12 @@ async def measure_level(url, container, main_pid, rate, dur, batch, workers, loa
     parse0 = find_parse_pids(main_pid)
     C0 = cpu_times([main_pid] + parse0)
     stop = asyncio.Event()
-    mt = asyncio.create_task(mem_peak(url, stop))
+    mt = asyncio.create_task(mem_sample(url, stop))
     t0 = time.monotonic()
     summary = await run_loadgen(url, rate, dur, batch, workers, load_cp, seed)
     await asyncio.sleep(1.0)                       # 让最后几个请求写完
     H1 = await healthz(url)
-    stop.set(); peak = await mt
+    stop.set(); mem = await mt
     parse1 = find_parse_pids(main_pid)
     C1 = cpu_times([main_pid] + parse1)
     t1 = time.monotonic()
@@ -188,17 +198,23 @@ async def measure_level(url, container, main_pid, rate, dur, batch, workers, loa
     sent_lg = int(summary.get("sent", 0) or 0)
     cross = abs(acc - acc_lg) / acc * 100 if acc else None
     return {
-        "rate": rate, "sent_lg": sent_lg, "acc_h": acc, "acc_lg": acc_lg,
+        "rate": rate, "sent_target": int(rate * dur), "sent_lg": sent_lg,
+        "sent_rate": round(sent_lg / (rate * dur), 4) if rate else None,
+        "acc_h": acc, "acc_lg": acc_lg,
         "errors_lg": int(summary.get("errors", 0) or 0),
         "cross_pct": round(cross, 1) if cross is not None else None,
         "cross_ok": cross is not None and cross <= 2.0,
         "accept_rate": round(acc / sent_lg, 4) if sent_lg else None,
         "inflight_rej": infl, "raw_rej": rawr,
-        "degraded": H1.get("degraded"),
+        "max_degrade_level": mem["max_level"],          # 本档窗口内达到的最大降级级别
         "main_cpu_pct": round(main_sec / wall * 100, 1) if wall > 0 else None,
         "main_us_ev": round(main_sec / acc * 1e6, 2) if acc > 0 else None,
         "parse_cpu_pct": round(parse_sec / wall * 100, 1) if wall > 0 else None,
-        "parse_procs": len(parse1), "ws_peak_mb": round(peak / 1048576, 1), "wall_s": round(wall, 1),
+        "loadgen_cpu_pct": summary.get("client_cpu_pct"),  # 压测进程合计（worker 之和 ÷ 时长）
+        "parse_procs": len(parse1),
+        "ws_peak_mb": round(mem["ws_peak"] / 1048576, 1),
+        "memcur_peak_mb": round(mem["memcur_peak"] / 1048576, 1),
+        "wall_s": round(wall, 1),
     }
 
 
@@ -213,8 +229,8 @@ async def main_async(args) -> dict:
         env += ["-e", f"FLOWLENS_MAX_PENDING_BYTES={args.max_pending_bytes}"]
     if args.raw_budget_bytes:
         env += ["-e", f"FLOWLENS_RAW_BUDGET_BYTES={args.raw_budget_bytes}"]
-    await _run(["docker", "run", "--rm", "-d", "--name", name, "--memory=256m",
-                "--memory-swap=256m", f"--cpuset-cpus={args.svc_cp}", *env,
+    await _run(["docker", "run", "--rm", "-d", "--name", name, f"--memory={args.mem}",
+                f"--memory-swap={args.mem}", f"--cpuset-cpus={args.svc_cp}", *env,
                 "-p", f"{port}:8080", args.image])
     try:
         if not await wait_ready(url):
@@ -230,12 +246,15 @@ async def main_async(args) -> dict:
             row = await measure_level(url, name, main_pid, rate, args.level_sec, args.batch,
                                       args.load_workers, args.load_cp, 100 + i)
             rows.append(row)
-            print(f"  acc_h={row['acc_h']} acc_lg={row['acc_lg']} acc={row['accept_rate']} "
-                  f"infl={row['inflight_rej']} raw={row['raw_rej']} main_cpu={row['main_cpu_pct']}% "
+            print(f"  acc_h={row['acc_h']} sent={row['sent_lg']}/{row['sent_target']} "
+                  f"acc={row['accept_rate']} infl={row['inflight_rej']} raw={row['raw_rej']} "
+                  f"maxlvl={row['max_degrade_level']} main_cpu={row['main_cpu_pct']}% "
                   f"us/ev={row['main_us_ev']} parse_cpu={row['parse_cpu_pct']}% "
-                  f"ws={row['ws_peak_mb']}MiB cross={row['cross_pct']}% ok={row['cross_ok']}",
+                  f"load_cpu={row['loadgen_cpu_pct']}% ws={row['ws_peak_mb']}MiB "
+                  f"memcur={row['memcur_peak_mb']}MiB cross={row['cross_pct']}% ok={row['cross_ok']}",
                   flush=True)
         result = {"label": args.label, "image": args.image, "pool": args.pool, "expect_parse": expect,
+                  "mem": args.mem,
                   "max_pending_bytes": args.max_pending_bytes, "raw_budget_bytes": args.raw_budget_bytes,
                   "svc_cp": args.svc_cp, "load_cp": args.load_cp, "load_workers": args.load_workers,
                   "level_sec": args.level_sec, "batch": args.batch, "port": port, "rows": rows}
@@ -253,6 +272,7 @@ def main() -> None:
     ap.add_argument("--image", required=True)
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--svc-cp", default="0,2,4,6")
+    ap.add_argument("--mem", default="256m", help="容器内存上限（评测=256m；本地分离实验可放宽）")
     ap.add_argument("--load-cp", default="8-15")
     ap.add_argument("--load-workers", type=int, default=8)
     ap.add_argument("--rates", default="40000,60000,80000")
