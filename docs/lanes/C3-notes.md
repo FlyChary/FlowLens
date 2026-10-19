@@ -92,12 +92,12 @@ RssAnon 随时间、降级级别、接受率、trim 回收量（/healthz 的 mal
 3. **在途额度可配**：DESIGN 把在途上限 4 MB 写死。需注明可用
    `FLOWLENS_MAX_PENDING_BYTES` 覆盖（实验/调参用）。
 4. **/healthz 的 malloc_trim 字段**：响应字段清单补一条。
-5. **glibc mmap/trim 阈值（推荐固化进镜像）**：DESIGN 未提。C3 实测
+5. **glibc mmap/trim 阈值（已固化进镜像，DESIGN 待补）**：C3 实测
    `MALLOC_MMAP_THRESHOLD_=131072` + `MALLOC_TRIM_THRESHOLD_=131072` 使满载峰值
-   −57.7 MiB、全程第 0 级。需注明"部署清单/Dockerfile 加这两个 ENV"；**固化进
-   Dockerfile 是一行改动，但 Dockerfile 不在本支线修改清单内，留给主线**（含：
-   确认评测容器启动方式是否透传 ENV——`docker run` 不显式 `-e` 时会继承镜像 ENV，
-   所以写进 Dockerfile 后评测容器自动生效，这正是固化的理由）。
+   −57.7 MiB、全程第 0 级。用户已批准在 Dockerfile base 阶段加这两个 ENV（本支线
+   例外放行，注释写明 g5 依据）；`docker run` 不显式 `-e` 时继承镜像 ENV，评测容器
+   自动生效。DESIGN 需补一句"部署时固定 glibc 大块/trim 门槛为 128 KB（Dockerfile
+   ENV）"及依据。
 
 ## 四-A、追加对照：glibc mmap/trim 阈值（用户追加指令，2026-10-19）
 
@@ -125,11 +125,11 @@ trim 累计回收 total_freed_mb，见"四-C"）。
 - 推荐组合升级为 **g5 = trim + 驻留 + 两个 mmap/trim 环境变量**；**T9b-B 不需要**
   （无内存压力可解决，且 C1 已证缩 Bloom/HLL 都是拿精度换内存）。
 - **待办（内存问题解决后）**：g5 配置下重做 S3（全程 0 级下的最终精度数据）。
-- **未解决问题（重要）**：这两个环境变量**只在容器启动时带上才生效**。评测容器是
-  `docker run --memory=256m` 起的，若评测脚本不带 `-e`，收益丢失。要固化只能改
-  **Dockerfile**（加一行 `ENV MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072`），
-  而 Dockerfile 不在 C3 支线允许修改清单内——**留给主线**（一行改动，需用户批准后合入；
-  同时记入"设计文档待改项"第 5 条）。
+- **ENV 固化（用户已批准，本支线改 Dockerfile）**：用户批准在 base 阶段加
+  `ENV MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072`（注释写明 g5 依据）。
+  镜像 ENV 会被 `docker run` 继承（不显式 `-e` 也生效），所以评测容器自动带上，收益固化。
+  `docker build --target test` 复验通过。**S3/S4 不重跑**——用户指令：等合并后在最终
+  代码上统一跑。
 
 ## 四-C、工具补充（为对照实验）
 
@@ -173,5 +173,7 @@ trim 累计回收 total_freed_mb，见"四-C"）。
   - 用户确认"主线未跑实验，可以跑容器"。
   - 用户确认"允许改 app.py 的 _healthz 加 malloc_trim 只读字段"（原清单不允许改
     app.py，属支线规则外的必要放行）。
+  - 用户追加 mmap 阈值对照实验（g5），并**批准改 Dockerfile**（原清单不允许，例外
+    放行）固化两个 glibc ENV；S3/S4 不重跑、等合并后在最终代码上统一跑。
 - 若后续审查认为驻留应只 user 侧（C1 的原始建议）而非 user+url 两侧，url 侧的
   `url_intern` 可在 `FLOWLENS_INTERN_URL_CAP=0` 下关闭，不影响 user 侧。
