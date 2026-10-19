@@ -348,7 +348,7 @@ def build_ledger(engine: Engine, qsvc: QueryService) -> dict:
 
 def _rss_bytes() -> int:
     try:
-        with open("/proc/self/statm") as f:
+        with open("/proc/self/statm", encoding="utf-8") as f:
             return int(f.read().split()[1]) * 4096
     except OSError:
         try:

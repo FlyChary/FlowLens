@@ -153,7 +153,7 @@ def proc_status(root: str = "/") -> dict:
     碎片/泄漏判断的核心信号。读不到（如 Windows）返回空 dict。"""
     out: dict = {}
     try:
-        with open(Path(root) / "proc" / "self" / "status") as f:
+        with open(Path(root) / "proc" / "self" / "status", encoding="utf-8") as f:
             for line in f:
                 if line.startswith("VmRSS:"):
                     out["VmRSS_bytes"] = int(line.split()[1]) * 1024
