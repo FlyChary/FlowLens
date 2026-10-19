@@ -86,6 +86,20 @@ def test_normalize_url_cache_is_shared():
     assert a == b == "/a/b"
 
 
+def test_normalize_url_interns_result():
+    """C3：归一化结果做驻留——路径带不同 ID 的原始 URL 归一化后内容相同，
+    应返回同一个字符串对象（不走归一化缓存：两个 raw 的缓存键不同）。"""
+    import flowlens.model as m
+    # 清掉 norm 缓存与 url 驻留表，确保这条断言靠"驻留"而不是"norm 缓存命中"
+    m.clear_norm_cache()
+    if m.url_intern is not None:
+        m.url_intern.clear()
+    a = normalize_url("/order/1")   # → /order/{id}
+    b = normalize_url("/order/2")   # → /order/{id}（不同的缓存键 /order/2）
+    assert a == b == "/order/{id}"
+    assert a is b, "归一化结果应被驻留成同一对象"
+
+
 def test_normalize_url_same_result_before_and_after_cache_change():
     """T10b：归一化缓存改"先剥 query/fragment 再查"后，结果必须与修改前逐字节一致。
 

@@ -11,6 +11,9 @@ CPU 核上（单线程服务一个核足够），压测进程固定在其他核�
   随机 at+window 回放 topk、stats）与 4 组共 20 个 SSE 订阅，持续 120 秒。
 - S3 精度：指定分布（默认长尾）3 万/秒 5 分钟并存档；运行期每秒记录默认窗口
   topk+stats 的服务响应；结束后（数据仍在保留期）抽 200 个已定稿区间与精确解比较。
+- S4 攻击流量（C3）：全随机分布（每个 URL 与用户都不重复）3 万/秒 10 分钟 + 停发
+  观察 60 秒。记录工作集/RssAnon 随时间、降级级别、接受率、trim 回收量与"每分钟
+  一行"汇总表——对抗性流量下内存有界的直接证据。
 - S5 过载与恢复：以 S1 最大可持续的 1.5 倍发送 60 秒，停发后再观察 60 秒，记录降级
   级别随时间变化与恢复时间。
 
@@ -52,6 +55,11 @@ S2_WRITE_FRAC = 0.70                 # S2 写入速率 = S1 最大可持续 × 0
 S3_RATE = 30_000                     # S3 固定 3 万/秒
 S3_SEC = 300                         # S3 5 分钟
 S3_SAMPLES = 200                     # S3 结束时抽 200 个已定稿区间
+S4_RATE = 30_000                     # S4 攻击流量：3 万/秒
+S4_SEC = 600                         # S4 持续 10 分钟（对抗性流量下内存有界的直接证据）
+SUST_RATE = 30_000                   # SUST 持续负载（C3 对比实验组 2~4 用）：长尾 3 万/秒
+SUST_SEC = 300                       # SUST 5 分钟（与 C2 基线同参数）
+SUST_TAIL = 60                       # SUST 停发后观察 60 秒（看回落）
 S5_OVERLOAD_FRAC = 1.5               # S5 过载 = S1 最大可持续 × 1.5
 S5_OVERLOAD_SEC = 60
 S5_OBSERVE_SEC = 60
@@ -227,16 +235,26 @@ def _free_port() -> int:
     return port
 
 
-async def start_service(target: str, port: int, image: str,
-                        workdir: str) -> Service:
-    """启动一个全新服务，等 /healthz 就绪后返回。"""
-    env = dict(os.environ, PYTHONHASHSEED="0", NO_PROXY="localhost,127.0.0.1")
+async def start_service(target: str, port: int, image: str, workdir: str,
+                        extra_env: dict | None = None) -> Service:
+    """启动一个全新服务，等 /healthz 就绪后返回。
+
+    extra_env：额外注入服务进程的环境变量（C3 实验组用它开/关 malloc_trim、
+    驻留、在途额度）。docker 目标翻译成 -e K=V，local 目标合进子进程 env。
+    """
+    extra_env = extra_env or {}
+    env = dict(os.environ, PYTHONHASHSEED="0", NO_PROXY="localhost,127.0.0.1",
+               **extra_env)
     if target == "docker":
         name = "flowlens-exp-" + datetime.datetime.now().strftime("%H%M%S%f")
+        env_args = []
+        for k, v in extra_env.items():
+            env_args += ["-e", f"{k}={v}"]
         proc = await asyncio.create_subprocess_exec(
             "docker", "run", "--rm", "-d", "--name", name,
             "--memory=256m", "--memory-swap=256m",
             f"--cpuset-cpus={SVC_CORE}",
+            *env_args,
             "-p", f"{port}:8080", image,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.wait()
@@ -796,6 +814,96 @@ async def run_s3(svc: Service, outdir: str, *, rate: int, duration: float,
     return summary
 
 
+async def run_sustained(svc: Service, outdir: str, *, rate: int,
+                        duration: float, batch: int, mode: str,
+                        seed: int, tail_sec: float = 60.0,
+                        minute_mark: bool = True) -> dict:
+    """持续负载内存曲线：固定速率跑 duration 秒 + 停发后观察 tail_sec 秒。
+
+    C3 的对比实验（组 2~4）与 S4 攻击流量都用它：长尾 3 万/秒 × 5 分钟（对比）
+    或全随机 3 万/秒 × 10 分钟（S4）。记录工作集 / RssAnon 随时间、降级级别、
+    接受率、malloc_trim 回收量（/healthz 的 malloc_trim 字段，组 2 起生效），
+    以及"每分钟一行"的汇总表（工作集、降级、接受率、trim 累计回收 MiB）。
+
+    返回 summary（含 memory、per_minute、load、degrade 级别序列）。
+    """
+    samples: list[dict] = []
+    stop = asyncio.Event()
+    mon = asyncio.create_task(_monitor(svc, stop, samples))
+    total = duration + tail_sec
+    # run_loadgen 返回 (summary, seconds) 元组；asyncio.sleep 返回 None。gather 按
+    # 顺序返回两者，解包时要先接住 run_loadgen 的元组再拆开，别把 sleep 的 None
+    # 当成 seconds（否则 merge_timeline 拿到 None 会崩）。
+    (lg_summary, lg_seconds), _ = await asyncio.gather(
+        run_loadgen(svc, rate=rate, duration=duration, batch=batch,
+                    gzip=False, mode=mode, seed=seed),
+        asyncio.sleep(total),  # 负载 + 停发观察尾巴
+    )
+    stop.set()
+    await mon
+    _write_jsonl(os.path.join(outdir, "timeline.jsonl"),
+                 merge_timeline(samples, lg_seconds))
+
+    # 降级级别随时间（t 秒 → 级别）
+    level_seq = [(s["t"], (s.get("healthz") or {}).get("degrade", {}).get("level"))
+                 for s in samples]
+    # malloc_trim 累计调用次数与累计耗时（/healthz 的 malloc_trim 字段）
+    trim_calls = [ (s.get("healthz") or {}).get("malloc_trim", {}).get("call_count", 0)
+                   for s in samples if (s.get("healthz") or {}).get("malloc_trim") ]
+    trim_total_ms = [ (s.get("healthz") or {}).get("malloc_trim", {}).get("total_ms", 0.0)
+                      for s in samples if (s.get("healthz") or {}).get("malloc_trim") ]
+    # 每分钟一行：工作集 MiB、降级级别、接受率、trim 累计回收
+    per_minute = []
+    if minute_mark:
+        t0 = samples[0]["t"] if samples else 0
+        for m in range(0, int(total // 60) + 1):
+            sec = m * 60
+            win = [s for s in samples
+                   if t0 // 1000 + sec - 1 <= s["t"] // 1000 <= t0 // 1000 + sec + 1]
+            if not win:
+                continue
+            ws = [(s.get("healthz") or {}).get("memory_bytes") for s in win]
+            ws = [w for w in ws if w is not None]
+            lvl = (win[-1].get("healthz") or {}).get("degrade", {}).get("level", 0)
+            acc = [s.get("accepted", 0) for s in win]
+            sent = [s.get("sent", 0) for s in win]
+            tm = (win[-1].get("healthz") or {}).get("malloc_trim") or {}
+            per_minute.append({
+                "minute": m,
+                "ws_peak_mb": mem_mb(max(ws)) if ws else None,
+                "level": lvl,
+                "accepted": sum(acc), "sent": sum(sent),
+                "accept_ratio": round(sum(acc) / sum(sent), 4) if sum(sent) else None,
+                "trim_call_count": tm.get("call_count", 0),
+                "trim_total_ms": tm.get("total_ms", 0.0),
+            })
+    summary = {
+        "scenario": "SUSTAINED", "rate": rate, "mode": mode,
+        "duration_s": duration, "tail_s": tail_sec,
+        "load": lg_summary, "memory": mem_timeline(samples),
+        "trim_calls_total": trim_calls[-1] if trim_calls else 0,
+        "trim_total_ms": trim_total_ms[-1] if trim_total_ms else 0.0,
+        "per_minute": per_minute,
+        "degrade_level_seq": level_seq,
+    }
+    write_summary(outdir, summary)
+    return summary
+
+
+async def run_s4(svc: Service, outdir: str, *, rate: int, duration: float,
+                 batch: int) -> dict:
+    """S4 攻击流量：全随机分布（每个 URL 与用户都不重复）持续 duration 秒。
+
+    这是题目"对抗性流量下内存有界"的直接证据：驻留表在随机流量下每个值都不
+    重复、表只涨命中不到，若整体清空策略生效，驻留表自身内存应钉死在 cap 以内，
+    不随事件数增长。"""
+    s = await run_sustained(svc, outdir, rate=rate, duration=duration,
+                            batch=batch, mode="随机", seed=400)
+    s["scenario"] = "S4"
+    write_summary(outdir, s)
+    return s
+
+
 async def run_s5(svc: Service, outdir: str, *, base_rate: int,
                  overload_sec: float, observe_sec: float, batch: int) -> dict:
     """S5 过载与恢复：以 1.5× 最大可持续发送 overload_sec 秒，停发后观察 observe_sec 秒。"""
@@ -839,7 +947,7 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
                         image: str, workdir: str, batch: int,
                         rates: list[int], s1_level_sec: int,
                         mode: str, pip_index: str | None,
-                        results_root: str) -> dict:
+                        results_root: str, extra_env: dict | None = None) -> dict:
     rng = __import__("numpy").random.default_rng(1234)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     root = os.path.join(results_root, stamp)
@@ -853,7 +961,7 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
         for gz in (False, True):
             d = os.path.join(root, f"S1_{'gzip' if gz else 'plain'}")
             os.makedirs(d, exist_ok=True)
-            svc = await start_service(target, port, image, workdir)
+            svc = await start_service(target, port, image, workdir, extra_env=extra_env)
             try:
                 write_meta(d, scenario="S1", target=target, port=port,
                            cpu_alloc=cpu_alloc,
@@ -875,7 +983,7 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
     if "S2" in names:
         d = os.path.join(root, "S2")
         os.makedirs(d, exist_ok=True)
-        svc = await start_service(target, port, image, workdir)
+        svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
             write_meta(d, scenario="S2", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"write_frac": S2_WRITE_FRAC, "duration_s": S2_SEC,
@@ -890,7 +998,7 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
     if "S3" in names:
         d = os.path.join(root, "S3")
         os.makedirs(d, exist_ok=True)
-        svc = await start_service(target, port, image, workdir)
+        svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
             write_meta(d, scenario="S3", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"rate": S3_RATE, "duration_s": S3_SEC, "batch": batch,
@@ -905,7 +1013,7 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
     if "S5" in names:
         d = os.path.join(root, "S5")
         os.makedirs(d, exist_ok=True)
-        svc = await start_service(target, port, image, workdir)
+        svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
             write_meta(d, scenario="S5", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"overload_frac": S5_OVERLOAD_FRAC,
@@ -918,6 +1026,39 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
         finally:
             await svc.stop()
         out["S5"] = r
+
+    if "S4" in names:
+        d = os.path.join(root, "S4")
+        os.makedirs(d, exist_ok=True)
+        svc = await start_service(target, port, image, workdir, extra_env=extra_env)
+        try:
+            write_meta(d, scenario="S4", target=target, port=port, cpu_alloc=cpu_alloc,
+                       params={"rate": S4_RATE, "duration_s": S4_SEC, "batch": batch,
+                               "mode": "随机", "tail_s": 60},
+                       image=image if target == "docker" else None)
+            r = await run_s4(svc, d, rate=S4_RATE, duration=S4_SEC, batch=batch)
+        finally:
+            await svc.stop()
+        out["S4"] = r
+
+    if "SUST" in names:
+        # C3 对比实验组（2~4）：长尾 3 万/秒 × 5 分钟持续负载，行为由 --extra-env 切换
+        # （trim / 驻留 / 在途额度）。每组一个新容器，跑完停掉，结果各存一个子目录。
+        d = os.path.join(root, "SUST")
+        os.makedirs(d, exist_ok=True)
+        svc = await start_service(target, port, image, workdir, extra_env=extra_env)
+        try:
+            write_meta(d, scenario="SUST", target=target, port=port, cpu_alloc=cpu_alloc,
+                       params={"rate": SUST_RATE, "duration_s": SUST_SEC, "batch": batch,
+                               "mode": "长尾", "tail_s": SUST_TAIL,
+                               "extra_env": extra_env or {}},
+                       image=image if target == "docker" else None)
+            r = await run_sustained(svc, d, rate=SUST_RATE, duration=SUST_SEC,
+                                    batch=batch, mode="长尾", seed=350,
+                                    tail_sec=SUST_TAIL)
+        finally:
+            await svc.stop()
+        out["SUST"] = r
 
     return {"root": root, "results": out}
 
@@ -939,7 +1080,20 @@ def main() -> None:
     p.add_argument("--pip-index", default=None,
                    help="docker build 的 PIP_INDEX_URL（可选，走国内源）")
     p.add_argument("--results", default="results", help="结果根目录")
+    p.add_argument("--extra-env", action="append", default=[],
+                   metavar="K=V",
+                   help="额外注入服务进程的环境变量（可多次）。C3 实验组用它"
+                        "开/关 malloc_trim（FLOWLENS_MALLOC_TRIM_SEC）、驻留"
+                        "（FLOWLENS_INTERN_USER_CAP/URL_CAP=0）、在途额度"
+                        "（FLOWLENS_MAX_PENDING_BYTES）。")
     args = p.parse_args()
+
+    extra_env = {}
+    for kv in args.extra_env:
+        if "=" not in kv:
+            p.error(f"--extra-env 需要 K=V 形式，收到 {kv!r}")
+        k, v = kv.split("=", 1)
+        extra_env[k] = v
 
     workdir = os.path.dirname(TOOLS)
     t0 = time.monotonic()
@@ -947,7 +1101,7 @@ def main() -> None:
         args.scenarios, target=args.target, port=args.port, image=args.image,
         workdir=workdir, batch=args.batch, rates=args.s1_rates,
         s1_level_sec=args.s1_level_sec, mode=args.mode, pip_index=args.pip_index,
-        results_root=args.results))
+        results_root=args.results, extra_env=extra_env))
     dt = time.monotonic() - t0
     print(f"\n[experiments] 完成，用时 {dt:.0f}s，结果目录：{result['root']}", flush=True)
     for name, r in result["results"].items():

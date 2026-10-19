@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import sys
 import zlib
 
 import numpy as np
@@ -112,6 +114,31 @@ def test_decode_truncated_gzip():
     full = _gzip(b"hello world " * 1000)
     with pytest.raises(BadRequest):
         decode_body(full[: len(full) // 2], "gzip")
+
+
+# ---- 在途上限的环境变量覆盖（C3 实验变量）----
+
+def test_pending_limit_env_override(monkeypatch):
+    """FLOWLENS_MAX_PENDING_BYTES 覆盖在途上限：合法值生效，非法/空退回默认。"""
+    from flowlens.ingest import _read_pending_limit, DEFAULT_PENDING_BYTES
+    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "2097152")  # 2 MB
+    assert _read_pending_limit() == 2 * 1024 * 1024
+    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "not-a-number")
+    assert _read_pending_limit() == DEFAULT_PENDING_BYTES
+    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "-5")
+    assert _read_pending_limit() == DEFAULT_PENDING_BYTES
+    monkeypatch.delenv("FLOWLENS_MAX_PENDING_BYTES")
+    assert _read_pending_limit() == DEFAULT_PENDING_BYTES
+
+
+def test_admission_limit_2mb_rejects_3mb():
+    """在途上限 2 MB 时，3 MB 请求预留不下（503 路径），2 MB 可预留。"""
+    adm = Admission(limit=2 * 1024 * 1024)
+    assert adm.can_reserve(3 * 1024 * 1024) is False
+    assert adm.try_reserve(3 * 1024 * 1024) is False
+    assert adm.pending == 0
+    assert adm.try_reserve(2 * 1024 * 1024) is True
+    assert adm.pending == 2 * 1024 * 1024
 
 
 # ---- IngestService 计数与错误 ----
@@ -363,3 +390,78 @@ def test_refresh_snapshot_async_matches_sync():
         assert s_sync.p95_bytes == s_async.p95_bytes
         assert s_sync.distinct_users == s_async.distinct_users
     asyncio.run(main())
+
+
+# ---- 定期 malloc_trim（C3）----
+
+def test_malloc_trim_non_linux_no_error(monkeypatch):
+    """非 Linux（或找不到 libc）时 malloc_trim() 什么都不做、不报错。
+
+    Windows 上真实路径即非 Linux；Linux 上则把 _LIBC 置成加载失败来模拟。
+    两种情况下都应返回 False、不抛异常。"""
+    import flowlens.ticker as tk
+    if os.name == "posix" and not sys.platform.startswith("win"):
+        # Linux：模拟 libc 加载失败（置 _LIBC=False，让 _load_libc 返回 None）
+        monkeypatch.setattr(tk, "_LIBC", False)
+    else:
+        # Windows：os.name != "posix" 直接短路，无需改 _LIBC
+        pass
+    assert tk.malloc_trim() is False
+
+
+def test_malloc_trim_linux_calls_libc(monkeypatch):
+    """Linux：malloc_trim 成功时返回 True，且确实调用了 libc.malloc_trim(0)。"""
+    if not (os.name == "posix" and not sys.platform.startswith("win")):
+        pytest.skip("仅 Linux 有 libc.malloc_trim")
+    import flowlens.ticker as tk
+    calls = []
+
+    class _FakeLib:
+        def malloc_trim(self, arg):
+            calls.append(arg)
+            return 1
+
+    monkeypatch.setattr(tk, "_LIBC", _FakeLib())
+    assert tk.malloc_trim() is True
+    assert calls == [0]
+
+
+def test_malloc_trim_no_symbol(monkeypatch):
+    """加载到的 libc 没有 malloc_trim 符号（如 musl）时返回 False、不报错。"""
+    import flowlens.ticker as tk
+    monkeypatch.setattr(tk, "_LIBC", object())  # 没有 malloc_trim 属性
+    assert tk.malloc_trim() is False
+
+
+def test_ticker_trim_disabled_on_windows():
+    """Windows 上 trim.enabled 恒为 False（平台不支持 malloc_trim）。"""
+    if os.name == "posix" and not sys.platform.startswith("win"):
+        pytest.skip("仅 Windows 上验证 trim 被平台关闭")
+    eng = Engine(Config(), FakeClock(NOW))
+    ticker = Ticker(eng, period=1.0, trim_period=10.0)
+    assert ticker.trim.enabled is False
+
+
+def test_ticker_trim_respects_period(monkeypatch):
+    """trim_period 之内不重复触发：第一拍设基准、未到点跳过、到点后触发一次。
+
+    直接驱动 _maybe_trim（墙钟参数），不真等 10 秒；强制 enabled 让非 Linux
+    平台也走触发逻辑，打桩 malloc_trim 与 _rss_anon_bytes 记录调用。"""
+    import flowlens.ticker as tk
+    eng = Engine(Config(), FakeClock(NOW))
+    ticker = Ticker(eng, period=1.0, trim_period=10.0)
+    monkeypatch.setattr(ticker.trim, "enabled", True)
+    calls = {"n": 0}
+    monkeypatch.setattr(tk, "malloc_trim", lambda: calls.__setitem__("n", calls["n"] + 1) or True)
+    monkeypatch.setattr(tk, "_rss_anon_bytes", lambda: 0)
+
+    ticker._maybe_trim(0.0)       # 首次：设基准，不 trim
+    assert calls["n"] == 0
+    ticker._maybe_trim(5.0)       # 5s < 10s，未到期
+    assert calls["n"] == 0
+    ticker._maybe_trim(11.0)      # 11s ≥ 10s，到期 → 触发一次
+    assert calls["n"] == 1
+    ticker._maybe_trim(12.0)      # 距上次(11)仅 1s < 10s，不重复
+    assert calls["n"] == 1
+    assert ticker.trim.call_count == 1
+    assert ticker.trim.total_ms >= 0.0

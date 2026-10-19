@@ -121,8 +121,11 @@ def test_healthz():
         # 全部字段
         for f in ("memory_bytes", "memory_current_bytes", "memory_limit_bytes",
                   "degraded", "deduped", "late", "invalid", "tick_errors",
-                  "last_tick_ms", "sse"):
+                  "last_tick_ms", "malloc_trim", "sse"):
             assert f in body, f"healthz 缺字段 {f}"
+        # malloc_trim 统计（C3）：字段齐全；非 Linux 上 enabled=False
+        assert {"enabled", "period_sec", "call_count", "total_ms",
+                "last_ms", "last_freed_mb"} <= set(body["malloc_trim"])
         # 测试注入假内存读数 (0, None)（见 _fake_memory_reader）
         assert body["memory_bytes"] == 0
         assert body["memory_limit_bytes"] is None

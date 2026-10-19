@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import os
 import zlib
 from dataclasses import dataclass
 
@@ -19,7 +20,28 @@ from .model import load_array, validate
 
 MAX_BODY_BYTES = 4 * 1024 * 1024             # 请求体（压缩后）上限
 MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024     # 单个请求解压后上限，超过提示拆分
-MAX_PENDING_BYTES = 4 * 1024 * 1024          # 在途请求的解压后字节数之和的上限
+# 在途请求的解压后字节数之和的上限（默认 4 MB）。C3 实验用环境变量覆盖：
+# 降到 2 MB 可压低满载在途内存，代价是更大的 503 比例。
+DEFAULT_PENDING_BYTES = 4 * 1024 * 1024
+
+
+def _read_pending_limit() -> int:
+    """从 FLOWLENS_MAX_PENDING_BYTES 读在途上限（字节）。
+
+    缺省/非法/非正数都退回默认 4 MB。容器实验用它把在途额度降到 2 MB 做对比
+    （组 4）。生产不设该变量，行为与原来一致。
+    """
+    raw = os.environ.get("FLOWLENS_MAX_PENDING_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_PENDING_BYTES
+    try:
+        v = int(raw)
+    except ValueError:
+        return DEFAULT_PENDING_BYTES
+    return v if v > 0 else DEFAULT_PENDING_BYTES
+
+
+MAX_PENDING_BYTES = _read_pending_limit()
 CHUNK_EVENTS = 5000                          # 每次让出事件循环前处理的事件数
 
 # gzip 解压分块：输入每次喂这么多压缩字节，输出用 max_length 限制，
