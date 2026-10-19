@@ -2,6 +2,8 @@
 
 有界内存的实时流量统计服务：接收 HTTP 访问事件，用固定内存的近似数据结构（Count-Min、HyperLogLog、DDSketch、稀疏线段树）持续维护，随时回答"最近一段时间哪些 URL / 用户最热（Top-K）、去重人数、响应字节 p95"，并支持按历史时刻回放。设计见 [docs/DESIGN.md](docs/DESIGN.md)。
 
+![框图](docs/flowlens-architecture-v3.png)
+
 ## 快速开始
 
 Docker（推荐，评测环境）：
@@ -151,6 +153,7 @@ pytest -q -m slow         # 慢测试（等价性对照、打包守护）
 
 - [docs/DESIGN.md](docs/DESIGN.md) — 设计文档（架构、算法、内存预算、性能数据）
 - [AI_LOG.md](AI_LOG.md) — AI 使用记录（关键交互、AI 生成的代码、被修正/否决的方案）
+- [prototype](docs/prototype/console.html) 项目高保真原型
 - [docs/perf/](docs/perf/) — 性能剖析报告（`T11a-report.md`：单核 CPU 上限、事件循环延迟、瓶颈定位）
 - [docs/EXPERIMENTS_FORMAT.md](docs/EXPERIMENTS_FORMAT.md) + [tools/experiments.py](tools/experiments.py) — 如何复现实验场景（S1 吞吐 / S2 混合负载 / S3 精度 / S4 攻击 / S5 过载）
 - [docs/PROGRESS.md](docs/PROGRESS.md) — 进度交接单（已定决策、未解决问题、基准数据）
