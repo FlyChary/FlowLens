@@ -533,3 +533,12 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 
 - 按 P1c 一的要求先测基线（池关 / 池开 3，256 MB 容器、空闲 5 秒）：池关工作集 71.5 MiB、池开 3 为 141.7 MiB，每个解析进程 RssAnon 约 18.8 MB（工作集增量约 23.5 MB/个，含碎片），与背景"约 25 MB"一致。
 - 测量工具 `tools/idle_mem.py`（WSL 宿主运行，与 s1_measure 同口径读宿主 /proc，不进容器）：主进程与各解析进程 RssAnon + /healthz 工作集/原始读数，断言解析进程数与期望一致。
+
+### 2026-10-19 支线 P1c：四项内存调整（逐项提交，逐项测空闲内存）
+
+- **一.1 线程数**：Dockerfile base 阶段 ENV 加 `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1`。容器内验证各解析 worker `Threads=1`、主进程 3（Python 主+GC+信号线程）。空闲：池关 71.5→70.2、池开 3 141.7→139.8 MiB（单项收益小，保留）。
+- **一.2 worker 默认 3→2**：`resolve_worker_count` 默认 `min(2, 核−1)`，env 覆盖仍夹 [0,3]（实验可显式 3）。测试期望更新（8/4/3 核→2）。空闲池开 2 = 121.2 MiB（比 3 省 18.6）。
+- **一.3 池开时在途额度默认 8 MB**：`ingest.py` 加 `POOLED_PENDING_BYTES=8MB` 与 `pooled_pending_limit()`（env 可覆盖），`make_engine` 池开时用它初始化 `Admission`；单进程路径不变（4 MB）。新增 `test_pooled_pending_limit_env_override`。
+- **一.4 进 3/4 级立即 malloc_trim**：`_make_degrade_change_hook` 的 on_change 里 `new>=3 and old<new`（级别升到 ≥3）调一次 `ticker.malloc_trim()`。测试 `test_entering_level3_calls_malloc_trim_once`（可控内存读数进 3 级→恰好一次；级别不变不重复；退出再进再调）。
+- **AI 方案被修正/说明**：① 一.4 的触发条件初版写成 `old<3 and new>=3`，被指令措辞"进入第 3 级或第 4 级的那一刻"纠正为 `old<new and new>=3`（3→4 也算进入第 4 级，也要 trim；4→3 回落不算）。② 空闲内存四项合并测（同一次构建），按进程数差值归因（调整 3/4 空闲无影响，注释写明）。③ Dockerfile 注释里"正式镜像内容与以前完全一致"一句与改动矛盾，改为"test 阶段只用于收尾验证"。
+- **验证**：Windows 本地 `pytest -q` 369 passed（+2 新测试）；`docker build`（含 test 阶段 pytest，Python 3.12）通过。镜像 `flowlens:p1c-2f`（--target app）。
