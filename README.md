@@ -52,6 +52,8 @@ curl -X POST http://127.0.0.1:8080/v1/ingest \
 {"accepted": 2, "deduped": 0, "late": 0, "invalid": 0}
 ```
 
+> 示例里的 `ts` 是固定的过去时间戳，直接照跑会被判为迟到（`late: 2`）；真实事件用**当前时刻的 epoch 毫秒**作 `ts` 会记入 `accepted`。
+
 ### 最近 60 秒 Top-K（GET /v1/topk）
 
 `by` 取 `url` 或 `user`，`k`≤100；不带 `at` 的默认窗口直接读快照，带 `at`（epoch 毫秒）回放历史区间。
