@@ -188,11 +188,13 @@ async def measure_level(url, container, main_pid, rate, dur, batch, workers, loa
     sent_lg = int(summary.get("sent", 0) or 0)
     cross = abs(acc - acc_lg) / acc * 100 if acc else None
     return {
-        "rate": rate, "acc_h": acc, "acc_lg": acc_lg,
+        "rate": rate, "sent_lg": sent_lg, "acc_h": acc, "acc_lg": acc_lg,
+        "errors_lg": int(summary.get("errors", 0) or 0),
         "cross_pct": round(cross, 1) if cross is not None else None,
         "cross_ok": cross is not None and cross <= 2.0,
         "accept_rate": round(acc / sent_lg, 4) if sent_lg else None,
         "inflight_rej": infl, "raw_rej": rawr,
+        "degraded": H1.get("degraded"),
         "main_cpu_pct": round(main_sec / wall * 100, 1) if wall > 0 else None,
         "main_us_ev": round(main_sec / acc * 1e6, 2) if acc > 0 else None,
         "parse_cpu_pct": round(parse_sec / wall * 100, 1) if wall > 0 else None,
