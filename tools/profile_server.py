@@ -202,19 +202,20 @@ def _install_ingest_sub() -> None:
     np.argsort = _wrap_sync("groupby", np.argsort)
 
 
-# ---- URL 归一化缓存命中率统计（T11a-2） ------------------------------------------
+# ---- URL 归一化缓存命中率统计（T11a-2，T11b 适配 _normalize_url_impl） -------------
 #
 # 只包装 flowlens.model 自己的两个函数（不改 flowlens/ 下任何文件）：
 #   - normalize_url：每条事件调用一次（validate 内）→ 总调用次数
-#   - _normalize_url：只在缓存未命中时被调用 → 未命中次数 + 未命中耗时
+#   - _normalize_url_impl：只在缓存未命中时被调用 → 未命中次数 + 未命中耗时
 # validate 的包装（"validate" 阶段）在它们外层，未命中耗时同时进 validate 阶段
 # 与 NORM_STATS——后者只是前者的一部分，不存在双重计数问题。
 #
 # 缓存键是剥掉 ?/# 之后的路径部分；键里含 {id} 的 URL（约一半流量）每次的路径段
-# 都是随机数字/UUID/长十六进制，路径本身都不同、缓存必未命中。未命中时顺手判断
-# 原始 URL 的路径部分是否含 ID 段（_id_seg_like），量化"带 ID 路径导致未命中"
-# 的占比。判断口径与 flowgen 的 {id} 归一化规则一致（纯数字 / UUID / ≥16 位十六
-# 进制）：只查键、不真做归一化，每条未命中多花约 1 微秒，只测未命中路径。
+# 都是随机数字/UUID/长十六进制，路径本身都不同、缓存必未命中。T11b 起带 ID 替换的
+# 路径不再写缓存，所以这类键每次都是未命中——本统计仍能正确计"每次未命中"。未命中
+# 时顺手判断原始 URL 的路径部分是否含 ID 段（_id_seg_like），量化"带 ID 路径导致
+# 未命中"的占比。判断口径与 flowgen 的 {id} 归一化规则一致（纯数字 / UUID /
+# ≥16 位十六进制）：只查键、不真做归一化，每条未命中多花约 1 微秒，只测未命中路径。
 
 
 def _id_seg_like(seg: str) -> bool:
@@ -246,17 +247,18 @@ def _norm_head(raw: str) -> str:
 def _install_norm_stats() -> None:
     """给 flowlens.model 的归一化入口装上命中率统计（只加计数、不改行为）。
 
-    包装 model.normalize_url（总调用）与 model._normalize_url（未命中才调）。
+    包装 model.normalize_url（总调用）与 model._normalize_url_impl（未命中才调，
+    T11b 起返回 (结果, 是否发生 ID 替换)）。
     口径与 model 内部一致：命中 = _norm_cache 里查得到剥掉 ?/# 后的键（T10b 起
-    缓存键是路径部分）。"带 ID 段"的判断需要原始 raw，而 _normalize_url 只拿到
-    键——用 _norm_pending 记录每次 normalize_url 调用的 (raw, 是否命中)，未命中
-    时弹出配对（validate 同步执行、同一事件循环线程内配对不会错位）。
+    缓存键是路径部分）。"带 ID 段"的判断需要原始 raw，而 _normalize_url_impl 只
+    拿到键——用 _norm_pending 记录每次 normalize_url 调用的 raw，未命中时弹出配对
+    （validate 同步执行、同一事件循环线程内配对不会错位）。
     """
     import flowlens.model as model
 
     orig_norm = model.normalize_url
-    orig_inner = model._normalize_url
-    pending: list[tuple[str, bool]] = []
+    orig_inner = model._normalize_url_impl
+    pending: list[str] = []
 
     def norm_wrapper(raw):
         NORM_STATS[0] += 1
@@ -283,7 +285,7 @@ def _install_norm_stats() -> None:
     inner_wrapper.__wraps_stage__ = "norm_miss"
     inner_wrapper.__wrapped__ = orig_inner
     model.normalize_url = norm_wrapper
-    model._normalize_url = inner_wrapper
+    model._normalize_url_impl = inner_wrapper
 
 
 def install_wrappers(engine) -> None:
@@ -710,7 +712,9 @@ def _has(cmd):
 
 
 def _run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    # Windows 中文系统默认 GBK 解码 UTF-8 输出会报 UnicodeDecodeError，显式 utf-8
+    return subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", **kw)
 
 
 # run 模式自己起的 /prof 探针对 localhost 发 HTTP：WSL 的 autoProxy 可能把

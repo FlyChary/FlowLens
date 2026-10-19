@@ -317,7 +317,7 @@ async def sample_service_cpu(svc: Service, last: dict) -> float | None:
         usage = int(m.group(1))
     else:
         try:
-            with open(f"/proc/{svc.pid}/stat") as f:
+            with open(f"/proc/{svc.pid}/stat", encoding="utf-8") as f:
                 fields = f.read().split()
             usage = int(fields[13]) + int(fields[14])  # utime + stime
         except (OSError, IndexError):
@@ -591,7 +591,7 @@ def git_commit() -> str:
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=TOOLS, stderr=subprocess.DEVNULL,
-            text=True).strip()
+            text=True, encoding="utf-8", errors="replace").strip()
     except Exception:
         return "unknown"
 

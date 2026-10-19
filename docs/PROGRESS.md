@@ -21,11 +21,23 @@
 | T10a 压测工具、离线精确解、边界用例 | 已完成，等审查 |
 | T10b 实验场景与端到端粗测 | 已完成，等审查 |
 | T10c 调试接口与控制台页面 | 未开始 |
-| T11 性能 | 进行中（T11a-2 已完成，等审查） |
+| T11 性能 | 进行中（T11a-2 完成等审查；T11b 缩小范围：第零/一/二节完成等审查，第三～六节留作提交后优化） |
 
 ## 进行中
 
-（当前无进行中的任务。T11a-2 已完成、汇报后等审查，见下"T11a 已完成"一节。）
+（T11b 已缩小范围完成：第零、一、二节已做，汇报后等审查。第三～六节留作提交后的优化，见"未解决的问题"第 9 条。）
+
+---
+
+T11b 已完成（**缩小范围**：按 docs/instructions/T11b.md，用户中途指示只完成第零、一、二节，第三～六节全部跳过，提交截止日所限），汇报后停下等审查。改动集中在 `flowlens/model.py`（归一化 + validate）与 `tools/`、`tests/` 的适配，未碰 Dockerfile、config.py、ingest.py、engine.py、__main__.py。
+
+1. **第零节（子进程与文本文件编码）**：4 处 `subprocess` 文本模式调用加 `encoding="utf-8", errors="replace"`（`tests/test_packaging.py`、`tools/experiments.py` 的 `git_commit`、`tools/profile_server.py` 的 `_run` 与 loadgen Popen——后者本已带，核过未漏）；`tools/` 与 `tests/` 里读 `/proc` 的 3 处 `open()`（experiments/mem_probe/mem_report）补 `encoding="utf-8"`。grep `text=True`/`universal_newlines` 确认无遗漏。
+2. **第一节（归一化未命中快路径）**：`_normalize_url` 改名 `_normalize_url_impl`、返回 `(结果, 是否 ID 替换)`；无 `"//"` 时跳过 scheme/多斜杠两个正则；ID 段判断改预编译正则 `_ID_SEG` 的 `fullmatch`（`[0-9]`/`[0-9a-fA-F]`，**不用 `\d`**，与既有 `isascii()` 口径一致）；发生 ID 段替换的路径不写缓存（稳定路径照常）。输出逐字节不变（参考实现对照测试）。
+3. **第二节（validate 列式快路径）**：先判"全 dict"（否则走逐条慢路径）；全 dict 时一次性取五列、整列 `type is str/int` + 非空 + event_id 长度 + ts/bytes int64 范围检查；全合法走 `_validate_fast`（user_id 仅"非 ASCII 或 len>128"才按字节截断），任一不合法退回 `_validate_one_by_one`（保留原实现）。
+4. **等价性测试**：改前 `normalize_url`/`_normalize_url`/`validate` 原样复制为 `ref_*`，覆盖全部表驱动用例 + 专门边界（Unicode/阿拉伯-印度/天城文数字、全角、恰好 15/16 位十六进制、大小写混合 UUID、截断 128 字节/多字节中间）+ flowgen 5000 条随机 URL + validate 各种非法混入（非 dict/缺字段/类型错/bool 冒充整数/越界/超长与多字节 user_id/int64 上界/≥2^64 转 float/空列表），逐列比较 EventBatch，全部一致。**未走退路**。
+5. **适配**：`tools/profile_server.py` 的归一化命中率包装改包 `_normalize_url_impl`（透传 `(结果, replaced)`，计数口径不变）；`tools/bench_model.py` 重写（改前基准用原样复刻的 `_base_normalize`，报告未命中改前/改后耗时 + 命中率）。
+6. **bench_model（Windows 单次）**：未命中路径改前 **3.57 μs** → 改后 **3.04 μs**（**1.17×**；无 `//` 子集 3.20→2.31 = 1.38×，flowgen 50% URL 带 `https://` 前缀仍跑正则故整体被稀释）；命中率改前/改后策略均 37.6%（带 ID 路径缓存与否都命中不了，改后策略的价值是"不占缓存槽位"，小池下未体现差异）。新/旧 `validate` 同 body 对照 3.95 vs 4.10 μs/条（1.04×）——列式快路径未拖慢全合法路径。
+7. **验证**：Windows `pytest -q` 340 passed, 3 skipped, 9 deselected（+1 个 `test_memstat` Windows 专属 WorkingSetSize 偶发失败，与本任务无关、重跑 2 过 1 挂）；Docker（WSL，Python 3.12）`docker build --target test` **342 passed, 2 skipped, 9 deselected** 全过。
 
 ---
 
@@ -207,6 +219,13 @@ WSL 的 `docker run --memory=256m`（服务固定单核、压测固定其他核�
 T10a 列与 T8b 列**同一台机器**（本机）采集。T10a 同样**未触及任何热路径**（改动是 `query.stats` 加一个 `at_ms` 参数、`app.py` 一处调用、`conftest` 加 `sys.path`、`test_api` 一处测试桩签名，其余全是 `tools/` 与 `tests/` 新增文件，不进入服务端运行路径），写入/解析/定稿/快照代码与 T8b 完全相同。T10a 列整体比 T8b 快（`bench_core` 18.5→26.4 万/秒、`完整 tick` 116→85 ms、`单次定稿` 25→18.9 ms），**这是本机单次/时段波动**（长尾吞吐历来 20 万～30 万摆动、`bench_model` 1.87→1.45），非 T10a 引入的优化。判读基准对比时应以"同一次采集内各指标是否自洽"为准，跨任务的机器/时段差不可当结论。**结论：T10a 未使任何路径变慢**。
 
 ## 未解决的问题
+
+9. **T11b 第三～六节（性能/内存收尾）留作提交后的优化**（T11b 因提交截止缩小范围，只完成第零/一/二节）：
+   - **第三节 写入分块大小**：`ingest.py` 的 `CHUNK_EVENTS` 仍为 5000。需按 T11a 结论用新每条耗时重测 1000/2000/5000，选单块同步耗时 ≤15 ms 的最大块（预计能解锁回放查询 p99<50 ms）。
+   - **第四节 垃圾回收调优**：`gc.freeze()` + 调高 gen0 阈值 + Ticker 定期再 freeze，削 gen2 单次 13～19 ms 停顿（事件循环 p99/max 的次级来源）。
+   - **第五节 内存收尾（T9b-B）**：归一化缓存上限 10 万→2 万（`NORM_CACHE_CAP`）、Bloom `per_gen` 容量（需用户批准改 config.py）、`/healthz` 加 Bloom 当前代已插入条数。注：第五节第 1 项（Dockerfile 固定 glibc 大块分配阈值 `MALLOC_MMAP_THRESHOLD_`/`MALLOC_TRIM_THRESHOLD_`）由支线 lane-c 做对照实验中，等其合并后再定。
+   - **第六节 容器验证**：profile_server（6/10 万每秒）、S1（最大可持续吞吐）、S2（混合负载查询 p99）、S3（长尾精度）、S4（全随机工作集）全部留待提交后在容器（真实内存读数）中跑。
+   - T11b 已做的第零/一/二节（编码修正 + 归一化未命中快路径 + validate 列式快路径）只改 `model.py`/`ingest.py` 上游的校验归一化路径与编码，未触及写入分块/GC/内存上限，故上面各项仍按原方案进行。
 
 8. **【主要发现，T10b】内存随持续写入增长，3 万/秒×5 分钟就进第 4 级，S3 精度数据因此无效；且与 C1 账本矛盾，差 ~90 MB，T9b 专门查。**
    - 现象（`results/20261018_190021/`，工作集口径）：S1_plain 峰值 204.6 MiB（进 3 级）、S1_gzip 190.6（1 级）、S2 210.5（3 级）、**S3 229.4（3 级 @90s、4 级 @200s，结束后仍贴 4 级）**、S5 190.1（1 级）。

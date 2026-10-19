@@ -51,7 +51,8 @@ def test_wheel_contains_every_source_py(tmp_path):
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "-w", str(out)],
-            cwd=ROOT, capture_output=True, text=True, timeout=300,
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300,
         )
         assert proc.returncode == 0, f"pip wheel 构建失败:\n{proc.stdout}\n{proc.stderr}"
         wheels = list(out.glob("*.whl"))

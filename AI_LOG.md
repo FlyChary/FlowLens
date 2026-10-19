@@ -420,3 +420,31 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 3. **loadgen 汇总的 `errors` 不是服务端问题**：是测量结束后 10 s 余量里客户端往正在关闭的容器发送的连接重置（`sent=accepted+rejected+errors` 严格相等、error≈10s×目标速率）。测量窗口内服务端 0 拒绝 0 重试。
 
 **六、验证**：Windows `pytest -q` **302 passed, 2 skipped, 9 deselected**（新增 4 条 profile 测试：GC 交叠、`_id_seg_like` 对照 model、norm 包装行为不变、报告新字段）；`tests/test_profile_server.py` 单独 12 条全过。**未触及热路径**（只改 `tools/profile_server.py` 剖析工具与其测试，未动 `flowlens/`），**不跑性能基准**（任务书明确：本任务不修改服务代码）。收尾的 `docker build --target test` 在 WSL Python 3.12 上执行（见收尾汇报）。
+
+### 2026-10-19 T11b（缩小范围）：子进程编码修正 + 归一化未命中快路径 + validate 列式快路径（flowlens/model.py、tools/、tests/）
+
+**范围**：用户中途明确"今天是提交截止日，T11b 缩小范围——只完成第零、一、二节，第三～六节全部跳过"。第五节第 1 项（Dockerfile 固定 glibc 大块分配阈值）由支线 lane-c 做对照实验中，本任务不碰 Dockerfile。
+
+**一、第零节（子进程与文本文件编码）**：4 处 `subprocess` 文本模式调用加 `encoding="utf-8", errors="replace"`（tests/test_packaging.py、tools/experiments.py 的 `git_commit`、tools/profile_server.py 的 `_run` 与 loadgen Popen——后者其实已有，核过没漏）；`tools/` 与 `tests/` 里读 `/proc` 的 3 处 `open()`（experiments/mem_probe/mem_report）补 `encoding="utf-8"`。grep `text=True`/`universal_newlines` 确认无遗漏。
+
+**二、第一节（归一化未命中快路径，model.py）**：
+1. `_normalize_url`（缓存未命中才走）改名 `_normalize_url_impl`，返回 `(结果, 是否发生 ID 段替换)`。无 `"//"` 时跳过 scheme/多斜杠两个正则（一次判断同时跳过两个——后续处理只删字符、不造 `"//"`）；ID 段判断用预编译正则 `_ID_SEG`（`[0-9]+` / UUID 8-4-4-4-12 / `[0-9a-fA-F]{16,}`）的 `fullmatch` 替代逐字符 `_is_hex` 循环。字符类显式 `[0-9]`/`[0-9a-fA-F]`、**不用 `\d`**（`\d` 会匹配其他语言数字，与既有 `isascii()` 前置判断不一致）。
+2. **缓存策略**：发生 ID 段替换的路径不写缓存（这类键几乎每条都不同、几乎不会再次出现，写进去只会把能命中的稳定路径挤出）；稳定路径照常缓存。`_HEX_DIGITS`/`_is_id_segment`/`_is_hex` 保留（profile_server 的 `_id_seg_like` 对照口径与参考实现仍用）。
+
+**三、第二节（validate 列式快路径，model.py）**：`validate` 先检查"全部元素是 dict"（否则直接走逐条慢路径——列式取列依赖 `.get`，对非 dict 不安全）；全 dict 时一次性列表推导取五列（`dict.get`）、整列 `type(x) is str/int`（`type is int` 天然排除 bool）+ 非空 + event_id 长度 + ts/bytes int64 范围检查；全合法走 `_validate_fast`（user_id 仅"非 ASCII 或 len>128"才走按字节截断的 `_truncate_utf8`，ASCII 且 ≤128 直接复用；url 列表推导调 `normalize_url`），任一条不合法退回 `_validate_one_by_one`（保留原逐条实现，不删）。
+
+**四、等价性测试（tests/test_model.py）**：把改前的 `normalize_url`/`_normalize_url`/`validate` 及依赖（`_is_id_segment`/`_is_hex`/`_truncate_utf8`/`_is_int`/常量）原样复制为 `ref_*`，与被测代码独立。覆盖：① 全部既有表驱动用例 + 专门构造的边界（Unicode/阿拉伯-印度/天城文数字、全角字符、恰好 15/16 位十六进制、大小写混合 UUID、UUID 末位 g、截断 128 字节边界、多字节字符中间截断、空/单段/`//`/scheme/query/fragment 各位置）逐一断言 `normalize_url` 与 `ref_normalize_url` 一致；② flowgen 生成 5000 条随机 URL 逐一比较；③ validate 全合法（3000 条 flowgen + 超长 ASCII user_id）、各种非法类型混入（非 dict/缺字段/类型错/bool 冒充整数/ts=0/负数/int64 上界/超长 event_id/非 ASCII event_id/超长多字节 user_id/空列表）逐列比较 EventBatch（ids/users/urls/ts/nbytes/invalid）；④ orjson 把 ≥2^64 整数转 float 的口径；⑤ 快路径 vs 慢路径在"混入一条非法"时的切换一致性。另加行为测试：无 `//` 时不调 scheme/多斜杠正则（monkeypatch 抛错验证）、带 ID 路径不写缓存、稳定路径写缓存。
+
+**五、适配被改名函数的引用**：`tools/profile_server.py` 的归一化命中率包装从 `_normalize_url` 改包 `_normalize_url_impl`（T11b 起它返回 `(结果, replaced)` 元组，包装透传、计数口径不变；`NORM_STATS` 仍是总调用/未命中/未命中耗时/带 ID 段占比，T11a 报告的可比性不受影响）。`tools/bench_model.py` 重写：改前基准用原样复刻的 `_base_normalize`（逐字符判 ID），改后用 `_normalize_url_impl`，报告未命中路径改前/改后耗时 + 命中率（改前策略 monkeypatch 让 `replaced` 恒 False 模拟"一切路径都写缓存"）。
+
+**六、bench_model（Windows，单次）**：
+- 未命中路径：改前 **3.57 μs** → 改后 **3.04 μs**（**1.17×**）。分解：无 `//` 子集 3.20→2.31（**1.38×**），有 `//` 子集（flowgen 50% URL 带 `https://` 前缀）3.72→3.62（1.03×，仍跑正则）。整体被 50% 带 `//` 的流量稀释。容器 T11a 口径（未命中 4.4~5.0 μs）是"每条 URL 都不同 → 缓存必未命中"的极端，本基准 flowgen 有 500 个 key 池、部分命中，故绝对值偏低、且 1.17× 未达"4.7→1.5"目标——**该目标是针对未命中绝对值的，需容器 S2/S1 复测**；本基准证明快路径正确（输出逐字节一致）且在无 `//` 路径上确有 1.38×。
+- 命中率：改前策略与改后策略在本 flowgen 流量下**都是 37.6%**（带 ID 路径无论缓存与否都命中不了；改后策略的价值是"不占缓存槽位、缓存满时不把稳定路径挤出"，在本 500-key 池 + 200 种 URL 的小池下没体现差异）。
+- 缓存命中组（200 种重复 URL）：4.3~5.0 μs/条，与 T10b 的 1.80 有差距，但**直接对照新/旧 `validate`（同 body）为 3.95 vs 4.10 μs/条（1.04×）**——列式快路径没有拖慢全合法路径，差距是本机时段波动（与 T10b 不同机器/时段，见 PROGRESS"基准数据"判读口径）。
+
+**七、与指令不一致 / 被否决的 AI 方案**：
+1. **validate 列式取列前未先判"全 dict"**：初版直接 `o.get("event_id") for o in objs`，遇到非 dict 元素（如 `"not-obj"`）抛 `AttributeError: 'str' object has no attribute 'get'`，`test_element_not_object`/`test_invalid_count_and_valid_kept` 挂掉。修复：取列前先 `any(type(o) is not dict for o in objs)` → 有非 dict 直接走逐条慢路径（慢路径本就逐条 `isinstance(obj, dict)` 判非法、计入 invalid，语义不变）。
+2. **user_id 截断的快路径判断写错**：初版 `len(u) > 128` 才截断——但截断判的是**字节**长度，`"中"*100`（100 字符、300 字节）字符数短字节数长会被漏截。改为"ASCII 且 len≤128 才跳过截断"，非 ASCII 一律走按字节的 `_truncate_utf8`。等价性测试用 `_ev(uid="中"*100)` 锁住。
+3. 用户补充指令（第五节第 1 项由 lane-c 做、先 `git pull` 确认 Dockerfile、跑容器前问支线）——本任务缩小范围后不涉及第五/六节，未跑容器实验，Dockerfile 未动。
+
+**八、验证**：Windows `pytest -q` **340 passed, 3 skipped, 9 deselected** + 1 个 `tests/test_memstat.py::test_windows_working_set_reads_real_value` 偶发失败（Windows 专属、读两次 `WorkingSetSize` 差 4 KB，重跑 2 过 1 挂，与本任务改动无关，本任务未碰 memstat.py）；Docker（WSL，Python 3.12）`docker build --target test` **342 passed, 2 skipped, 9 deselected** 全过。`bench_model` 见上。**未走退路**（等价性测试全部通过，未 `git checkout` model.py）。
