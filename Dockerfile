@@ -8,7 +8,7 @@
 #   test  —— 测试镜像：与 base 同依赖，额外装 pytest、复制 tests 与 tools、跑 pytest -q
 #            （`docker build --target test .` 执行；构建成功即全量快测试在 3.12 通过）
 #   app   —— 正式镜像（**默认目标**，放最后）：非 root 运行、健康检查、启动服务
-# 正式镜像（默认 app 目标）的内容与以前完全一致；test 阶段只用于收尾验证。
+# test 阶段只用于收尾验证（docker build --target test .）。
 #
 # 用 `pip install -c constraints.txt .` 安装：pyproject.toml 的包列表已改为自动发现
 # （include = ["flowlens*"]），会装出 flowlens 及其全部子包（api、sketch）。装完删除
@@ -21,7 +21,15 @@ ENV PYTHONHASHSEED=0 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     MALLOC_MMAP_THRESHOLD_=131072 \
-    MALLOC_TRIM_THRESHOLD_=131072
+    MALLOC_TRIM_THRESHOLD_=131072 \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
+# 限制 numpy 底层数学库的线程数为 1（P1c 一.1）：numpy 自带的 OpenBLAS 在
+# **import 时**按可见核数创建工作线程与线程栈缓冲区（每线程约 8 MB 栈 + 私有
+# 缓冲区），每个进程（主进程 + 各解析进程）都付一次这份内存；本服务只用
+# 向量化数组运算，用不到多线程矩阵/BLAS 运算（单线程向量化已是当前瓶颈上限，
+# P1b §5 瓶颈在主进程事件循环）。线程数降到 1 省掉线程栈与缓冲区的常驻内存。
 # 固定 glibc 的"大块"门槛与 trim 触发门槛为 128 KB（不随每次大块归还自动上调）。
 # 依据（C3 g5 对照实验，docs/lanes/C3-report.md §二-B）：默认门槛下，几轮归还后
 # ~650 KB 的请求体改从普通堆分配、用完变成 glibc 保留的碎片，满载工作集峰值

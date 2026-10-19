@@ -195,3 +195,16 @@ cgroup 口径）、原始读数 memory_current_bytes。镜像 = 当前代码（f
   ~58 MiB，离第 4 级（≈230 MiB）还有 ~89 MiB——但 3 万/秒写入下工作集会再涨，
   这正是 P1b §4 棘轮的背景。
 
+### 6.2 调整 1：numpy 底层库线程数限制为 1（Dockerfile）
+
+base 阶段 ENV 加 `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1`
+（注释写明依据：OpenBLAS 在 import 时按核数建线程与缓冲区，本服务只用向量运算）。
+验证：容器内 `docker inspect` 确认 env 已进镜像；容器内各进程 Threads——主进程 3
+（Python 主 + GC + 信号线程，正常）、各解析 worker 1（此前会含 OpenBLAS 线程）。
+
+空闲内存（同 §6.1 方法，镜像 flowlens:p1c-2 含本项）：
+- 池关：工作集 71.5 → **70.2 MiB**（−1.3）；主进程 RssAnon 68.6 → 67.7 MiB
+- 池开 3：工作集 141.7 → **139.8 MiB**（−1.9）；各 worker RssAnon 18.8 → 18.9 MiB
+
+单项收益小（glibc 门槛与 C3 的 trim 已覆盖大头，OpenBLAS 缓冲本就小），但方向
+正确、无代价，保留。
