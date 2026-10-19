@@ -91,6 +91,10 @@ tests/                   单元测试；tests/e2e/ 端到端用例
 6. 注释、文档字符串、错误信息用中文，标识符用英文。
 7. 执行instructionsz2任务时，先建任务清单（计划），然后逐项执行
 
+## 编码约定
+
+开发环境是 Windows 中文系统（默认编码 GBK），而代码、日志、文档都是 UTF-8。凡是以文本方式读写文件或子进程输出，都必须显式指定 encoding="utf-8"：open() 读写文本文件时；subprocess 使用 text=True 时同时传 encoding="utf-8", errors="replace"。不要依赖系统默认编码。
+
 ## 每个任务结束时
 
 评测在 Docker 镜像（Linux、Python 3.12）中运行，它是唯一的标准环境。收尾检查按需进行，不做重复的全量运行：

@@ -395,3 +395,28 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 3. `experiments.py` 的 `_build_image` 显式 `--target app`（Dockerfile 默认目标曾是 test 阶段）；收尾后已把 app 挪回默认目标。
 
 **验证（全过）**：Windows `pytest -q` **290 passed, 2 skipped, 9 deselected**、`-m slow` **9 passed**；Docker（WSL，Python 3.12）`docker build --target test` **291 passed, 1 skipped, 9 deselected**。基准（Windows，与 T10a 同机）：bench_core 长尾 ~30.0 万/s、bench_model 缓存命中 ~1.80 μs/条、**真实流量组 3.87→0.50 μs/条（归一化缓存剥离 query/fragment 生效）**、bench_engine 每批 1000/5000 合计 ~5.24/~4.13 μs/条、单次定稿中位 ~18.2 ms、满载快照 ~46.5 ms、完整 tick ~83.0 ms。除归一化缓存显著变快外，未触及其他热路径、未使任何路径变慢。
+
+### 2026-10-18 T11a-2 修正测量并补充 GC/归一化缓存统计，完成 CPU 剖析（tools/profile_server.py、tests/test_profile_server.py、docs/perf/T11a-report.md、docs/PROGRESS.md、results/T11a/run_100k.json、run_60k.json）
+
+**一、测量方法的两处修正（任务书第一节）**：
+1. **测量窗口改墙钟 deadline**：上一版测量循环用 `sleep(0.5)×N` 累计名义时长——满载下每次 sleep 都被事件循环延迟触发（实测循环延迟 p50 68 ms），名义 30 s 拖成 47 s，而 loadgen 只发 70 s（预热 30+测量 30+余量 10、**没算起 loadgen 后的 3 s 建连延迟**），窗口尾部 ~10 s 没流量，把 `accepted_rate`（稀释到 79 426/s）与 `cpu_pct_of_core`（84.7%）稀释了。改为 `deadline = monotonic() + measure`、循环条件 `monotonic() < deadline`，loadgen 时长改 `3s 启动 + 预热 + 测量 + 10s 余量`（73 s）。重跑后 `measure_sec` 实测 30.1 s，干净。
+2. **垃圾回收单独计账**：`gc.callbacks` 原来只记代数/耗时/对象数，GC 烧的 CPU 混在各阶段的 `process_time` 差值里（阶段之和虚高，把一次 18.9 ms 的 gen2 回收算进 3.8 ms 的 orjson 解析）。现在每次回收记**墙钟起止**（`GC_SPANS`/`GC_ENDS`），各阶段包装时用 `_gc_overlap_ns`（bisect 定位、O(log n)）算"调用时段与回收区间的交叠"、从该阶段 wall 与 cpu 里各扣一次（单线程下交叠部分两者相等），新增 `gc_us` 字段。校验口径改"（扣后阶段之和 + GC 总耗时）/ 进程 CPU ≈ 1.0"（10 万 0.948、6 万 0.932）。效果：load_array 单阶段扣掉 61～131 ms 的 gen2 回收、tick_finalize 扣 4～23 ms。
+   - **实现踩坑**：`_gc_overlap_ns` 初版交叠公式写错（把 `e-t0` / `t1-s` 直接加，没做 `max(t0,s)/min(t1,e)` 区间求交），单测锁住；`GC_SPANS` 线性扫会让每条事件多花 ~μs，改 bisect + 平行 end 列表压到 O(log n)（回收稀疏时绝大多数调用直接返回 0）。
+
+**二、归一化缓存命中率（任务书第一节第 3 条）**：运行时包装 `flowlens.model.normalize_url`（总调用）与 `_normalize_url`（未命中才调）——**只包装、不重写 model 内部逻辑**（初版曾把 model 的查表+回填逻辑复制进包装函数，违反"只加计时不改行为"，已改为用 `_norm_pending` 记录每次调用的原始 raw、未命中时配对判断"带 ID 段"，不重复 model 的缓存语义）。结果：**命中率仅 38.5%**（两组一致），未命中 4.4～5.0 μs/次，**未命中里 90.6% 是路径带随机 ID 的**（flowgen ~50% URL 路径含 `{id}` 段、替换成随机数字/UUID/十六进制、路径每条都不同、缓存必未命中）。这解释了 validate 占核 60%+（7.2～8.2 μs/条）——是 T11a 那版"validate 满载慢 2.9× 根因未查明"的**答案**：不是内存压力，是缓存命中率天然低。
+
+**三、两组测量（WSL 容器、256 MB、服务 0 号核、假内存读数）**：
+- **10 万/秒**：核 **97.2%**（饱和）、接受 **72,911/秒**、每条 CPU **13.33 μs** → 单核上限 ~7.5 万/秒。
+- **6 万/秒**：核 **71.6%**（余量 40%）、全部接受 **59,973/秒**、每条 CPU **11.94 μs** → 单核上限 ~8.4 万/秒。
+- **单核可持续（无降级干扰）≈ 7.5 万～8 万/秒**。
+- 加了一个**查询探针**（仅 6 万/秒组开，每 250 ms 一次 `topk(URL, 60s, k=10)`）：60 s 窗口 k≤100 命中快照路径，**p99 0.04 ms（亚毫秒）**——直接回答"6 万/秒时查询 p99 能否低于 50 ms"：默认查询远达标。
+- **事件循环延迟**：6 万/秒 p50 66 μs（探针自同步、偏乐观）、p99 41 ms / max 61 ms ≈ 一个 **5000 条写入同步块**（wall 54～61 ms）；10 万/秒核饱和后 p50 被拖到 204 ms。最长停顿主因是写入块、次因是 gen2 GC（13～19 ms 单次）。
+
+**四、报告**：`docs/perf/T11a-report.md` 六节（两组结果 + 扣 GC 后阶段表、GC 分代统计、归一化缓存、事件循环延迟分布与最长停顿来源、6 万/秒查询 p99<50ms 判断、按收益排序的 5 个优化方向：① 归一化未命中提速 ② 写入块 5000→~1000 ③ `gc.freeze()`+阈值 ④ 快照改维护窗口汇总 ⑤ gen2/tick 拆段，各自写明阶段/预计节省/需改文件/是否冻结/风险）。
+
+**五、与指令不一致 / 踩坑**：
+1. **6 万/秒组首两次（带查询探针）被 WSL2 宿主负载抖动污染**：内存 8～14 s 就摸到 220 MB 提前结束、loadgen 36～51% error、`measure_sec` 只有 8～14 s。确认宿主空闲（load 0.08、无孤儿进程/容器）后第三次跑干净（30.1 s、0 error 窗口内、核 71.6%）。**教训：容器测量对宿主瞬时负载敏感，跑前要看 `uptime`/`docker ps`**。
+2. 查询探针走**快照路径**（60 s 窗口 k=10 ≤ snapshot_top_n=100），计算亚毫秒、探针 CPU 开销可忽略，未影响 6 万/秒组的吞吐数字（核 71.6% 与无探针一致）。
+3. **loadgen 汇总的 `errors` 不是服务端问题**：是测量结束后 10 s 余量里客户端往正在关闭的容器发送的连接重置（`sent=accepted+rejected+errors` 严格相等、error≈10s×目标速率）。测量窗口内服务端 0 拒绝 0 重试。
+
+**六、验证**：Windows `pytest -q` **302 passed, 2 skipped, 9 deselected**（新增 4 条 profile 测试：GC 交叠、`_id_seg_like` 对照 model、norm 包装行为不变、报告新字段）；`tests/test_profile_server.py` 单独 12 条全过。**未触及热路径**（只改 `tools/profile_server.py` 剖析工具与其测试，未动 `flowlens/`），**不跑性能基准**（任务书明确：本任务不修改服务代码）。收尾的 `docker build --target test` 在 WSL Python 3.12 上执行（见收尾汇报）。
