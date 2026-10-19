@@ -222,9 +222,15 @@ async def main_async(args) -> dict:
     port = args.port or _free_port()
     name = f"flowlens-p1b-{int(time.time() * 1000)}"
     url = f"http://127.0.0.1:{port}"
-    expect = args.parse_workers if args.pool == "on" else 0
-    env = ["-e", "PYTHONHASHSEED=0",
-           "-e", f"FLOWLENS_PARSE_WORKERS={args.parse_workers if args.pool == 'on' else 0}"]
+    if args.pool == "auto":
+        # 不注入 FLOWLENS_PARSE_WORKERS，让服务按可用核数自动决定（P1c 二.5 单核对照：
+        # 1 核时应自动退回单进程路径，解析进程数为 0）
+        expect = None
+        env = ["-e", "PYTHONHASHSEED=0"]
+    else:
+        expect = args.parse_workers if args.pool == "on" else 0
+        env = ["-e", "PYTHONHASHSEED=0",
+               "-e", f"FLOWLENS_PARSE_WORKERS={args.parse_workers if args.pool == 'on' else 0}"]
     if args.max_pending_bytes:
         env += ["-e", f"FLOWLENS_MAX_PENDING_BYTES={args.max_pending_bytes}"]
     if args.raw_budget_bytes:
@@ -238,8 +244,10 @@ async def main_async(args) -> dict:
         await asyncio.sleep(2.0)  # 等池预热稳定
         main_pid = await container_main_pid(name)
         parse = find_parse_pids(main_pid)
-        if len(parse) != expect:
+        if expect is not None and len(parse) != expect:
             raise RuntimeError(f"解析进程数不符：期望 {expect}，实得 {len(parse)}，pids={parse}")
+        print(f"[setup] 解析进程数={len(parse)}（期望 {expect if expect is not None else '自动'}）",
+              flush=True)
         rows = []
         for i, rate in enumerate(args.rates):
             print(f"[level {i + 1}/{len(args.rates)}] rate={rate} ...", flush=True)
@@ -278,7 +286,7 @@ def main() -> None:
     ap.add_argument("--rates", default="40000,60000,80000")
     ap.add_argument("--level-sec", type=int, default=20)
     ap.add_argument("--batch", type=int, default=5000)
-    ap.add_argument("--pool", choices=["on", "off"], default="off")
+    ap.add_argument("--pool", choices=["on", "off", "auto"], default="off")
     ap.add_argument("--parse-workers", type=int, default=3)
     ap.add_argument("--max-pending-bytes", type=int, default=0, help="在途额度（0=默认 4MB）")
     ap.add_argument("--raw-budget-bytes", type=int, default=0, help="原始请求体额度（0=默认 8MB）")
