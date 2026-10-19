@@ -96,8 +96,9 @@ def test_parsedbatch_chunk():
 # ---- worker 数计算（纯函数，不依赖核数/进程）----
 
 def test_resolve_workers_from_cpus(monkeypatch):
+    """默认上限 2（P1c 一.2）：min(2, 核数−1)，核数 1 不启用。"""
     import flowlens.parse_pool as pp
-    for n_cpus, expected in [(4, 3), (3, 2), (2, 1), (1, 0), (0, 0)]:
+    for n_cpus, expected in [(8, 2), (4, 2), (3, 2), (2, 1), (1, 0), (0, 0)]:
         monkeypatch.setattr(pp, "available_cpus", lambda n=n_cpus: n_cpus)
         monkeypatch.delenv("FLOWLENS_PARSE_WORKERS", raising=False)
         assert resolve_worker_count() == expected
@@ -108,6 +109,8 @@ def test_workers_env_override(monkeypatch):
     monkeypatch.setattr(pp, "available_cpus", lambda: 8)
     monkeypatch.setenv("FLOWLENS_PARSE_WORKERS", "2")
     assert resolve_worker_count() == 2
+    monkeypatch.setenv("FLOWLENS_PARSE_WORKERS", "3")   # 实验可显式开 3（超过默认上限）
+    assert resolve_worker_count() == 3
     monkeypatch.setenv("FLOWLENS_PARSE_WORKERS", "0")   # 显式禁用
     assert resolve_worker_count() == 0
     monkeypatch.setenv("FLOWLENS_PARSE_WORKERS", "9")   # 夹到 [0,3]
@@ -115,7 +118,7 @@ def test_workers_env_override(monkeypatch):
     monkeypatch.setenv("FLOWLENS_PARSE_WORKERS", "not-a-number")
     assert resolve_worker_count() == 0
     monkeypatch.delenv("FLOWLENS_PARSE_WORKERS")
-    assert resolve_worker_count() == 3
+    assert resolve_worker_count() == 2  # 覆盖清除后回默认 min(2, 8−1)
 
 
 def test_one_core_disabled(monkeypatch):

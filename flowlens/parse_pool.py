@@ -153,9 +153,14 @@ def available_cpus() -> int:
 
 
 def resolve_worker_count() -> int:
-    """解析进程数：min(3, 可用核数 − 1)，小于 1 时不启用（返回 0）。
+    """解析进程数：min(2, 可用核数 − 1)，小于 1 时不启用（返回 0）。
 
-    FLOWLENS_PARSE_WORKERS 环境变量可覆盖（0 表示禁用）；覆盖值也夹在 [0, 3]。
+    默认上限从 3 降到 2（P1c 一.2）：每个解析进程约多占 25 MB 常驻内存
+    （P1c §6 空闲内存实测），256 MB 容器下每少一个进程就少一份内存压力；
+    而 2 个解析进程的解析能力约 20 万条/秒以上，超过主进程的写入上限
+    （P1b §5：瓶颈在主进程），第 3 个没有收益。
+    FLOWLENS_PARSE_WORKERS 环境变量仍可覆盖（0 表示禁用；实验可显式开 3，
+    覆盖值夹在 [0, 3]）。
     """
     raw = os.environ.get("FLOWLENS_PARSE_WORKERS", "").strip()
     if raw:
@@ -164,7 +169,7 @@ def resolve_worker_count() -> int:
         except ValueError:
             return 0
         return max(0, min(3, v))
-    return max(0, min(3, available_cpus() - 1))
+    return max(0, min(2, available_cpus() - 1))
 
 
 class ParsePool:

@@ -208,3 +208,13 @@ base 阶段 ENV 加 `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1`
 
 单项收益小（glibc 门槛与 C3 的 trim 已覆盖大头，OpenBLAS 缓冲本就小），但方向
 正确、无代价，保留。
+
+### 6.3 调整 2：解析进程数默认上限 3 → 2（parse_pool.resolve_worker_count）
+
+`min(2, 可用核数 − 1)`，`FLOWLENS_PARSE_WORKERS` 仍可覆盖（夹 [0,3]，实验可显式
+开 3）。注释写明依据（每个解析进程实测 ~19–23.5 MB；2 个的解析能力超过主进程
+上限、第 3 个无收益）。测试更新：`test_resolve_workers_from_cpus` 期望 8/4/3 核→2、
+2 核→1、1 核→0；env 覆盖用例补"3 显式生效"。
+
+空闲内存（调整 1 之上的增量）：池开 2 = **121.2 MiB**（池开 3 为 139.8，
+每个 worker 约省 18.6 MiB 工作集）；池关 70.2 不变。
