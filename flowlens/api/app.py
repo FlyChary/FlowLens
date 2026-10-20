@@ -44,7 +44,7 @@ from ..errors import FlowLensError, Overloaded, PayloadTooLarge
 from ..ingest import Admission, IngestService
 from ..memstat import memory_bytes, memory_current_bytes, memory_limit_bytes
 from ..model import clear_norm_cache
-from ..query import QueryService
+from ..query import QueryService, StatsAnswer
 from ..ticker import Ticker, malloc_trim
 from ..supervisor import FrontsBudgetView
 from . import debug
@@ -229,6 +229,21 @@ def _fmt_num(x: float):
     return int(x) if float(x).is_integer() else round(float(x), 2)
 
 
+def stats_body(s: StatsAnswer, mem_bytes: int, degraded: bool) -> dict:
+    """/v1/stats 的响应字典。引擎的 _stats 与前端进程（P2d-2）共用，
+    保证两边生成的响应逐字节一致。"""
+    return {
+        "window_ms": s.window_ms,
+        "from": s.from_ms,
+        "to": s.to_ms,
+        "approx_distinct_users": int(round(s.distinct_users)),
+        # 区间内没有数据时 p95 是 NaN：orjson 默认输出 null（不出现 NaN 字面量）
+        "approx_p95_bytes": _fmt_num(s.p95_bytes) if s.p95_bytes == s.p95_bytes else None,
+        "memory_bytes": mem_bytes,
+        "degraded": degraded,
+    }
+
+
 # ---- 中间件：只在这里把异常转成 HTTP 响应，各接口只抛异常 ----
 # 必须加 @web.middleware（新式，__middleware_version__=1）：aiohttp 3.14+ 对新式中间件
 # 按 request 调用 m(request, handler=handler)，并把 request.app 设成当前应用；
@@ -376,16 +391,7 @@ async def _stats(request: web.Request) -> web.Response:
     qp = QueryParams.from_request(request, now_ms, need_k=False, need_by=False)
     s = await request.app[query_service_key].stats(qp.window_ms, qp.at_ms)
     mem_bytes, _ = request.app[memory_reader_key]()
-    return _json_response({
-        "window_ms": s.window_ms,
-        "from": s.from_ms,
-        "to": s.to_ms,
-        "approx_distinct_users": int(round(s.distinct_users)),
-        # 区间内没有数据时 p95 是 NaN：orjson 默认输出 null（不出现 NaN 字面量）
-        "approx_p95_bytes": _fmt_num(s.p95_bytes) if s.p95_bytes == s.p95_bytes else None,
-        "memory_bytes": mem_bytes,
-        "degraded": ctrl.degraded,
-    })
+    return _json_response(stats_body(s, mem_bytes, ctrl.degraded))
 
 
 async def _healthz(request: web.Request) -> web.Response:
