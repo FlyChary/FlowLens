@@ -265,6 +265,12 @@ async def main_async(args) -> dict:
                   f"load_cpu={row['loadgen_cpu_pct']}% ws={row['ws_peak_mb']}MiB "
                   f"memcur={row['memcur_peak_mb']}MiB cross={row['cross_pct']}% ok={row['cross_ok']}",
                   flush=True)
+            # P2c 四.1：某档接受率跌破阈值后更高档无意义（服务已不达标），停掉爬坡
+            if args.stop_below > 0 and row["accept_rate"] is not None \
+                    and row["accept_rate"] < args.stop_below:
+                print(f"  [stop] 接受率 {row['accept_rate']} < {args.stop_below}，"
+                      f"跳过更高档", flush=True)
+                break
         result = {"label": args.label, "image": args.image, "pool": args.pool, "expect_parse": expect,
                   "mem": args.mem, "fast": args.fast,
                   "max_pending_bytes": args.max_pending_bytes, "raw_budget_bytes": args.raw_budget_bytes,
@@ -296,6 +302,8 @@ def main() -> None:
     ap.add_argument("--raw-budget-bytes", type=int, default=0, help="原始请求体额度（0=默认 8MB）")
     ap.add_argument("--fast", action="store_true",
                     help="loadgen 用 P2a 快速模式（--fast，模板 + bytes.replace）")
+    ap.add_argument("--stop-below", type=float, default=0.0,
+                    help="某档接受率低于该值后停止爬坡（P2c 四.1 用 0.90；0=关闭）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", default="")
     args = ap.parse_args()
