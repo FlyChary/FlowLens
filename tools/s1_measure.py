@@ -123,11 +123,14 @@ async def wait_ready(url: str, timeout: float = 40.0) -> bool:
 
 
 async def run_loadgen(url: str, rate: int, dur: float, batch: int,
-                      workers: int, load_cp: str, seed: int) -> dict:
-    """跑一次 loadgen（taskset 固定到 load 核），阻塞等退出，返回最后汇总行 dict。"""
+                      workers: int, load_cp: str, seed: int, fast: bool = False) -> dict:
+    """跑一次 loadgen（taskset 固定到 load 核），阻塞等退出，返回最后汇总行 dict。
+    fast=True 时用 P2a 的快速模式（--fast，预生成模板 + bytes.replace）。"""
     args = [sys.executable, str(TOOLS / "loadgen.py"), "--url", url,
             "--workers", str(workers), "--conc", "8", "--rate", str(rate),
             "--batch", str(batch), "--duration", str(dur), "--mode", "长尾", "--seed", str(seed)]
+    if fast:
+        args += ["--fast", "--fast-templates", "32"]
     if os.path.exists("/usr/bin/taskset"):
         args = ["taskset", "-c", load_cp] + args
     env = dict(os.environ, NO_PROXY="localhost,127.0.0.1", PYTHONHASHSEED="0")
@@ -172,7 +175,8 @@ async def mem_sample(url: str, stop: asyncio.Event) -> dict:
     return {"ws_peak": ws, "memcur_peak": cur, "max_level": max_level}
 
 
-async def measure_level(url, container, main_pid, rate, dur, batch, workers, load_cp, seed):
+async def measure_level(url, container, main_pid, rate, dur, batch, workers, load_cp, seed,
+                        fast: bool = False):
     """严格串行的一档。返回本档指标 dict。"""
     H0 = await healthz(url)
     parse0 = find_parse_pids(main_pid)
@@ -180,7 +184,7 @@ async def measure_level(url, container, main_pid, rate, dur, batch, workers, loa
     stop = asyncio.Event()
     mt = asyncio.create_task(mem_sample(url, stop))
     t0 = time.monotonic()
-    summary = await run_loadgen(url, rate, dur, batch, workers, load_cp, seed)
+    summary = await run_loadgen(url, rate, dur, batch, workers, load_cp, seed, fast)
     await asyncio.sleep(1.0)                       # 让最后几个请求写完
     H1 = await healthz(url)
     stop.set(); mem = await mt
@@ -252,7 +256,7 @@ async def main_async(args) -> dict:
         for i, rate in enumerate(args.rates):
             print(f"[level {i + 1}/{len(args.rates)}] rate={rate} ...", flush=True)
             row = await measure_level(url, name, main_pid, rate, args.level_sec, args.batch,
-                                      args.load_workers, args.load_cp, 100 + i)
+                                      args.load_workers, args.load_cp, 100 + i, args.fast)
             rows.append(row)
             print(f"  acc_h={row['acc_h']} sent={row['sent_lg']}/{row['sent_target']} "
                   f"acc={row['accept_rate']} infl={row['inflight_rej']} raw={row['raw_rej']} "
@@ -262,7 +266,7 @@ async def main_async(args) -> dict:
                   f"memcur={row['memcur_peak_mb']}MiB cross={row['cross_pct']}% ok={row['cross_ok']}",
                   flush=True)
         result = {"label": args.label, "image": args.image, "pool": args.pool, "expect_parse": expect,
-                  "mem": args.mem,
+                  "mem": args.mem, "fast": args.fast,
                   "max_pending_bytes": args.max_pending_bytes, "raw_budget_bytes": args.raw_budget_bytes,
                   "svc_cp": args.svc_cp, "load_cp": args.load_cp, "load_workers": args.load_workers,
                   "level_sec": args.level_sec, "batch": args.batch, "port": port, "rows": rows}
@@ -290,6 +294,8 @@ def main() -> None:
     ap.add_argument("--parse-workers", type=int, default=3)
     ap.add_argument("--max-pending-bytes", type=int, default=0, help="在途额度（0=默认 4MB）")
     ap.add_argument("--raw-budget-bytes", type=int, default=0, help="原始请求体额度（0=默认 8MB）")
+    ap.add_argument("--fast", action="store_true",
+                    help="loadgen 用 P2a 快速模式（--fast，模板 + bytes.replace）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", default="")
     args = ap.parse_args()

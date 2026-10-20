@@ -26,6 +26,8 @@
 | Docker/部署（支线 B1+B1b） | 已完成（constraints.txt 固定版本、__main__.py 处理 SIGTERM、非 root、单阶段 pip install 装完删源码） |
 | T11 性能 | 进行中（T11a-2 完成等审查；T11b 缩小范围：第零/一/二节完成等审查，第三～六节留作提交后优化） |
 | P1 解析进程池（支线 lane-c） | 检查点一完成（第一～三节：parse_pool + 引擎拆分 + 写入并发限制 + 等价性/正确性测试），等审查；第四节容器实测留检查点二 |
+| P2a 冲刺 20 万诊断（支线 lane-c） | 已完成（主进程 py-spy 剖析、压测快速模式、msgspec/正则基准、路线估计；未改 flowlens/，见 docs/lanes/P2-notes.md §一~四） |
+| P2b Bloom 去重提速 + tick 剖析（支线 lane-c） | 已完成（dedup.py 判代数组化 + 默认 k=6，输出不变部分有参考实现对照测试；tick 只诊断；端到端 12/16/20/24 万前后对比；dedup.py 重新冻结，见 P2-notes.md 与"已定的决策"） |
 
 ## 进行中
 
@@ -194,6 +196,12 @@ T8 过载降级已完成（见 git 提交 `6aecc4e`）。T8 内容：
 - 记账类工具的身份自检（C1 事故教训）：worktree 开发的独立 tools/*.py 必须显式把项目根插到 `sys.path` 最前（脚本模式 CWD 不在 path、conda editable install 不随 worktree 变化）；出数前打印 `flowlens.__file__` 自检，出现与写入路径模型矛盾的数字（如"每值仅 1 个对象"）立即停手排查。C1 首轮因 import 解析到主仓库、全部数据作废重跑。
 - 探针自保（C2 事故教训）：被测系统已近内存上限时，测量必须让位于保命——`memory.current > 上限×0.80` 时跳过 `gc.get_objects()`+MemWalker 深度遍历（瞬时对象会把 current 推过上限、内核 OOM 杀掉探针本身）。
 
+### 支线 lane-c P2b（Bloom 去重提速、tick 剖析）
+
+- **dedup.py 解冻与重冻（P2b）**：`flowlens/dedup.py` 经用户批准**解冻用于 P2b 的性能优化**（Bloom 判代数组化 + 写位 + k 字段），其他冻结模块（config.py、hashing.py、segtree.py、bounds.py 等）不动。改动：① 判"代是否就绪"改 numpy 数组比较（`_gen_ids[gen_ids%代数]==gen_ids`，替代逐条列表推导，输出不变）；② 写位**保留** `np.bitwise_or.at`——曾按指令改"按字下标排序 + reduceat 合并 + 一次 |="，实测（标准镜像 numpy 2.5.4、稳态一代 ~200 万 id、批 1 万）反而慢 5.96×（本布隆填充率 ~6%、同一字碰撞少，reduceat 被 argsort 主导），故不采用；③ `BloomConfig` 加 `k: int|None`，**默认 k=6**（None 时按公式=12 行为不变、整数时直接取用）。输出不变部分（判代 + 写位）由 `tests/test_dedup.py` 的改前参考实现 `RefBloom` 对照守护（批内/跨批/跨代/未就绪代/轮换清空，k=6 与 k=12 各跑一遍，每步比对 dup/active 与每代 words/n/代号）。**本任务结束后 dedup.py 重新冻结**（与 bounds.py、sketch/heavy.py 同级）。
+- **Bloom 去重 k=6 为默认（P2b 二）**：实测（`tools/bench_bloom.py`，per_gen 200 万、写满一代后查 100 万未写入 id）k=12 误判率 0.030%/1.33 μs、k=8 0.044%/0.88、k=6 0.075%/0.66、k=4 0.197%/0.45——在"误判率 ≤0.1%"约束下 k=6 耗时最低（比 k=12 省 0.676 μs/条、~51%）。设计文档 §3.1 与 §4 的 k 与误判率待按此更新（DESIGN_TODO 第 35 条）。
+- **tick 是 ~75 ms/s 的固定税、不随吞吐涨（P2b 三，只诊断）**：`tools/bench_tick.py`（FakeClock 驱动 Engine、运行时包装计时）隔离测量，长尾/随机 × 5/12/20 万每秒的每 tick 合计 ~65-85 ms/s，对速率不敏感；P2a 从实时服务 py-spy 得到的"40→141 ms/s、随吞吐涨"是饱和事件循环里 tick 与写路径重叠/排队造成的假象。tick 每 tick 工作量由名单上限（leaf_keep 128 / cand_cap 512-2048）与固定线段树决定，与每秒事件数无关。最大子项是**定稿 CMS 入层（_Builder.accept，~26-36 ms，冻结 segtree.py）**与**快照 TopK（bounds.top_k，~18-27 ms，冻结 bounds.py）**；最大结构性杠杆是快照增量合并（engine.py 未冻结 + bounds 合并语义冻结）。削 tick 需解冻冻结模块，本任务未改。
+
 ## 基准数据
 
 各任务结束时重跑全部测试与性能基准并追加一列（以后每个任务都一样）。每项各跑 3 次取中位（单次波动大）。"上一版"为 T6c 前后对照；"T7b"为提交 `d2d5c8e`；"T8"、"T8b"分别为对应任务结束时的本机（T8b 机器）中位数。
@@ -277,3 +285,5 @@ T10a 列与 T8b 列**同一台机器**（本机）采集。T10a 同样**未触�
 提交后（按原计划）：① **T11 性能优化**——按 `docs/perf/T11a-report.md` 第六节方向清单实施（① 归一化未命中提速、② 写入块 5000→~1000、③ `gc.freeze()`+阈值，①② 是非冻结模块、风险低收益最大，优先）；② **T10c 控制台页面**（调试接口已由支线 B1 完成）；③ 容器里统一重跑 S3/S4/S1/S2（C3 用户指令，最终代码 + g5 配置）；④ 收尾（统一修改设计文档、整理 AI_LOG、答辩准备）。**每个任务结束都必须在 WSL 跑全量 `pytest -q`**（T8b 起，已写入 CLAUDE.md）。
 
 **支线（lane）状态**：B1/B1b（Docker + 调试接口）、C1（内存账本）、C2（内存增长调查）、C3（内存加固 + glibc mmap/trim 阈值）的代码均已合并进 main，本 F2 收尾把它们各自的决策/待解决/设计待改/AI 记录并入 PROGRESS / DESIGN_TODO / AI_LOG（见"已定的决策"支线小节、"未解决的问题"第 8 条、AI_LOG 末尾支线小节）。支线原始笔记保留在 `docs/lanes/`。
+
+**lane-c 冲刺 20 万/秒（P2a→P2b）**：P2a 诊断（py-spy 剖析 + 压测快速模式 + msgspec/正则基准 + 路线估计）与 P2b（Bloom 判代数组化 + 默认 k=6，主进程 12 万档 5.26→4.87 μs/条、Bloom 占比 py-spy 26.1%→16.1%、tick 确认为 ~75 ms/s 固定税不随吞吐涨）已完成。dedup.py 本任务结束重新冻结。**下一步（P2c，待指令）**：20 万/秒的剩余瓶颈是①进程池通信 ~1.8 μs/条（池架构固定税、23% GIL 争抢）→ 前端进程架构（把主进程等解析/回传 ParsedBatch 的成本搬出）；②tick ~75 ms/s 固定税要削需解冻 segtree.py（CMS 入层）/bounds.py（top_k）或做快照增量合并；③256 MB 内存墙（统计状态 ~200 MiB 贴 L3 线）需原生化。详见 `docs/lanes/P2-notes.md` 与 P2a §4.5 路线估计。
