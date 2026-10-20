@@ -1,13 +1,14 @@
-"""P1c 空闲内存测量：启动容器、等 5 秒，读主进程与每个解析进程的 RssAnon 与容器工作集。
+"""空闲内存测量（P1c 起，P2d-1 起支持前端模式）：启动容器、等 5 秒，读引擎
+（主进程）与每个前端进程的 RssAnon 与容器工作集。
 
 运行在 WSL 宿主机（读 /proc 不进容器，与 s1_measure.py 同口径）：
 - docker inspect 拿主进程宿主 PID，扫宿主 /proc/*/status 的 RssAnon（ppid==主进程
-  的解析进程，排除 resource_tracker 与健康检查）；
+  的前端进程，排除 resource_tracker 与健康检查）；
 - 工作集 = /healthz 的 memory_bytes（cgroup 工作集口径），原始读数 = memory_current_bytes。
 
 用法（WSL）：
-  ~/.flowlens_venv/bin/python tools/idle_mem.py --image flowlens:p1c-baseline --pool on --workers 3
-  ~/.flowlens_venv/bin/python tools/idle_mem.py --image flowlens:p1c-baseline --pool off
+  ~/.flowlens_venv/bin/python tools/idle_mem.py --image flowlens:p2d1 --fronts 3
+  ~/.flowlens_venv/bin/python tools/idle_mem.py --image flowlens:p2d1 --fronts 0
   --env K=V 可额外注入环境变量（可多次）。
 """
 import argparse
@@ -72,7 +73,12 @@ def _stat_ppid(pid: int) -> int | None:
 
 
 def find_service_pids(main_pid: int) -> dict[str, list[int]]:
-    """按 ppid 找主进程的直接子进程，排除 resource_tracker 与健康检查进程。"""
+    """按 ppid 找主进程的直接子进程，排除 resource_tracker 与健康检查进程。
+
+    P2d-1 前端模式下，前端进程由 spawn 拉起、cmdline 是 multiprocessing 引导行
+    （不含 "flowlens"，但含 "python"），与解析 worker 同一识别口径：父进程是引擎
+    + 非 resource_tracker + python 进程。
+    """
     parse, other = [], []
     for d in os.listdir("/proc"):
         if not d.isdigit():
@@ -109,8 +115,7 @@ async def main_async(args) -> dict:
     port = _free_port()
     name = f"flowlens-idle-{int(time.time() * 1000)}"
     url = f"http://127.0.0.1:{port}"
-    workers = args.workers if args.pool == "on" else 0
-    env = ["-e", "PYTHONHASHSEED=0", "-e", f"FLOWLENS_PARSE_WORKERS={workers}"]
+    env = ["-e", "PYTHONHASHSEED=0", "-e", f"FLOWLENS_FRONTENDS={args.fronts}"]
     for kv in args.env:
         if "=" not in kv:
             raise SystemExit(f"--env 需要 K=V 形式，收到 {kv!r}")
@@ -129,18 +134,19 @@ async def main_async(args) -> dict:
             raise RuntimeError("拿不到容器主进程 PID")
         pids = find_service_pids(main_pid)
         main_rss = _rss_anon_kb(main_pid)
-        parse_rss = {p: _rss_anon_kb(p) for p in pids["parse"]}
-        if len(pids["parse"]) != (workers if args.pool == "on" else 0):
-            raise RuntimeError(f"解析进程数不符：期望 {workers if args.pool == 'on' else 0}，"
+        front_rss = {p: _rss_anon_kb(p) for p in pids["parse"]}
+        if len(pids["parse"]) != args.fronts:
+            raise RuntimeError(f"前端进程数不符：期望 {args.fronts}，"
                                f"实得 {len(pids['parse'])}")
         hz = await wait_ready(url)
         MB = 1048576
         result = {
-            "label": args.label or (f"pool_{args.pool}_w{workers}"),
+            "label": args.label or (f"fronts{args.fronts}"),
             "image": args.image, "mem": args.mem, "svc_cp": args.svc_cp,
+            "fronts": args.fronts,
             "main_rss_anon_mb": round(main_rss / 1024, 1) if main_rss else None,
-            "parse_rss_anon_mb": [round(v / 1024, 1) if v else None
-                                  for v in parse_rss.values()],
+            "front_rss_anon_mb": [round(v / 1024, 1) if v else None
+                                  for v in front_rss.values()],
             "ws_mb": round(hz.get("memory_bytes", 0) / MB, 1),
             "memcur_mb": round(hz.get("memory_current_bytes", 0) / MB, 1),
         }
@@ -155,8 +161,8 @@ async def main_async(args) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description="P1c 空闲内存测量（WSL 宿主运行）")
     ap.add_argument("--image", required=True)
-    ap.add_argument("--pool", choices=["on", "off"], default="off")
-    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--fronts", type=int, default=0,
+                    help="前端进程数（P2d-1，FLOWLENS_FRONTENDS；0=单进程模式）")
     ap.add_argument("--mem", default="256m")
     ap.add_argument("--svc-cp", default="0,2,4,6")
     ap.add_argument("--env", action="append", default=[], metavar="K=V")

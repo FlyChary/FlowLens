@@ -1,17 +1,22 @@
-"""P1b S1 爬坡测量（严格串行版）：单容器，每档档前/档后各同步读一次 /healthz 与宿主
+"""S1 爬坡测量（严格串行版）：单容器，每档档前/档后各同步读一次 /healthz 与宿主
 /proc CPU 时间，差值即该档。运行在 WSL 宿主机（读 CPU 不进容器）。
 
+P2d-1 起用 --fronts 指定前端进程数（FLOWLENS_FRONTENDS；0=单进程）：引擎=容器主
+进程，前端=主进程的直接子进程（排除 resource_tracker 与健康检查，与 find_parse_pids
+同口径）。指标改名：engine_cpu_pct / engine_us_ev（引擎）与 front_cpu_pct /
+front_procs（前端合计，单进程模式为 0）。
+
 每档（严格串行）：
-  档前  H0=healthz；C0=主进程+各解析进程 CPU 时间；t0=monotonic
+  档前  H0=healthz；C0=引擎+各前端 CPU 时间；t0=monotonic
   loadgen --rate R --duration 20，阻塞等退出，读最后汇总行
   sleep 1（让最后几个请求写完）
   档后  H1=healthz；C1=CPU 时间；t1=monotonic
   接受条数      = H1.events_ingested − H0.events_ingested
   在途/原始拒绝 = H1 与 H0 的 ingest_rejected、raw_rejected 差
-  主进程 CPU 秒 = C1.main − C0.main；解析 CPU 秒 = 各解析进程差值之和
-  主进程每条 μs = 主进程 CPU 秒 ÷ 接受条数 × 1e6   ← 主要指标（分子分母同窗口，不受窗口含
+  引擎 CPU 秒   = C1.engine − C0.engine；前端 CPU 秒 = 各前端差值之和
+  引擎每条 μs   = 引擎 CPU 秒 ÷ 接受条数 × 1e6   ← 主要指标（分子分母同窗口，不受窗口含
                  爬坡/收尾影响）
-  主进程 CPU%   = 主进程 CPU 秒 ÷ (t1−t0) × 100（含爬坡/收尾一两秒，略偏低）
+  引擎 CPU%     = 引擎 CPU 秒 ÷ (t1−t0) × 100（含爬坡/收尾一两秒，略偏低）
   交叉核对：接受条数 与 loadgen 汇总 accepted 应在 2% 内，超出则标出
 """
 import argparse
@@ -211,11 +216,13 @@ async def measure_level(url, container, main_pid, rate, dur, batch, workers, loa
         "accept_rate": round(acc / sent_lg, 4) if sent_lg else None,
         "inflight_rej": infl, "raw_rej": rawr,
         "max_degrade_level": mem["max_level"],          # 本档窗口内达到的最大降级级别
-        "main_cpu_pct": round(main_sec / wall * 100, 1) if wall > 0 else None,
-        "main_us_ev": round(main_sec / acc * 1e6, 2) if acc > 0 else None,
-        "parse_cpu_pct": round(parse_sec / wall * 100, 1) if wall > 0 else None,
+        # 引擎（容器主进程）CPU 与每条耗时；前端合计 CPU（P2d-1：parse 组 = 前端组，
+        # 单进程模式前端数 0、该值为 0）
+        "engine_cpu_pct": round(main_sec / wall * 100, 1) if wall > 0 else None,
+        "engine_us_ev": round(main_sec / acc * 1e6, 2) if acc > 0 else None,
+        "front_cpu_pct": round(parse_sec / wall * 100, 1) if wall > 0 else None,
         "loadgen_cpu_pct": summary.get("client_cpu_pct"),  # 压测进程合计（worker 之和 ÷ 时长）
-        "parse_procs": len(parse1),
+        "front_procs": len(parse1),
         "ws_peak_mb": round(mem["ws_peak"] / 1048576, 1),
         "memcur_peak_mb": round(mem["memcur_peak"] / 1048576, 1),
         "wall_s": round(wall, 1),
@@ -226,15 +233,12 @@ async def main_async(args) -> dict:
     port = args.port or _free_port()
     name = f"flowlens-p1b-{int(time.time() * 1000)}"
     url = f"http://127.0.0.1:{port}"
-    if args.pool == "auto":
-        # 不注入 FLOWLENS_PARSE_WORKERS，让服务按可用核数自动决定（P1c 二.5 单核对照：
-        # 1 核时应自动退回单进程路径，解析进程数为 0）
-        expect = None
-        env = ["-e", "PYTHONHASHSEED=0"]
-    else:
-        expect = args.parse_workers if args.pool == "on" else 0
-        env = ["-e", "PYTHONHASHSEED=0",
-               "-e", f"FLOWLENS_PARSE_WORKERS={args.parse_workers if args.pool == 'on' else 0}"]
+    # 前端模式（P2d-1）：显式指定前端数（0 = 单进程）。前端进程按"父进程号等于
+    # 引擎（容器主进程）+ 命令行不含 resource_tracker"识别——spawn 子进程的
+    # cmdline 是 multiprocessing 引导行（不含 flowlens），find_parse_pids 的
+    # 现有识别口径（主进程直接子进程、排除 resource_tracker 与健康检查）直接复用。
+    expect = args.fronts
+    env = ["-e", "PYTHONHASHSEED=0", "-e", f"FLOWLENS_FRONTENDS={args.fronts}"]
     if args.max_pending_bytes:
         env += ["-e", f"FLOWLENS_MAX_PENDING_BYTES={args.max_pending_bytes}"]
     if args.raw_budget_bytes:
@@ -245,13 +249,12 @@ async def main_async(args) -> dict:
     try:
         if not await wait_ready(url):
             raise RuntimeError("服务未就绪：\n" + (await _run(["docker", "logs", name]))[-2000:])
-        await asyncio.sleep(2.0)  # 等池预热稳定
+        await asyncio.sleep(2.0)  # 等前端连上稳定
         main_pid = await container_main_pid(name)
-        parse = find_parse_pids(main_pid)
-        if expect is not None and len(parse) != expect:
-            raise RuntimeError(f"解析进程数不符：期望 {expect}，实得 {len(parse)}，pids={parse}")
-        print(f"[setup] 解析进程数={len(parse)}（期望 {expect if expect is not None else '自动'}）",
-              flush=True)
+        fronts = find_parse_pids(main_pid)  # 前端模式下即前端进程
+        if len(fronts) != expect:
+            raise RuntimeError(f"前端进程数不符：期望 {expect}，实得 {len(fronts)}，pids={fronts}")
+        print(f"[setup] 前端进程数={len(fronts)}（期望 {expect}）", flush=True)
         rows = []
         for i, rate in enumerate(args.rates):
             print(f"[level {i + 1}/{len(args.rates)}] rate={rate} ...", flush=True)
@@ -260,8 +263,9 @@ async def main_async(args) -> dict:
             rows.append(row)
             print(f"  acc_h={row['acc_h']} sent={row['sent_lg']}/{row['sent_target']} "
                   f"acc={row['accept_rate']} infl={row['inflight_rej']} raw={row['raw_rej']} "
-                  f"maxlvl={row['max_degrade_level']} main_cpu={row['main_cpu_pct']}% "
-                  f"us/ev={row['main_us_ev']} parse_cpu={row['parse_cpu_pct']}% "
+                  f"maxlvl={row['max_degrade_level']} engine_cpu={row['engine_cpu_pct']}% "
+                  f"us/ev={row['engine_us_ev']} front_cpu={row['front_cpu_pct']}% "
+                  f"fronts={row['front_procs']} "
                   f"load_cpu={row['loadgen_cpu_pct']}% ws={row['ws_peak_mb']}MiB "
                   f"memcur={row['memcur_peak_mb']}MiB cross={row['cross_pct']}% ok={row['cross_ok']}",
                   flush=True)
@@ -271,7 +275,8 @@ async def main_async(args) -> dict:
                 print(f"  [stop] 接受率 {row['accept_rate']} < {args.stop_below}，"
                       f"跳过更高档", flush=True)
                 break
-        result = {"label": args.label, "image": args.image, "pool": args.pool, "expect_parse": expect,
+        result = {"label": args.label, "image": args.image,
+                  "fronts": args.fronts, "expect_fronts": expect,
                   "mem": args.mem, "fast": args.fast,
                   "max_pending_bytes": args.max_pending_bytes, "raw_budget_bytes": args.raw_budget_bytes,
                   "svc_cp": args.svc_cp, "load_cp": args.load_cp, "load_workers": args.load_workers,
@@ -296,8 +301,8 @@ def main() -> None:
     ap.add_argument("--rates", default="40000,60000,80000")
     ap.add_argument("--level-sec", type=int, default=20)
     ap.add_argument("--batch", type=int, default=5000)
-    ap.add_argument("--pool", choices=["on", "off", "auto"], default="off")
-    ap.add_argument("--parse-workers", type=int, default=3)
+    ap.add_argument("--fronts", type=int, default=0,
+                    help="前端进程数（P2d-1，FLOWLENS_FRONTENDS；0=单进程模式）")
     ap.add_argument("--max-pending-bytes", type=int, default=0, help="在途额度（0=默认 4MB）")
     ap.add_argument("--raw-budget-bytes", type=int, default=0, help="原始请求体额度（0=默认 8MB）")
     ap.add_argument("--fast", action="store_true",
@@ -308,7 +313,7 @@ def main() -> None:
     ap.add_argument("--label", default="")
     args = ap.parse_args()
     args.rates = [int(x) for x in args.rates.split(",") if x]
-    args.label = args.label or f"pool_{args.pool}_pend{args.max_pending_bytes}_raw{args.raw_budget_bytes}"
+    args.label = args.label or f"fronts{args.fronts}_pend{args.max_pending_bytes}_raw{args.raw_budget_bytes}"
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:

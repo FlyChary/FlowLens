@@ -72,6 +72,13 @@ class SharedState:
         self.raw_pending = ctx.Array("q", n, lock=False)  # 前端 i 写：原始体额度已预留的字节
         self.ingest_rejected = ctx.Array("q", n, lock=False)  # 前端 i 写：在途额度拒绝累计
         self.raw_rejected = ctx.Array("q", n, lock=False)     # 前端 i 写：原始体额度拒绝累计
+        # 各前端额度的**实际合计**（普通属性、只给引擎进程用；各前端进程不需要，
+        # 每前端的额度作为 Process 参数单独传）。第 3 级起"正常/收紧"两种口径的
+        # 合计都要有——引擎侧视图（FrontsBudgetView）按 tight 标志选口径。
+        self.adm_total = 0
+        self.adm_tight_total = 0
+        self.raw_total = 0
+        self.raw_tight_total = 0
 
     def reset_slot(self, i: int) -> None:
         """前端 i 意外退出后，它的预留不会再释放，由引擎在重启它之前清零。拒绝计数保留。"""
@@ -141,6 +148,32 @@ class SlotAdmission(Admission):
     @rejected.setter
     def rejected(self, value: int) -> None:
         self._r[self._i] = value
+
+
+class RawSlotAdmission(SlotAdmission):
+    """前端原始请求体额度：limit 随共享 tight 标志动态（第 3 级起用收紧口径，
+    与单进程模式 _make_degrade_change_hook 把 raw_budget.limit 从 8 MB 降到
+    4 MB 的语义一致）。_ingest_expect（发请求体前的 503 判断）与 _read_raw_body
+    每次使用都现读 limit，所以动态 limit 天然生效，不需要改 app.py。
+
+    参考代码骨架在 create_front_app 里放的是普通 SlotAdmission（limit 恒为
+    raw_normal），那会让第 3 级收紧对原始体额度不生效——按单进程语义补上。
+    """
+
+    def __init__(self, normal: int, tight: int, pending_arr, rejected_arr,
+                 slot: int, shared: "SharedState"):
+        self._s = shared
+        self._tight_limit = tight
+        self._normal_limit = normal
+        super().__init__(normal, pending_arr, rejected_arr, slot)
+
+    @property
+    def limit(self) -> int:
+        return self._tight_limit if self._s.tight.value else self._normal_limit
+
+    @limit.setter
+    def limit(self, value: int) -> None:
+        self._normal_limit = value
 
 
 class FrontsBudgetView:

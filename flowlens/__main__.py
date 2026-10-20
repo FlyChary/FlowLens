@@ -83,7 +83,8 @@ def main() -> None:
 
 def _run_single(args, lingering: float) -> None:
     engine, ingest_service, query_service = make_engine(Clock())
-    app = create_app(engine, ingest_service, query_service)
+    app = create_app(engine, ingest_service, query_service,
+                     memory_reader=_env_memory_reader)
 
     async def run():
         # auto_decompress=False：不在传输层自动解压 gzip 请求体。请求体保持压缩，
@@ -130,6 +131,22 @@ def _run_single(args, lingering: float) -> None:
         log.info("收到 Ctrl+C（KeyboardInterrupt），停止服务")
 
 
+def _env_memory_reader() -> tuple[int, int | None]:
+    """内存读数（P2d-1 六）：默认读真实内存；测试用环境变量
+    FLOWLENS_TEST_MEM（格式 "mem,limit"，如 "251658240,268435456"）强制返回值，
+    让真实子进程可控地进入指定降级级别（子进程里没法像进程内 e2e 那样注入
+    memory_reader）。数值非法时忽略、退回真实读数。单进程与前端模式都生效。"""
+    from .api.app import _default_memory_reader
+    raw = os.environ.get("FLOWLENS_TEST_MEM", "").strip()
+    if raw:
+        try:
+            mem_s, limit_s = (x.strip() for x in raw.split(","))
+            return int(mem_s), (int(limit_s) if limit_s else None)
+        except ValueError:
+            log.warning("FLOWLENS_TEST_MEM 格式非法（应为 mem,limit），忽略")
+    return _default_memory_reader()
+
+
 def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
     """前端模式：先起前端（spawn），再建引擎、起 Unix 内部 HTTP 与写入通道。"""
     from .ingest import MAX_PENDING_BYTES, MAX_DECOMPRESSED_BYTES
@@ -152,7 +169,9 @@ def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
              sup.adm_normal, sup.adm_tight, sup.raw_normal, sup.raw_tight)
     sup.start_all()                       # 先启动前端（spawn，不继承大块内存）
     engine, ingest_service, query_service = make_engine(Clock())
-    app = create_app(engine, ingest_service, query_service, fronts=sup.shared)
+    # memory_reader=_env_memory_reader：支持 FLOWLENS_TEST_MEM 注入（测试进第 4 级用）
+    app = create_app(engine, ingest_service, query_service, fronts=sup.shared,
+                     memory_reader=_env_memory_reader)
 
     async def run():
         runner = web.AppRunner(app, auto_decompress=False, lingering_time=lingering)

@@ -25,7 +25,7 @@ from .errors import (BadRequest, FlowLensError, Overloaded, PayloadTooLarge,
 from .ingest import MAX_PENDING_BYTES, decode_body
 from .ipc import MSG_ACK, MSG_BATCH, encode_parsed, read_msg, send_msg
 from .parse_pool import parse_body
-from .supervisor import DegradeView, SlotAdmission
+from .supervisor import DegradeView, RawSlotAdmission, SlotAdmission
 
 log = logging.getLogger("flowlens.frontend")
 
@@ -138,7 +138,10 @@ upstream_key = web.AppKey("upstream", ClientSession)
 
 # 转发时保留的请求/响应头（其余丢弃）
 _FWD_REQ = {"accept", "last-event-id", "content-type", "content-length", "content-encoding"}
-_FWD_RESP = {"content-type", "retry-after", "cache-control", "x-accel-buffering"}
+# allow：引擎 405 响应的 Allow 头（允许的方法列表），规则要求对外头部与单进程
+# 模式一致，必须透传；其余响应一般没有这个头
+_FWD_RESP = {"allow", "cache-control", "content-type", "retry-after",
+             "x-accel-buffering"}
 
 
 async def _front_ingest(request: web.Request) -> web.Response:
@@ -188,12 +191,20 @@ def create_front_app(conn, shared, slot, n_fronts, query_sock: str,
                      raw_normal: int, raw_tight: int) -> web.Application:
     """组装一个前端进程的 HTTP 应用。
 
-    raw_budget 放 SlotAdmission（_read_raw_body / _ingest_expect 只依赖这个键）、
+    raw_budget 放 RawSlotAdmission（_read_raw_body / _ingest_expect 只依赖这个键）、
     degrade 放 DegradeView；额度镜像到共享数组的第 slot 槽。
+
+    参考代码骨架在这里放的是普通 SlotAdmission（limit 恒为 raw_normal），但第 4.3
+    节又定义了收紧口径 raw_tight、单进程模式下第 3 级会把 raw_budget.limit 从
+    RAW_BUDGET_LIMIT 收紧到 TIGHT_RAW_BUDGET_LIMIT——骨架没用上 raw_tight 参数，
+    会让"第 3 级收紧原始体额度"在前端模式不生效。这里改用 RawSlotAdmission：
+    limit 随共享 tight 标志动态（现读现选），_ingest_expect 与 _read_raw_body
+    每次使用都读 limit，天然生效（汇报与 P2-notes 中说明）。
     """
     app = web.Application(client_max_size=0, middlewares=[_error_middleware])
-    app[raw_budget_key] = SlotAdmission(raw_normal, shared.raw_pending,
-                                        shared.raw_rejected, slot)
+    app[raw_budget_key] = RawSlotAdmission(raw_normal, raw_tight,
+                                           shared.raw_pending, shared.raw_rejected,
+                                           slot, shared)
     app[degrade_controller_key] = DegradeView(shared)
     app[front_ingest_key] = FrontIngestService(
         conn, SlotAdmission(adm_normal, shared.pending, shared.ingest_rejected, slot),
