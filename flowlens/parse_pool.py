@@ -22,6 +22,9 @@ import numpy as np
 from .hashing import key_hashes
 from .model import load_array, validate
 
+# 前端每块解析的条数：一块约 10 ms，前端在块间让出事件循环回答查询（P2d-2 四）
+FRONT_PARSE_CHUNK = 1000
+
 
 @dataclass
 class ParsedBatch:
@@ -79,6 +82,45 @@ def parse_body(raw: bytes) -> ParsedBatch:
         urls=batch.urls,
         users=batch.users,
         invalid=batch.invalid,
+    )
+
+
+def parse_chunks(raw: bytes, chunk: int = FRONT_PARSE_CHUNK):
+    """parse_body 的分块版（P2d-2 四）：与 parse_body 结果相同，但逐块产出
+    ParsedBatch——load_array 只做一次，validate 与三列哈希按块进行，让调用方
+    在块与块之间 `await asyncio.sleep(0)` 让出事件循环（前端单次阻塞从 ~45 ms
+    降到约一块的 10 ms，期间还能回答查询）。
+
+    空数组（0 条事件）时仍产出一个空块：`range(0, max(len, 1), chunk)` 就是为
+    此，concat_parsed 的结果与 parse_body 相同（0 条、invalid=0）。
+    NDJSON 中某行不是合法 JSON 时 load_array 放入的占位值会被 validate 计入
+    invalid；按块切分不改变 invalid 的总计数（逐块计再求和 = 整批一次计）。
+    """
+    arr = load_array(raw)
+    for i in range(0, max(len(arr), 1), chunk):
+        part = arr[i:i + chunk]
+        batch = validate(part)
+        yield ParsedBatch(
+            ts=batch.ts, nbytes=batch.nbytes,
+            h_id=key_hashes(batch.ids), h_url=key_hashes(batch.urls),
+            h_user=key_hashes(batch.users),
+            urls=batch.urls, users=batch.users, invalid=batch.invalid)
+
+
+def concat_parsed(parts: list) -> ParsedBatch:
+    """把 parse_chunks 的逐块结果拼回一个 ParsedBatch：与 parse_body(raw) 的
+    每个字段逐项相同（数组逐段 concat、字符串列逐段展平、invalid 求和）。"""
+    if len(parts) == 1:
+        return parts[0]
+    return ParsedBatch(
+        ts=np.concatenate([p.ts for p in parts]),
+        nbytes=np.concatenate([p.nbytes for p in parts]),
+        h_id=np.concatenate([p.h_id for p in parts]),
+        h_url=np.concatenate([p.h_url for p in parts]),
+        h_user=np.concatenate([p.h_user for p in parts]),
+        urls=[u for p in parts for u in p.urls],
+        users=[u for p in parts for u in p.users],
+        invalid=sum(p.invalid for p in parts),
     )
 
 

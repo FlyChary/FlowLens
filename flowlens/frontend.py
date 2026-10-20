@@ -29,7 +29,7 @@ from .errors import (BadRequest, FlowLensError, Overloaded, PayloadTooLarge,
                      TooOld, UnsupportedEncoding)
 from .ingest import MAX_PENDING_BYTES, decode_body
 from .ipc import MSG_ACK, MSG_BATCH, MSG_SNAPSHOT, encode_parsed, read_msg, send_msg
-from .parse_pool import parse_body
+from .parse_pool import concat_parsed, parse_chunks
 from .query import (is_snapshot_query, stats_from_snapshot,
                     topk_from_snapshot)
 from .supervisor import DegradeView, RawSlotAdmission, SlotAdmission
@@ -175,7 +175,13 @@ class FrontIngestService:
                     f"降级期间单个请求的上限暂时为 {mb} MB，请稍后重试", retry_after=1)
             raise Overloaded(retry_after=1)
         try:
-            parsed = parse_body(raw)   # P2d-2 改为分块、块间让出
+            # 分块解析（P2d-2 四）：每块约 10 ms，块间让出事件循环，前端在块间
+            # 回答查询（原来一次性 parse_body 5000 条约 45 ms、期间无法应答）
+            parts = []
+            for part in parse_chunks(raw):
+                parts.append(part)
+                await asyncio.sleep(0)      # 块间让出，前端在这里回答查询
+            parsed = concat_parsed(parts)
             return await self.conn.submit(parsed)
         finally:
             self.admission.release(n)

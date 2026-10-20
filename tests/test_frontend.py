@@ -464,3 +464,35 @@ def test_create_front_app_registers_local_query_routes():
     canonicals = {r.resource.canonical for r in app.router.routes()}
     assert "/v1/topk" in canonicals and "/v1/stats" in canonicals
     assert "/v1/ingest" in canonicals and "/{tail}" in canonicals
+
+
+# ---- 四：分块解析（parse_chunks 逐块 + 块间让出 + concat 后与原解析相同）----
+
+def test_front_ingest_chunked_parse_equals_whole(monkeypatch):
+    """ingest 分块解析：强制小 chunk 后，发给引擎的 ParsedBatch 与整批
+    parse_body 逐字段相同（块间 sleep(0) 让出事件循环，代码里可见）。"""
+    import flowlens.frontend as fe
+    from flowlens.parse_pool import FRONT_PARSE_CHUNK, parse_body
+    body = orjson.dumps([{"event_id": f"ec{i}", "user_id": f"u{i % 3}",
+                          "url": f"/ec/{i % 7}?q={i}", "ts": NOW - (i % 50),
+                          "bytes": 1 + (i % 4)} for i in range(7)])
+    # 记录 parse_chunks 被以默认参数调用（ingest 不传 chunk），spy 内部强制
+    # 小块（chunk=2）验证多块拼接路径
+    seen_chunks = []
+    orig = fe.parse_chunks
+
+    def spy(raw, chunk=FRONT_PARSE_CHUNK):
+        yield from orig(raw, chunk=2)   # 强制小块：验证多块路径
+        seen_chunks.append(chunk)
+    monkeypatch.setattr(fe, "parse_chunks", spy)
+    conn = _FakeConn(result=IngestResult(7, 0, 0, 0))
+    adm = _make_adm(1024 * 1024)
+    svc = FrontIngestService(conn, adm, _Tight(0), 1024 * 1024, 512 * 1024)
+    r = asyncio.run(svc.ingest(body, None))
+    assert r.accepted == 7 and seen_chunks == [FRONT_PARSE_CHUNK]
+    # 发给引擎的批与整批 parse_body 相同
+    got, expected = conn.submitted[0], parse_body(body)
+    assert (got.ts == expected.ts).all() and (got.h_id == expected.h_id).all()
+    assert got.urls == expected.urls and got.users == expected.users
+    assert got.invalid == expected.invalid
+    assert adm.pending == 0   # finally 释放
