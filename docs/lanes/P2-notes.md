@@ -636,3 +636,136 @@ SSE 两组均 **0 连接错误**、1430 帧、20 订阅者。写入侧 140/200 �
 5. **未跑项**：本次未跑 `pytest -m slow` 与性能基准（本任务只验证、未触及热路径与
    bounds/sketch）；收尾的 `docker build --target test` 与 Windows pytest 在提交前执行。
    **已确认**（372 passed, 2 skipped, 9 deselected；Windows 工具测试 25 passed）。
+
+---
+
+# P2d-1 过程记录：前端进程架构（进程模型、写入通道、转发）
+
+> 环境同 P2b：WSL2 + Docker（评测同口径），服务核 0,2,4,6，压测核 8-15（8 worker）。
+> **本任务落地 `docs/instructions/P2d-1.md`**：把"解析 + HTTP 接入"从引擎（单写者主进程）
+> 挪到 n 个前端进程（SO_REUSEPORT 共享 8080），引擎只保留去重、写统计结构、tick、降级与
+> 内部 HTTP（只在 Unix 套接字上）。依据 P2c：512 MB / 20 万条每秒下主进程 CPU ~95%、
+> 其中约 12% 进程池通信 + 约 12% HTTP + 约 15% 事件循环——前端架构把这三项的大部分移出引擎。
+> **镜像** `flowlens:p2d1` = 本任务代码（lane-c HEAD）。前端模式仅 Linux（SO_REUSEPORT）。
+> 新增模块：`flowlens/supervisor.py`（前端数计算 + 共享状态 + FrontSupervisor）、
+> `flowlens/ipc.py`（写入通道消息格式）、`flowlens/frontend.py`（前端进程）；
+> 改动：`flowlens/ingest.py`（`write_parsed` 抽取）、`flowlens/api/app.py`（`fronts=` 视图）、
+> `flowlens/__main__.py`（双模式启动）、`flowlens/parse_pool.py`（删 ParsePool）。
+
+## 一、各节完成情况
+
+| 节 | 内容 | 落地 |
+|---|---|---|
+| 一 | 前端数计算 `resolve_front_count` | `supervisor.py`。env `FLOWLENS_FRONTENDS` 优先；非 Linux 强制 0；自动 = min(3, 核−1) 且内存上限 ≥ 384 MB |
+| 二 | 共享状态 `SharedState` + 视图 | `supervisor.py`。`lock=False`（每槽单写者）；`SlotAdmission`/`RawSlotAdmission`（前端镜像额度）、`FrontsBudgetView`（引擎侧汇总）、`DegradeView`（前端读降级） |
+| 三 | 写入通道消息格式 | `ipc.py`。`<IB` 头 + pickle5 负载；`WireBatch` 只传批内不重复字符串 + 下标数组；分帧/编解码/空批单测 |
+| 四 | 前端进程 | `frontend.py`。SO_REUSEPORT TCPSite；POST /v1/ingest 本地解析后发引擎、其余原样转发 Unix 内部 HTTP；`EngineConnection`（req_id 关联 ACK） |
+| 五 | 引擎侧 | `ingest.write_parsed` 抽取（进程池与写入通道共用后半段）；`serve_front` 写入通道服务端；`UnixSite` 内部 HTTP；`FrontSupervisor`（spawn + monitor + stop）；`__main__` 双模式 |
+| 六 | 测试 | 单测（supervisor/ipc）+ 前端模式 e2e（`tests/e2e/test_fronts_e2e.py`，8 组用例）+ selftest 边界用例对前端模式 |
+| 七 | 初步性能检查 | 见第六节（对照 P2b 第四节进程池）。**注：本节最初一次压测未留结果（脚本漏了必填的 `--out`、且 `/d/` 与 `/mnt/d/` 路径混用导致重定向失败，`results/p2d1/` 为空），本收尾重跑，结果即下文。** |
+
+## 二、"需要确认"项的实测结论
+
+1. **`reject_ingest` 的条件**：确认是 `level >= 4`（`degrade.py` 的 `reject_ingest` 属性）。
+   `DegradeView.reject_ingest` 按此实现（`level.value >= 4`）。**不继承 DegradeController**
+   ——那是有状态机、每秒被 Ticker 驱动的对象，前端进程里没有任何东西驱动它；实测 aiohttp 3.14
+   对 AppKey 取值不做类型检查，`DegradeView` 放进 `degrade_controller_key` 不告警、不报错。
+2. **`IngestResult` 字段顺序**：确认是 `(accepted, deduped, late, invalid)`（engine.py:30），
+   与参考代码假设一致，ACK 的 `ok` 负载按此还原。
+3. **`SlotAdmission` 的 rejected 镜像**：参考代码给两选一（请求结束 finally 里同步 / 改成属性
+   在 setter 里同步）。**选"改成属性 + setter"**：`_ingest_expect` 在发请求体之前拒绝时直接
+   `budget.rejected += 1`（走不到任何 handler 的 finally），只有 setter 方式能镜像到这条路径。
+4. **路径存在但方法不对（如 `GET /v1/ingest`、`PUT /v1/topk`）的 405**：实测 aiohttp 3.14 路由
+   在"路径匹配但方法不匹配"时**会继续尝试后面的资源**，所以这些请求落到 catch-all `_proxy`
+   转发给引擎、由引擎返回 405（带 `Allow` 头）。前端**不需要**为这些路径显式注册 405/404
+   处理器。e2e（`test_fronts_error_parity_with_single`）逐项验证了 400/404/405/415/422 及
+   413（`Expect: 100-continue` 与分块两条路径）与单进程模式同状态码、同错误体。
+5. **原始体额度在降级期收紧**（参考代码骨架的缺口）：骨架 `create_front_app` 放的是普通
+   `SlotAdmission`（limit 恒为 `raw_normal`），会让"第 3 级收紧原始体额度"在前端模式不生效
+   （单进程模式下 `_make_degrade_change_hook` 会把 `raw_budget.limit` 从 8 MB 降到 4 MB）。
+   **补了 `RawSlotAdmission`**：limit 随共享 `tight` 标志现读现选，`_ingest_expect` 与
+   `_read_raw_body` 每次使用都读 limit，天然生效、无需改 app.py。
+
+## 三、ParsePool 删除
+
+前端模式取代了解析进程池。**删除**：`ParsePool` 类、`FLOWLENS_PARSE_WORKERS`、
+`resolve_worker_count`、哈希自检与对应测试（`tests/e2e/test_parse_pool_e2e.py`）。
+**保留**：`ParsedBatch`、`parse_body`、`available_cpus`（前端进程仍用 `parse_body` 解析；
+`available_cpus` 被 `resolve_front_count` 用）——留在 `parse_pool.py`（导入路径不变）。
+单进程模式（前端数 0）也不再使用 ParsePool，行为与 P2d-1 之前完全相同（现有测试不改即通过）。
+
+## 四、每前端额度与"合计"口径（第 4.3 节）
+
+`per_front_limit(合计, n, 下限) = max(合计 // n, 下限)`。因为有下限，**前端数较多时实际
+合计会高于设定值**（一个前端的正常额度不能低于单请求上限，否则合法的大请求永远预留不到）：
+
+- **默认额度（在途 4 MB、原始体 8 MB）、3 前端**：在途 4 MB÷3=1.37 MB < 4 MB 下限 →
+  每前端抬到 4 MB、**合计 12 MB**（设定 4 MB）；原始体 8 MB÷3=2.7 MB < 4 MB 下限 →
+  每前端 4 MB、**合计 12 MB**（设定 8 MB）。即默认额度下前端数 > 1 时合计被下限抬高。
+- **第 7 节压测额度（两额度各 16 MB）、3 前端**：16 MB÷3=5.3 MB > 4 MB 下限，**合计正好
+  16 MB**（下限不生效），与 P2b 第四节进程池的 16 MB 口径一致（公平对照）。
+- **收紧额度**不设下限（`收紧合计 // n`）：与单进程模式"降级期间单个请求上限暂时降低"
+  的语义一致（第 3 级起在途 2 MB÷n、原始体 4 MB÷n）。
+
+## 五、语义与对外一致性（规则核对）
+
+- 在途额度在**解析之前**预留（`FrontIngestService.ingest`：先 `decode_body` → `try_reserve`
+  → 再 `parse_body`），与单进程一致。
+- 去重**只在引擎里**做（前端只解析、去重与写桶在 `serve_front` → `write_parsed`）。
+- **第 4 级在读取请求体之前拒绝**（`_front_ingest` 开头查 `reject_ingest` → 503，不读体）；
+  e2e `test_fronts_level4_reject_before_body` 用 `FLOWLENS_TEST_MEM` 把引擎打进第 4 级验证。
+- 单条不合法只计入 `invalid`（`parse_body` 行为不变，经 `WireBatch.invalid` 传到引擎首块加回）。
+- 对外状态码 / 错误体 / 头部（含 `Allow`、`Retry-After`、`Content-Type`）与单进程完全一致
+  （错误由引擎产生、前端 `_error_from_ack` 还原成同样的 `FlowLensError`、同一套
+  `_error_middleware` 转响应；转发路径透传白名单头部）。
+
+## 六、第 7 节：512 MB、3 前端、两额度各 16 MB、快速压测四档（对照 P2b 四进程池）
+
+`s1_measure --fast --fronts 3 --mem 512m`（服务核 0,2,4,6、压测核 8-15、8 worker、batch 5000、
+每档 20 s）。**前端识别口径**：父进程号 = 引擎（容器主进程）且 cmdline 不含 `resource_tracker`
+（spawn 子进程），断言数量 = 3（`s1_measure.py` 已按此改，`--fronts` 参数、`front_cpu_pct` /
+`engine_us_ev` 指标）。
+
+| 档 | 接受率 | 引擎 CPU% | **引擎 μs/条** | 前端合计 CPU% | 工作集峰值 | 最大降级 | 在途/原始拒 |
+|---|---|---|---|---|---|---|---|
+| 12 万 | 100% | 22.7 | **2.61** | 51.3 | 290.0 MiB | 0 | 0/0 |
+| 16 万 | 100% | 31.0 | **2.71** | 68.0 | 310.3 MiB | 0 | 0/0 |
+| 20 万 | 99.99% | 42.8 | **2.99** | 84.4 | 312.8 MiB | 0 | 0/0 |
+| 24 万 | 99.98% | 54.5 | **3.18** | 110.5 | 321.1 MiB | 0 | 0/0 |
+
+对照 **P2b 第四节（进程池 3，同 512 MB、两额度各 16 MB、快速压测）**：
+
+| 档 | 引擎(主) μs/条 池→前端 | 引擎(主) CPU% 池→前端 | 辅助 CPU% 池→前端 | 24 万接受率 池→前端 | 24 万降级 池→前端 |
+|---|---|---|---|---|---|
+| 12 万 | 4.87 → **2.61** | 39.2 → **22.7** | 48 → 51 | — | — |
+| 16 万 | 4.96 → **2.71** | 53.3 → **31.0** | 66 → 68 | — | — |
+| 20 万 | 4.92 → **2.99** | 64.4 → **42.8** | 88 → 84 | — | — |
+| 24 万 | 5.18 → **3.18** | 73.5 → **54.5** | 106 → 110 | 96.7% → **99.98%** | L1(拒 37/220) → **L0(0/0)** |
+
+- **引擎每条 μs 全档近乎减半**（12 万 −46%、24 万 −39%）：HTTP 接入 + 解析都移出引擎后，
+  引擎只剩去重 + 写统计结构，单条 CPU 成本大幅下降。
+- **引擎 CPU% 全档下降**（24 万 73.5%→54.5%）：进程池下主进程在 24 万已接近单核饱和
+  （73.5%、20 万 64.4%），前端模式 24 万仅 54.5%——**主进程 CPU 饱和这条 20 万冲刺的
+  硬瓶颈被显著缓解**（P2c 的 10 分钟 20 万"稳定达成"卡在 CPU 饱和，本项是正向信号，
+  但 10 分钟级稳定达成仍需后续验证，非本任务范围）。
+- **24 万档降级消失**：进程池在 24 万进 L1（主进程变慢→请求占额度变长→拒写 37 在途 + 220
+  原始体、发送塌陷到 96.7%），前端模式 **0 拒写、100% 发送达成、接受率 99.98%、全程 0 级**。
+- **辅助（前端）合计 CPU% 与进程池解析 worker 相当**（51~110%），前端只是把原来主进程做的
+  HTTP+解析搬到 3 个进程并行，总计算量没减少——收益全在"引擎更轻、离饱和更远"。
+- **工作集峰值比进程池高 ~56~60 MiB**（12 万 290 vs 234）：每个前端是完整 aiohttp HTTP 服务
+  （含到引擎的 Unix 客户端会话 + 事件循环），常驻足迹高于进程池里只做解析的 worker。512 MB
+  下工作集最高 321 MiB、远低于 512 MB 上限与 L3 线 400 MiB，全程 0 级，非问题；256 MB 下
+  这 3 个前端的常驻会再次顶紧（与 P2c"256 MB 多进程更差"一致，`resolve_front_count` 的
+  384 MB 下限正是为此）。
+
+**空闲内存**（`idle_mem --fronts 3 --mem 512m`，启动等 5 s）：引擎（主进程）RssAnon
+**71.6 MiB**，每个前端 RssAnon **~30.6 MiB**（3 前端合计 ~92 MiB），容器工作集 177.6 MiB。
+前端单进程常驻 ~30 MiB（含 aiohttp 栈 + 客户端会话），是 512 MB 下工作集抬升的来源。
+
+## 七、收尾验证
+
+- Windows `pytest -q`（PYTHONHASHSEED=0）：**412 passed, 12 skipped, 9 deselected**
+  （12 skipped = 前端模式 e2e，需 Linux，Windows 上自动跳过）。
+- Windows `pytest -q -m slow`（`__main__.py` 改动，必须跑）：**9 passed**（114 s）。
+- `docker build --target test`（WSL，Python 3.12 全量快测试）：**通过**。
+- 结果文件：`results/p2d1/s7_fronts3.json`（四档）、`results/p2d1/s7_idle.json`（空闲）。
