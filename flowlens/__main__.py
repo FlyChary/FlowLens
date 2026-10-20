@@ -17,6 +17,7 @@ from aiohttp import web
 
 from .api.app import (create_app, degrade_controller_key, make_engine,
                       memory_reader_key)
+from .api import debug
 from .hub import SnapshotHub, make_on_snapshot
 from .ipc import MSG_ACK, MSG_BATCH, decode_to_parsed, read_msg, send_msg
 from .intern import url_intern, user_intern
@@ -144,15 +145,25 @@ def _env_memory_reader() -> tuple[int, int | None]:
     """内存读数（P2d-1 六）：默认读真实内存；测试用环境变量
     FLOWLENS_TEST_MEM（格式 "mem,limit"，如 "251658240,268435456"）强制返回值，
     让真实子进程可控地进入指定降级级别（子进程里没法像进程内 e2e 那样注入
-    memory_reader）。数值非法时忽略、退回真实读数。单进程与前端模式都生效。"""
+    memory_reader）。数值非法时忽略、退回真实读数。单进程与前端模式都生效。
+
+    P2d-2 五：只在 **FLOWLENS_DEBUG=1** 时才读 FLOWLENS_TEST_MEM——未开调试却设了
+    它时打印警告并忽略（生产误设不会悄悄改变内存读数），生效时以 WARNING 级别
+    明确"内存读数被 FLOWLENS_TEST_MEM 覆盖"（启动日志可见）。"""
     from .api.app import _default_memory_reader
     raw = os.environ.get("FLOWLENS_TEST_MEM", "").strip()
-    if raw:
-        try:
-            mem_s, limit_s = (x.strip() for x in raw.split(","))
-            return int(mem_s), (int(limit_s) if limit_s else None)
-        except ValueError:
-            log.warning("FLOWLENS_TEST_MEM 格式非法（应为 mem,limit），忽略")
+    if not raw:
+        return _default_memory_reader()
+    if not debug.is_enabled():   # FLOWLENS_DEBUG=1 才允许测试内存注入
+        log.warning("FLOWLENS_TEST_MEM 已设置但未开调试（FLOWLENS_DEBUG=1），忽略"
+                    "（生产误设不会改变内存读数）")
+        return _default_memory_reader()
+    try:
+        mem_s, limit_s = (x.strip() for x in raw.split(","))
+        log.warning("内存读数被 FLOWLENS_TEST_MEM 覆盖为 %s（仅调试模式）", raw)
+        return int(mem_s), (int(limit_s) if limit_s else None)
+    except ValueError:
+        log.warning("FLOWLENS_TEST_MEM 格式非法（应为 mem,limit），忽略")
     return _default_memory_reader()
 
 

@@ -78,7 +78,9 @@ def main():
     port, fronts, test_mem, raw_budget = sys.argv[1:5]
     env = dict(os.environ, PYTHONHASHSEED="0", FLOWLENS_FRONTENDS=fronts)
     if test_mem:
+        # P2d-2 五：FLOWLENS_TEST_MEM 只在 FLOWLENS_DEBUG=1 时生效，故一并开启调试
         env["FLOWLENS_TEST_MEM"] = test_mem
+        env["FLOWLENS_DEBUG"] = "1"
     if raw_budget:
         env["FLOWLENS_RAW_BUDGET_BYTES"] = raw_budget
     child = subprocess.Popen([sys.executable, "-m", "flowlens",
