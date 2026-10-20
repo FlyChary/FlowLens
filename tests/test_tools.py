@@ -295,7 +295,9 @@ def _cfg(**over):
     base = dict(url="http://127.0.0.1:0", workers=1, conc=1, rate=500,
                 batch=100, duration=2.0, gzip=False, mode="长尾", seed=0,
                 archive=None, max_retries=3, p_late=0.0, p_future=0.0,
-                p_cross=0.0, p_dup=0.0, p_invalid=0.0, request_timeout_s=5.0)
+                p_cross=0.0, p_dup=0.0, p_invalid=0.0, request_timeout_s=5.0,
+                # P2a 快速模式（--fast）：与 argparse 的接口一致（默认关闭）
+                fast=False, fast_templates=32)
     base.update(over)
     return base
 

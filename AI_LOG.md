@@ -560,3 +560,12 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - **设计文档待改项**：按惯例记入 `docs/DESIGN_TODO.md` 第 29~34 条（§3.2 进程池与单写者、§3.1 在途额度 8 MB/块 10000、§3.6 进 3/4 级立即 trim、§5 内存表按实测重写、§7 P1c 实验表、§8 吞吐取舍），DESIGN.md 本身未动（用户另行更新）。
 - **最终验证**：`pytest -q` **369 passed, 4 skipped, 9 deselected**；`pytest -q -m slow` **9 passed**；`docker build --target test`（WSL，Python 3.12 全量快测试）通过。基准：`bench_core 长尾` 约 **27.8 万/秒**（本机单次，历史区间 20 万~30 万内，与 P1 提交时的 29.9 万持平，未变慢）。
 - **被否决/修正**：无（收尾无新方案）。**待用户确认**：① 256 MB 下验收标准 1/2 不满足是否接受（是否按"1 worker 为 256 MB 下池配置最优、2× 仅在 512 MB 兑现"合并进 main）；② 补发邮件的内容口径。
+
+### 2026-10-20 支线 P2a：冲刺 20 万/秒第 1 步——诊断与准备（只诊断与工具，未改 flowlens/）
+
+- **主进程剖析（py-spy，A/B 两组，详见 docs/lanes/P2-notes.md §一）**：A（lane-c 池 3、16 MB、512 MB、12 万/秒）主进程 7.5 μs 口径的构成——池通信 23.5%（~1.76 μs，QueueFeederThread 13.5% + 池管理线程 9.4%，两线程抢走主进程 23% 的 GIL）、写入引擎 46.4%（Bloom 22.2% 最大头、各维度 14.5%、tick 15.7%）；B（已提交版本单进程、256 MB、5 万/秒，10.5 μs 口径）——解析侧 46.3%（解压+orjson+校验+归一化 41.8%）、写入引擎 35.9%。**"主进程那约 6 μs 是什么"有了答案：池通信 ~1.8 + tick ~1.2 + 写入细项（P1 的 2.5 没细拆的 intern/秒分组/入口/Bloom 哈希派生）~1.5 + HTTP/事件循环 ~1.1 + 饱和档排队 ~1.0**。aiohttp 访问日志未开启（AppRunner 未传 access_log）。
+- **压测工具快速模式（tools/loadgen.py --fast）**：每 worker 预生成 32 个请求体模板（dict 里直接写占位再 orjson.dumps，O(n)），发送前 bytes.replace 两个等宽占位（13 位 ts + 12 位 event_id 序号）。每条压测 CPU 从 55.0 μs 降到 **0.75~0.77 μs（~73 倍）**；本机 8 核上 30/40/50 万每秒全部 100% 达成、CPU 仅 7~14%。正确性：打真实服务 10 万/秒 ×25 s，deduped=late=invalid=0。
+- **msgspec 与正则基准（tools/bench_parse.py 新建）**：msgspec Struct(gc=False) 比 orjson+validate 快 **1.23×**（长尾 3.57→2.89 μs/条）、解析一批 5000 条内存峰值 11.1→1.96 MiB；正则一次 sub 做 ID 段替换比逐段 fullmatch 快 **2.33×**（1.84→0.79 μs/条），与 tests 参考实现 20054 条模糊检查 0 不一致。msgspec 是**诊断用依赖**（WSL venv `~/.venv-p2`），不进项目依赖。
+- **路线估计（P2-notes §4.5）**：路线一（512 MB+池）纯 Python 上限 ~16-18 万（砍池通信+tick），20 万需再砍写入引擎；路线二（256 MB 单进程）msgspec+正则后 ~9.2 μs/条 ≈ 11 万 CPU 上限，但内存墙（统计状态 ~200 MiB 贴 L3 线）先顶死，现实 ~7-9 万。**20 万的下一步杠杆是写入核心与统计状态的原生化**（与 P1 总结方向一致）。
+- **AI 方案被修正/踩坑**：① 模板生成初版对 800 KB 串逐条 `bytes.replace(...,1)` 找占位是 O(n²)（32×10000 条 ~13 分钟、8 worker 全卡死），改为 dict 内写占位一次 dumps（11.4 s）。② `deadline` 原先在模板生成前起算，~11 s 生成吃掉短 --duration 的发送窗口（sent=0），改为生成后起算。③ 占位串必须互不为子串（`999…`/`888…`），否则先后 replace 互相破坏。④ 收尾时 `pytest` 挂 `test_loadgen_503_retry_and_archive`：`_worker_async` 新增读 `cfg["fast"]` 而测试的 `_cfg()` 没带该键——在 `tests/test_tools.py` 的 `_cfg()` 里补 `fast=False, fast_templates=32`（对齐 argparse 接口），修复后 369 passed。
+- **验证**：Windows `pytest -q` **369 passed, 4 skipped, 9 deselected**（PYTHONHASHSEED=0）；`docker build --target test`（WSL，Python 3.12）通过。未触及 bounds/sketch/Dockerfile（无需 slow）；未触及服务热路径（flowlens/ 未改，未跑基准）。

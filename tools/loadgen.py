@@ -18,10 +18,20 @@
 worker 的随机种子 = --seed + worker 号，event_id 序号区间互不相交
 （worker × SEQ_STRIDE）。
 
+快速模式（``--fast``，P2a）：发送前不再逐条生成与序列化——每个 worker 启动时
+预生成 ``--fast-templates N``（默认 32）个完整请求体模板（按 --mode 指定的分布），
+模板里的 ts 与 event_id 序号写成占位串，每次发送用 bytes.replace 把两个占位换成
+当前墙钟毫秒与该进程递增的序号（批内所有事件同一 ts；event_id 全局不重复）。
+占位宽度与替换值宽度相同，请求体大小逐字节不变。快速模式**不支持** --archive
+与精确解对比（仍用原模式）；迟到/未来/跨批/批内重复/非法比例参数在快速模式
+下无效（模板全是正常事件，验证口径：服务应 deduped/late/invalid 全为 0）。
+
 用法示例：
   python tools/loadgen.py --url http://127.0.0.1:8080 --workers 4 --conc 8 \
       --rate 20000 --batch 5000 --duration 60 --gzip --archive out \
       --mode 长尾 --seed 0
+  python tools/loadgen.py --url http://127.0.0.1:8080 --workers 8 --conc 8 \
+      --rate 200000 --batch 5000 --duration 30 --fast --mode 长尾 --seed 0
 """
 
 import argparse
@@ -34,6 +44,7 @@ import zlib
 
 import aiohttp
 import numpy as np
+import orjson
 
 from flowgen import (ArchiveWriter, SEQ_STRIDE, EventGen, finalize_archive,
                      now_ms)
@@ -45,6 +56,68 @@ BATCH_QUEUE_CAP = 8      # 进程内待发送批次的缓冲上限（背压，�
 def gzip_bytes(data: bytes) -> bytes:
     c = zlib.compressobj(GZIP_CLEVEL, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
     return c.compress(data) + c.flush()
+
+
+# ---- 快速模式（--fast，P2a）：模板预生成 + bytes.replace ----
+
+# ts 占位：13 位（当前 epoch 毫秒恒为 13 位，到 2286 年不变）
+TS_PLACEHOLDER = "9999999999999"
+# event_id 序号占位：12 位。两个占位**不能互为子串**（否则先后 replace 互相破坏），
+# 故用不同的数字序列（9 与 8）。自然流量中出现整段 12 位相同数字的概率 ~1e-12/处，
+# 生成模板时再用 count 校验占位只出现在预期位置。
+SEQ_PLACEHOLDER = "888888888888"
+
+
+def _make_fast_templates(gen: EventGen, batch: int, n: int) -> tuple[list[bytes], int]:
+    """预生成 n 个完整请求体模板（按 --mode 分布），返回 (模板, 批内下标宽度 w)。
+
+    模板与现有模式同分布（同一套 key 规则、query/fragment、bytes），但生成方式是
+    直接在 dict 里写占位符再 orjson.dumps——**O(n)**。不能先 raw_batch 再逐条
+    bytes.replace(...,1)：replace 从字符串开头线性扫描，n 条事件是 O(n²)（
+    32×10000 条约需几分钟，worker 启动卡死、整轮压测 0 发送）。
+
+    只有两个字段是占位：
+      - ts：每条都是 13 位 TS_PLACEHOLDER（发送时替换为当前毫秒，批内同一 ts）
+      - event_id："e" + 12 位 SEQ_PLACEHOLDER + 批内下标（w 位补零）
+        发送时把 SEQ_PLACEHOLDER 替换为本批基准序号 B（按批递增 10^w），
+        事件 j 的 id 即 f"e{B}{j:0{w}d}"——批内、跨批、跨 worker（B 起点互不相交）
+        全局不重复。
+    占位与真实值等宽，两次 bytes.replace 后请求体大小逐字节不变。
+    生成后 count 校验占位只出现在预期位置（自然内容撞上占位串则断言失败）。
+    """
+    w = max(1, len(str(batch - 1)))          # 批内下标的位数
+    sp = SEQ_PLACEHOLDER.encode()
+    tp = TS_PLACEHOLDER.encode()
+    out = []
+    for _ in range(n):
+        evs = gen.batch(batch)
+        d = []
+        for j, e in enumerate(evs):
+            # gen.raw(e) 照常消耗 rng（URL 的 query/fragment 等），但 id/ts 用占位
+            row = gen.raw(e)
+            row["event_id"] = "e" + SEQ_PLACEHOLDER + str(j).zfill(w)
+            row["ts"] = int(TS_PLACEHOLDER)
+            d.append(row)
+        body = orjson.dumps(d)
+        # 占位校验：SEQ/TS 占位各恰好每条一次。自然内容（url 随机数字等）撞上
+        # 占位串时 count 会超预期，替换会损坏其他字段——断言失败、重新生成
+        assert body.count(sp) == batch, \
+            f"SEQ 占位出现 {body.count(sp)} 次（应为 {batch}），模板与随机内容冲突"
+        assert body.count(tp) == batch, \
+            f"TS 占位出现 {body.count(tp)} 次（应为 {batch}），模板与随机内容冲突"
+        out.append(body)
+    return out, w
+
+
+def _fast_fill(body: bytes, base: int, w: int, ts_ms: int) -> bytes:
+    """发送前填充模板：SEQ 占位 → 本批基准序号（等宽），TS 占位 → 当前毫秒。
+
+    填充后事件 j 的 event_id = f"e{base + j:0{12 + w}d}" 的十进制展开
+    （= 12 位基准 + w 位批内下标）：base 按批递增 10**w，worker 间起点
+    相差 SEQ_STRIDE（10**8），全局不重复。
+    """
+    filled = body.replace(SEQ_PLACEHOLDER.encode(), str(base).zfill(12).encode())
+    return filled.replace(TS_PLACEHOLDER.encode(), str(ts_ms).encode())
 
 
 def pctl(values, p: float) -> float | None:
@@ -120,7 +193,6 @@ async def _worker_async(cfg: dict, wid: int, mp_queue) -> None:
     """
     url = cfg["url"].rstrip("/") + "/v1/ingest"
     rate_pw = cfg["rate"] / cfg["workers"]          # 每进程速率
-    deadline = time.monotonic() + cfg["duration"]
     gen = EventGen(
         mode=cfg["mode"], seed=cfg["seed"] + wid,
         p_late=cfg["p_late"], p_future=cfg["p_future"], p_cross=cfg["p_cross"],
@@ -131,6 +203,18 @@ async def _worker_async(cfg: dict, wid: int, mp_queue) -> None:
     headers = {"Content-Encoding": "gzip"} if cfg["gzip"] else {}
     retries = [0]
     archived_ev = [0]
+    fast = cfg["fast"]
+
+    # 快速模式：启动时预生成请求体模板（长尾/均匀分布），之后每批只做
+    # bytes.replace（ts + event_id 序号），不再生成事件与序列化
+    fast_templates: list[bytes] = []
+    fast_w = 1
+    fast_base = 0
+    if fast:
+        fast_templates, fast_w = _make_fast_templates(gen, cfg["batch"],
+                                                       cfg["fast_templates"])
+        # worker 间序号起点互不相交（SEQ_STRIDE 间隔），批内下标占 w 位
+        fast_base = wid * SEQ_STRIDE + 1
 
     sessions = [aiohttp.ClientSession(
         trust_env=False,
@@ -151,16 +235,18 @@ async def _worker_async(cfg: dict, wid: int, mp_queue) -> None:
             if item is None:  # 结束标记
                 return
             evs, body = item
+            n_ev = cfg["batch"] if evs is None else len(evs)
             outcome, lats = await _send_batch(session, url, body, headers,
-                                              len(evs), cfg["max_retries"], retries)
+                                              n_ev, cfg["max_retries"], retries)
             if outcome == "accepted" and arch is not None:
-                # 存档按"这一次成功发送"的时刻落盘（重发成功时用重发时刻）
+                # 存档按"这一次成功发送"的时刻落盘（重发成功时用重发时刻）。
+                # 快速模式不允许 --archive（main 里已拒绝），evs 恒非 None 时到这里
                 t_ms = now_ms()
                 for e in evs:
                     e.sent_ms = t_ms
                 arch.add(evs)
                 archived_ev[0] += len(evs)
-            await done_q.put((len(evs), outcome, lats))
+            await done_q.put((n_ev, outcome, lats))
 
     async def collector() -> None:
         """汇总完成结果：每批按"完成时刻"归秒、只计一次；收到结束标记后输出逐秒统计。"""
@@ -189,10 +275,17 @@ async def _worker_async(cfg: dict, wid: int, mp_queue) -> None:
     senders = [asyncio.create_task(sender(i)) for i in range(cfg["conc"])]
     collector_task = asyncio.create_task(collector())
 
+    # deadline 在模板生成**之后**才起算：模板预生成是启动开销（快速模式 32×10000
+    # 条约 10 s），不应吃掉发送窗口——否则短 --duration 下生成完 deadline 已过、
+    # 一条都发不出（实测 workers_done 正常但 sent=0、CPU 烧满在生成上）
     t_start = time.monotonic()
+    deadline = t_start + cfg["duration"]
     next_send_at = t_start
     sent_batches = 0
+    cpu_send_t0 = time.process_time()   # 发送窗口 CPU 计时起点（排除模板生成）
 
+    fast_w10 = 10 ** fast_w
+    fast_n = len(fast_templates)
     try:
         while True:
             now = time.monotonic()
@@ -201,12 +294,22 @@ async def _worker_async(cfg: dict, wid: int, mp_queue) -> None:
             if now < next_send_at:
                 await asyncio.sleep(min(next_send_at - now, 0.2))
                 continue
-            evs = gen.batch(cfg["batch"], now_ms())
-            body = gen.raw_batch(evs)
-            if cfg["gzip"]:
-                body = gzip_bytes(body)
-            sent_batches += 1
-            await lane.put((evs, body))
+            if fast:
+                # 快速模式：模板填充（等宽替换，请求体大小不变）
+                body = _fast_fill(fast_templates[sent_batches % fast_n],
+                                  fast_base, fast_w, now_ms())
+                if cfg["gzip"]:
+                    body = gzip_bytes(body)
+                fast_base += fast_w10
+                sent_batches += 1
+                await lane.put((None, body))
+            else:
+                evs = gen.batch(cfg["batch"], now_ms())
+                body = gen.raw_batch(evs)
+                if cfg["gzip"]:
+                    body = gzip_bytes(body)
+                sent_batches += 1
+                await lane.put((evs, body))
             next_send_at += cfg["batch"] / rate_pw
     finally:
         # 收尾：等所有批次发完（结果进 done_q），放结束标记让 collector 汇总后退出
@@ -222,7 +325,8 @@ async def _worker_async(cfg: dict, wid: int, mp_queue) -> None:
         wall = time.monotonic() - t_start
         mp_queue.put(("done", {"wid": wid, "sent_batches": sent_batches,
                                "archived": archived_ev[0], "retries": retries[0],
-                               "wall_s": wall, "cpu_s": time.process_time()}))
+                               "wall_s": wall, "cpu_s": time.process_time(),
+                               "cpu_send_s": time.process_time() - cpu_send_t0}))
 
 
 def _merge_seconds(per_sec: dict, sec: int, stats: dict, lat: list) -> None:
@@ -245,7 +349,8 @@ def second_line(sec: int, stats: dict, lat: list) -> str:
 
 
 def summary_dict(cfg: dict, per_sec: dict, done: list, wall: float,
-                 t0_ms: int, all_lat: list, cpu_s: float) -> dict:
+                 t0_ms: int, all_lat: list, cpu_s: float,
+                 cpu_send_s: float = 0.0) -> dict:
     """汇总 → 一行 JSON 的 dict。"""
     tot = {k: sum(b[k] for b in per_sec.values()) for k in
            ("sent", "accepted", "rejected", "errors")}
@@ -264,6 +369,12 @@ def summary_dict(cfg: dict, per_sec: dict, done: list, wall: float,
         "lat_p50_ms": pctl(all_lat, 50), "lat_p95_ms": pctl(all_lat, 95),
         "lat_p99_ms": pctl(all_lat, 99),
         "client_cpu_pct": round(cpu_s / wall * 100.0, 1) if wall else 0.0,
+        # 发送窗口 CPU 口径（排除模板预生成等启动开销）：worker 的 cpu_send_s
+        # 之和 ÷ 发送窗口 wall。每条 μs = 该 CPU 秒 ÷ sent——P2a 报告压测端
+        # 每条事件 CPU 时间用这个
+        "client_cpu_send_pct": round(cpu_send_s / wall * 100.0, 1) if wall else 0.0,
+        "client_cpu_us_per_ev": round(cpu_send_s / tot["sent"] * 1e6, 2)
+                               if (cpu_send_s and tot["sent"]) else None,
         "start_ms": t0_ms,
         "workers_done": len(done),
     }
@@ -302,6 +413,12 @@ def main() -> None:
     p.add_argument("--mode", choices=["长尾", "均匀", "随机"], default="长尾")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--archive", default=None, help="存档目录（只存 202 接受的批次）")
+    p.add_argument("--fast", action="store_true",
+                   help="快速模式：预生成请求体模板 + bytes.replace，"
+                        "发送开销降到最低（P2a）。不支持 --archive 与精确解对比；"
+                        "所有事件都是正常事件（迟到/未来/重复/非法比例为 0）")
+    p.add_argument("--fast-templates", type=int, default=32,
+                   help="快速模式每个 worker 预生成的模板数（默认 32）")
     p.add_argument("--max-retries", type=int, default=5, help="503 后的最大重试次数")
     p.add_argument("--p-late", type=float, default=0.0)
     p.add_argument("--p-future", type=float, default=0.0)
@@ -310,6 +427,14 @@ def main() -> None:
     p.add_argument("--p-invalid", type=float, default=0.0)
     p.add_argument("--request-timeout-s", type=float, default=10.0)
     args = p.parse_args()
+    if args.fast:
+        if args.archive:
+            p.error("--fast 不支持 --archive（存档与精确解对比用原模式）")
+        if args.mode == "随机":
+            p.error("--fast 不支持 --mode 随机（模板复用固定 key 集，"
+                    "只有长尾/均匀有吞吐测试意义）")
+        if args.fast_templates < 1:
+            p.error("--fast-templates 至少 1")
 
     start_wall = time.monotonic()
     t0_ms = now_ms()
@@ -359,7 +484,9 @@ def main() -> None:
 
     wall = time.monotonic() - start_wall
     cpu_s = sum(d.get("cpu_s", 0.0) for d in done) + time.process_time()
-    summary = summary_dict(cfg, per_sec, done, wall, t0_ms, all_lat, cpu_s)
+    cpu_send_s = sum(d.get("cpu_send_s", 0.0) for d in done)
+    summary = summary_dict(cfg, per_sec, done, wall, t0_ms, all_lat, cpu_s,
+                           cpu_send_s)
     if args.archive:
         meta = {
             "key_rule": 1,
