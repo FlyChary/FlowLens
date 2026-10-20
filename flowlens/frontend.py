@@ -19,16 +19,28 @@ import time
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
 from .api.app import (_error_middleware, _ingest_expect, _json_response,
-                      _read_raw_body, degrade_controller_key, raw_budget_key)
+                      _read_raw_body, degrade_controller_key,
+                      raw_budget_key, stats_body)
+from .api.params import QueryParams
+from .api.stream import topk_data
+from .config import Config
 from .engine import IngestResult
 from .errors import (BadRequest, FlowLensError, Overloaded, PayloadTooLarge,
                      TooOld, UnsupportedEncoding)
 from .ingest import MAX_PENDING_BYTES, decode_body
 from .ipc import MSG_ACK, MSG_BATCH, MSG_SNAPSHOT, encode_parsed, read_msg, send_msg
 from .parse_pool import parse_body
+from .query import (is_snapshot_query, stats_from_snapshot,
+                    topk_from_snapshot)
 from .supervisor import DegradeView, RawSlotAdmission, SlotAdmission
+from .timewin import Clock
 
 log = logging.getLogger("flowlens.frontend")
+
+# 快照保留的 Top-K 条数（Config 默认值；引擎与前端同版本启动，值一致）
+_TOP_N = Config().snapshot_top_n
+# 解析 at 参数用的时钟（判"at 在未来"），前端进程各一个、无状态
+_clock = Clock()
 
 
 class FrontState:
@@ -171,6 +183,7 @@ class FrontIngestService:
 
 front_ingest_key = web.AppKey("front_ingest", FrontIngestService)
 upstream_key = web.AppKey("upstream", ClientSession)
+front_state_key = web.AppKey("front_state", FrontState)
 
 # 转发时保留的请求/响应头（其余丢弃）
 _FWD_REQ = {"accept", "last-event-id", "content-type", "content-length", "content-encoding"}
@@ -189,6 +202,47 @@ async def _front_ingest(request: web.Request) -> web.Response:
         body, request.headers.get("Content-Encoding"))
     return _json_response({"accepted": r.accepted, "deduped": r.deduped,
                            "late": r.late, "invalid": r.invalid}, status=202)
+
+
+# ---- 默认窗口查询：本地快照副本直接回答（P2d-2 三）----
+
+async def _front_topk(request: web.Request) -> web.StreamResponse:
+    """默认窗口 topk：本地快照新鲜（3 秒内收到）时直接回答，否则转发引擎。
+
+    参数解析与校验与引擎的 _topk 同一份 QueryParams.from_request：非法参数
+    在这里就得到与引擎一致的 400（在转发之前）。引擎的第二道校验
+    （QueryService._check_window / _check_k）范围与 params 层相同（window
+    1~600 秒、k 1~100），对通过 from_request 的默认窗口查询不会触发；引擎的
+    "第 1 级暂停回放"检查在快照分支**之后**，默认窗口在引擎上同样不受影响
+    （以实际代码为准核对过，行为与引擎逐字节一致）。
+    """
+    st = request.app[front_state_key]
+    snap = st.fresh_snapshot()
+    if snap is not None:
+        qp = QueryParams.from_request(request, _clock.now_ms())
+        if is_snapshot_query(qp.at_ms, qp.window_ms, qp.k, _TOP_N):
+            ans = topk_from_snapshot(snap, qp.by, qp.k, qp.window_ms)
+            sh = st.shared
+            return _json_response(
+                topk_data(ans, degraded=bool(sh.degraded.value),
+                          sample_weight=sh.sample_weight.value))
+    return await _proxy(request)
+
+
+async def _front_stats(request: web.Request) -> web.StreamResponse:
+    """默认窗口 stats：本地快照新鲜时直接回答（memory_bytes / degraded 从
+    共享内存读，引擎在每次快照回调里写的），否则转发引擎。"""
+    st = request.app[front_state_key]
+    snap = st.fresh_snapshot()
+    if snap is not None:
+        qp = QueryParams.from_request(request, _clock.now_ms(),
+                                      need_k=False, need_by=False)
+        if is_snapshot_query(qp.at_ms, qp.window_ms, None, _TOP_N):
+            sh = st.shared
+            return _json_response(
+                stats_body(stats_from_snapshot(snap, qp.window_ms),
+                           sh.mem_bytes.value, bool(sh.degraded.value)))
+    return await _proxy(request)
 
 
 async def _proxy(request: web.Request) -> web.StreamResponse:
@@ -224,7 +278,8 @@ async def _proxy(request: web.Request) -> web.StreamResponse:
 
 def create_front_app(conn, shared, slot, n_fronts, query_sock: str,
                      adm_normal: int, adm_tight: int,
-                     raw_normal: int, raw_tight: int) -> web.Application:
+                     raw_normal: int, raw_tight: int,
+                     state: "FrontState | None" = None) -> web.Application:
     """组装一个前端进程的 HTTP 应用。
 
     raw_budget 放 RawSlotAdmission（_read_raw_body / _ingest_expect 只依赖这个键）、
@@ -245,8 +300,15 @@ def create_front_app(conn, shared, slot, n_fronts, query_sock: str,
     app[front_ingest_key] = FrontIngestService(
         conn, SlotAdmission(adm_normal, shared.pending, shared.ingest_rejected, slot),
         shared, adm_normal, adm_tight)
+    # 本地快照副本（P2d-2 三）：默认窗口查询用它直接回答。state 由调用方传入时
+    # 复用（_front_run 在创建 EngineConnection 之前建好它，读循环要往里存快照），
+    # 测试等直接构造时在这里新建
+    app[front_state_key] = state if state is not None else FrontState(shared)
     app.router.add_post("/v1/ingest", _front_ingest, expect_handler=_ingest_expect)
-    # catch-all：除 POST /v1/ingest 外的一切（含错误方法、不存在路径）转发给引擎
+    # 默认窗口查询在 catch-all 之前注册：本地快照新鲜时直接回答，否则落到下面转发
+    app.router.add_get("/v1/topk", _front_topk)
+    app.router.add_get("/v1/stats", _front_stats)
+    # catch-all：除上面已注册的路径外的一切（含错误方法、不存在路径）转发给引擎
     app.router.add_route("*", "/{tail:.*}", _proxy)
 
     async def _open(app):
@@ -287,9 +349,11 @@ async def _front_run(slot, host, port, ingest_sock, query_sock, shared,
             await asyncio.sleep(0.1)
     if reader is None:
         raise SystemExit(f"front{slot}: 无法连接引擎写入通道 {ingest_sock}")
-    conn = EngineConnection(reader, writer, on_lost=stop.set)
+    state = FrontState(shared)   # 本地快照副本：读循环存快照、默认窗口查询读快照
+    conn = EngineConnection(reader, writer, on_lost=stop.set, state=state)
     app = create_front_app(conn, shared, slot, 1, query_sock,
-                           adm_normal, adm_tight, raw_normal, raw_tight)
+                           adm_normal, adm_tight, raw_normal, raw_tight,
+                           state=state)
     # auto_decompress=False 与 lingering_time 的含义与 __main__.py 中的注释相同，
     # 必须同样设置（见那里的注释：aiohttp 3.14+ 不自动解压、413/503 后读体再关连接）
     runner = web.AppRunner(app, auto_decompress=False, lingering_time=lingering)

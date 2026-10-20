@@ -15,11 +15,13 @@ import numpy as np
 import orjson
 import pytest
 
-from flowlens.engine import IngestResult
+from flowlens.bounds import Result
+from flowlens.engine import IngestResult, Snapshot
 from flowlens.errors import (BadRequest, Overloaded, PayloadTooLarge, TooOld,
                              UnsupportedEncoding)
-from flowlens.frontend import (EngineConnection, FrontIngestService,
-                               _error_from_ack, create_front_app)
+from flowlens.frontend import (EngineConnection, FrontIngestService, FrontState,
+                               _error_from_ack, _front_stats, _front_topk,
+                               create_front_app)
 from flowlens.ipc import _HDR, MSG_ACK
 from flowlens.parse_pool import ParsedBatch
 from flowlens.supervisor import (DegradeView, SharedState, SlotAdmission,
@@ -272,3 +274,193 @@ def test_create_front_app_routes_ingest_and_catchall():
     canonicals = {r.resource.canonical for r in app.router.routes()}
     assert "/v1/ingest" in canonicals
     assert "/{tail}" in canonicals   # catch-all 转发
+
+
+# ---- 三：默认窗口查询本地回答（_front_topk / _front_stats）----
+
+class _FakeReq:
+    """aiohttp 请求替身：QueryParams.from_request 只读 .query；_proxy 被
+    monkeypatch 成记录桩，所以 .method 等属性只在其被调用时用到。"""
+
+    def __init__(self, query: dict, app):
+        self.query = query
+        self.app = app
+        self.method = "GET"
+        self.headers = {}
+        self.can_read_body = False
+        self.path_qs = "/x"
+
+    @property
+    def rel_url(self):
+        import types
+        return types.SimpleNamespace(path_qs=self.path_qs)
+
+    async def read(self):
+        return b""
+
+
+def _snap_with(data):
+    """一个两维度的快照：url 维度 2 条、user 维度 1 条名单。"""
+    url_tops = (Result(1, "/a", 10.0, 9.0, 11.0), Result(2, "/b", 5.0, 4.0, 6.0))
+    user_tops = (Result(3, "u1", 7.0, 6.0, 8.0),)
+    return Snapshot(NOW, NOW - 60_000, NOW, (url_tops, user_tops),
+                    (11.0, 8.0), 42.0, 999.0)
+
+
+def _fresh_state(shared, snap):
+    st = FrontState(shared)
+    st.snapshot = snap
+    import time as _t
+    st.snapshot_recv_ms = _t.monotonic() * 1000
+    return st
+
+
+def _app_with_state(shared, st):
+    app = {}
+    # 用 dict 替身：_front_topk / _front_stats 只用 request.app[front_state_key]
+    from flowlens.frontend import front_state_key
+    app[front_state_key] = st
+    return app
+
+
+def _proxy_stub(monkeypatch, calls):
+    async def _proxy(request):
+        calls.append(request.path_qs)
+        return "PROXIED"
+    monkeypatch.setattr("flowlens.frontend._proxy", _proxy)
+
+
+def test_front_topk_answers_from_snapshot(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    st = _fresh_state(shared, _snap_with(None))
+    req = _FakeReq({}, _app_with_state(shared, st))
+    calls = []
+    _proxy_stub(monkeypatch, calls)
+    resp = asyncio.run(_front_topk(req))
+    assert calls == []                       # 本地回答，不转发
+    body = orjson.loads(resp.body)
+    assert body["window_ms"] == 60_000
+    assert body["from"] == NOW - 60_000 and body["to"] == NOW
+    assert body["by"] == "url" and body["k"] == 10 and body["final"] is False
+    assert body["degraded"] is False and "sample_rate" not in body
+    assert body["unseen_upper"] == 11.0
+    assert body["items"][0] == {"key": "/a", "count": 10, "err": 2.0}
+    assert body["items"][1] == {"key": "/b", "count": 5, "err": 2.0}
+
+
+def test_front_topk_by_user_dim(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    st = _fresh_state(shared, _snap_with(None))
+    req = _FakeReq({"by": "user", "k": "1"}, _app_with_state(shared, st))
+    calls = []
+    _proxy_stub(monkeypatch, calls)
+    body = orjson.loads(asyncio.run(_front_topk(req)).body)
+    assert body["by"] == "user" and body["k"] == 1
+    assert body["items"] == [{"key": "u1", "count": 7, "err": 2.0}]
+    assert body["unseen_upper"] == 8.0
+
+
+def test_front_topk_degraded_and_sample_rate(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    shared.degraded.value = 1
+    shared.sample_weight.value = 4
+    st = _fresh_state(shared, _snap_with(None))
+    req = _FakeReq({}, _app_with_state(shared, st))
+    _proxy_stub(monkeypatch, [])
+    body = orjson.loads(asyncio.run(_front_topk(req)).body)
+    assert body["degraded"] is True and body["sample_rate"] == 0.25
+
+
+def test_front_topk_stale_snapshot_proxies(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    st = _fresh_state(shared, _snap_with(None))
+    st.snapshot_recv_ms -= 3001              # 3 秒前收到 → 过期
+    req = _FakeReq({}, _app_with_state(shared, st))
+    calls = []
+    _proxy_stub(monkeypatch, calls)
+    assert asyncio.run(_front_topk(req)) == "PROXIED" and len(calls) == 1
+
+
+def test_front_topk_no_snapshot_proxies(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    st = FrontState(shared)                  # 还没收到快照
+    req = _FakeReq({}, _app_with_state(shared, st))
+    calls = []
+    _proxy_stub(monkeypatch, calls)
+    assert asyncio.run(_front_topk(req)) == "PROXIED" and len(calls) == 1
+
+
+@pytest.mark.parametrize("query", [
+    {"window": "30s"},                       # 非 60 秒窗口
+    {"at": "1"},                             # 带 at
+    {"k": "101"},                            # k 超过 K_MAX（400）
+    {"k": "0"},                              # 非法 k（400）
+])
+def test_front_topk_nondefault_or_bad_proxies_or_400(monkeypatch, query):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    st = _fresh_state(shared, _snap_with(None))
+    req = _FakeReq(query, _app_with_state(shared, st))
+    calls = []
+    _proxy_stub(monkeypatch, calls)
+    if "k" in query:
+        # 非法 k 与引擎一致地在这里就 400（QueryParams 层）
+        with pytest.raises(BadRequest):
+            asyncio.run(_front_topk(req))
+        assert calls == []
+    else:
+        assert asyncio.run(_front_topk(req)) == "PROXIED"
+        assert len(calls) == 1
+
+
+def test_front_stats_answers_from_snapshot(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    shared.mem_bytes.value = 123_456_789
+    st = _fresh_state(shared, _snap_with(None))
+    req = _FakeReq({}, _app_with_state(shared, st))
+    calls = []
+    _proxy_stub(monkeypatch, calls)
+    body = orjson.loads(asyncio.run(_front_stats(req)).body)
+    assert calls == []
+    assert body == {"window_ms": 60_000, "from": NOW - 60_000, "to": NOW,
+                    "approx_distinct_users": 42, "approx_p95_bytes": 999,
+                    "memory_bytes": 123_456_789, "degraded": False}
+
+
+def test_front_stats_nan_p95_is_null(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    snap = _snap_with(None)
+    st = _fresh_state(shared, snap)
+    # 快照 p95 为 NaN（窗口内无数据）→ 响应 null（orjson 不输出 NaN 字面量）
+    import math
+    st.snapshot = Snapshot(snap.at_ms, snap.from_ms, snap.to_ms,
+                           snap.tops, snap.unseen_upper, snap.distinct_users,
+                           float("nan"))
+    req = _FakeReq({}, _app_with_state(shared, st))
+    _proxy_stub(monkeypatch, [])
+    body = orjson.loads(asyncio.run(_front_stats(req)).body)
+    assert body["approx_p95_bytes"] is None
+
+
+def test_front_stats_nondefault_proxies(monkeypatch):
+    shared = SharedState(mp.get_context("spawn"), 1)
+    st = _fresh_state(shared, _snap_with(None))
+    req = _FakeReq({"window": "30s"}, _app_with_state(shared, st))
+    calls = []
+    _proxy_stub(monkeypatch, calls)
+    assert asyncio.run(_front_stats(req)) == "PROXIED" and len(calls) == 1
+    # window=abc 非法：与引擎一致地 400
+    req2 = _FakeReq({"window": "abc"}, _app_with_state(shared, st))
+    with pytest.raises(BadRequest):
+        asyncio.run(_front_stats(req2))
+
+
+def test_create_front_app_registers_local_query_routes():
+    shared = SharedState(mp.get_context("spawn"), 1)
+    app = create_front_app(_FakeConn(), shared, 0, 1, "/tmp/unused.sock",
+                           4 * 1024 * 1024, 2 * 1024 * 1024,
+                           8 * 1024 * 1024, 4 * 1024 * 1024)
+    from flowlens.frontend import front_state_key
+    assert isinstance(app[front_state_key], FrontState)
+    canonicals = {r.resource.canonical for r in app.router.routes()}
+    assert "/v1/topk" in canonicals and "/v1/stats" in canonicals
+    assert "/v1/ingest" in canonicals and "/{tail}" in canonicals
