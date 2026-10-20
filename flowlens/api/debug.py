@@ -31,6 +31,7 @@ def is_enabled() -> bool:
 def register(app: web.Application) -> None:
     """注册调试路由（create_app 在 FLOWLENS_DEBUG=1 时调用）。"""
     app.router.add_get("/debug/structure", _debug_structure)
+    app.router.add_get("/debug/info", _debug_info)
 
 
 # ---- 只读快照：各部分独立成纯函数，便于测试与基准测量 ----
@@ -146,6 +147,21 @@ def build_structure(engine, d: Dim, at_ms: int | None = None,
     if at_ms is not None:
         data["plan"] = _plan_summary(engine, d, at_ms, window_ms)
     return data
+
+
+async def _debug_info(request: web.Request) -> web.Response:
+    """引擎侧信息查询（P2d-2 六）：/v1/topk、/v1/stats 的引擎侧请求计数
+    （query_counter）与内部 Unix 套接字路径（前端模式下，测试据此直连引擎）。
+
+    验证"前端模式默认窗口查询由前端本地回答、不经过引擎"：对前端（对外端口）
+    发默认窗口查询后，这里的计数不增；带 at / 非 60 秒窗口的查询（转发）才增。
+    """
+    from .app import query_counter_key, query_sock_key
+    out = {
+        "query": dict(request.app[query_counter_key]),
+        "query_sock": request.app.get(query_sock_key),
+    }
+    return web.Response(content_type="application/json", body=orjson.dumps(out))
 
 
 async def _debug_structure(request: web.Request) -> web.Response:

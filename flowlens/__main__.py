@@ -16,7 +16,7 @@ import tempfile
 from aiohttp import web
 
 from .api.app import (create_app, degrade_controller_key, make_engine,
-                      memory_reader_key)
+                      memory_reader_key, query_sock_key)
 from .api import debug
 from .hub import SnapshotHub, make_on_snapshot
 from .ipc import MSG_ACK, MSG_BATCH, decode_to_parsed, read_msg, send_msg
@@ -192,6 +192,8 @@ def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
     # memory_reader=_env_memory_reader：支持 FLOWLENS_TEST_MEM 注入（测试进第 4 级用）
     app = create_app(engine, ingest_service, query_service, fronts=sup.shared,
                      memory_reader=_env_memory_reader)
+    # 内部 Unix 套接字路径报给 /debug/info（P2d-2 六的 e2e 据此直连引擎）
+    app[query_sock_key] = query_sock
     # 快照广播（P2d-2 二）：每次替换快照后，把快照与降级/采样/内存状态发给所有前端
     hub = SnapshotHub()
     engine.on_snapshot = make_on_snapshot(hub, sup.shared, app[degrade_controller_key],

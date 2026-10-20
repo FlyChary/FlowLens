@@ -92,6 +92,13 @@ ticker_task_key = web.AppKey("ticker_task", asyncio.Task)
 stream_manager_key = web.AppKey("stream_manager", StreamManager)
 degrade_controller_key = web.AppKey("degrade_controller", DegradeController)
 memory_reader_key = web.AppKey("memory_reader", Callable)
+# 引擎侧查询计数（P2d-2 六）：_topk / _stats 每请求 +1，/debug/info 读（验证
+# "前端模式默认窗口查询由前端本地回答、不经过引擎"）。普通 dict 计数，单写者
+# （事件循环），无锁。
+query_counter_key = web.AppKey("query_counter", dict)
+# 前端模式下内部 Unix 套接字的路径（/debug/info 报给测试直连引擎用）；
+# 单进程模式没有（不设）
+query_sock_key = web.AppKey("query_sock", str)
 
 
 def _default_memory_reader() -> tuple[int, int | None]:
@@ -141,6 +148,8 @@ def create_app(engine: Engine, ingest_service: IngestService,
     # memory_limit_bytes 都统一从这一个 reader 读。默认是 memstat 的两个函数；
     # 测试注入假读数（如恒 (0, None)），让测试与运行环境的真实内存解耦。
     app[memory_reader_key] = memory_reader if memory_reader is not None else _default_memory_reader
+    # 引擎侧查询计数（P2d-2 六）：_topk / _stats 每请求 +1
+    app[query_counter_key] = {"topk": 0, "stats": 0}
     # 级别变化副作用（收紧/恢复预算、进入第 3 级清缓存）：只在实际变化时回调一次
     controller.on_change = _make_degrade_change_hook(app)
     # Expect: 100-continue 的超大请求在这一步拒绝，客户端不会发送请求体（见 _ingest_expect）
@@ -377,6 +386,7 @@ async def _ingest(request: web.Request) -> web.Response:
 
 
 async def _topk(request: web.Request) -> web.Response:
+    request.app[query_counter_key]["topk"] += 1   # 引擎侧计数（P2d-2 六）
     ctrl = request.app[degrade_controller_key]
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms)
@@ -386,6 +396,7 @@ async def _topk(request: web.Request) -> web.Response:
 
 
 async def _stats(request: web.Request) -> web.Response:
+    request.app[query_counter_key]["stats"] += 1   # 引擎侧计数（P2d-2 六）
     ctrl = request.app[degrade_controller_key]
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms, need_k=False, need_by=False)

@@ -48,7 +48,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux",
 # ---- wrapper：起服务子进程 + stdin/stdout JSON 命令通道 ----
 
 _WRAPPER = r'''
-import json, os, select, subprocess, sys, time
+import json, os, re, select, subprocess, sys, threading
 
 def children(pid):
     try:
@@ -75,11 +75,13 @@ def front_children(engine_pid):
     return res
 
 def main():
-    port, fronts, test_mem, raw_budget = sys.argv[1:5]
+    port, fronts, test_mem, raw_budget, debug, sockfile = sys.argv[1:7]
     env = dict(os.environ, PYTHONHASHSEED="0", FLOWLENS_FRONTENDS=fronts)
     if test_mem:
         # P2d-2 五：FLOWLENS_TEST_MEM 只在 FLOWLENS_DEBUG=1 时生效，故一并开启调试
         env["FLOWLENS_TEST_MEM"] = test_mem
+        env["FLOWLENS_DEBUG"] = "1"
+    if debug:
         env["FLOWLENS_DEBUG"] = "1"
     if raw_budget:
         env["FLOWLENS_RAW_BUDGET_BYTES"] = raw_budget
@@ -87,7 +89,23 @@ def main():
                               "--host", "127.0.0.1", "--port", port],
                              cwd=os.environ["FLOWLENS_ROOT"], env=env,
                              stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+                             stderr=subprocess.PIPE)
+    # 引擎启动日志里有 "内部 HTTP <query.sock>、写入通道 <ingest.sock>"，把它
+    # 解析出来写到 sockfile，测试据此直连引擎内部 Unix 套接字（路径在临时目录）
+    sock_re = re.compile(r"内部 HTTP (\S+)、写入通道 (\S+)")
+    def _tail():
+        q = i = None
+        for line in child.stderr:
+            line = line.decode("utf-8", "replace")
+            m = sock_re.search(line)
+            if m and q is None:
+                q, i = m.group(1), m.group(2)
+                try:
+                    with open(sockfile, "w") as f:
+                        f.write(json.dumps({"query": q, "ingest": i}))
+                except OSError:
+                    pass
+    threading.Thread(target=_tail, daemon=True).start()
     while True:
         # 引擎子进程退出就结束（不依赖 stdin EOF，避免 SIGTERM 测试死锁）
         if child.poll() is not None:
@@ -125,16 +143,21 @@ class _Wrapper:
     """wrapper 进程：stdin 发 JSON 命令、stdout 收 JSON 回复。
 
     服务子进程的环境变量（FLOWLENS_FRONTENDS / FLOWLENS_TEST_MEM /
-    FLOWLENS_RAW_BUDGET_BYTES）在这里传给子进程。close() 时 terminate wrapper
-    （wrapper 退出前把服务子进程一并 kill）。
+    FLOWLENS_RAW_BUDGET_BYTES / FLOWLENS_DEBUG）在这里传给子进程。
+    前端模式下引擎把两个内部 Unix 套接字路径写在启动日志里（P2d-2 六），
+    wrapper 的 tail 线程解析出来写到 self._sockfile，query_sock 属性读回。
+    close() 时 terminate wrapper（wrapper 退出前把服务子进程一并 kill）。
     """
 
     def __init__(self, port: int, fronts: str = "2", test_mem: str = "",
-                 raw_budget: str = ""):
+                 raw_budget: str = "", debug: str = "1"):
+        import tempfile
+        fd, self._sockfile = tempfile.mkstemp(prefix="flowlens-sock-")
+        os.close(fd)
         env = dict(os.environ, FLOWLENS_ROOT=str(ROOT))
         self.proc = subprocess.Popen(
             [sys.executable, "-c", _WRAPPER, str(port), fronts, test_mem,
-             raw_budget],
+             raw_budget, debug, self._sockfile],
             env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
             errors="replace", bufsize=1)
@@ -155,6 +178,21 @@ class _Wrapper:
 
     def front_pids(self) -> list[int]:
         return self.ask("front_children")["children"]
+
+    @property
+    def query_sock(self) -> str:
+        """引擎内部 HTTP 的 Unix 套接字路径（前端模式；轮询等 wrapper 解析日志）。"""
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                with open(self._sockfile, encoding="utf-8") as f:
+                    d = json.load(f)
+                if d.get("query"):
+                    return d["query"]
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        raise AssertionError("未从引擎日志解析出内部 Unix 套接字路径")
 
     def close(self) -> None:
         if self.proc.poll() is None:
@@ -215,9 +253,10 @@ def _start_front_service(fronts: int = 2, test_mem: str = "",
 
 
 def _http_json(port: int, method: str, path: str, body: bytes = b"",
-               headers: dict | None = None) -> tuple[int, dict, dict]:
+               headers: dict | None = None,
+               timeout: float = 10.0) -> tuple[int, dict, dict]:
     """发一个原始 HTTP 请求，返回 (状态码, JSON 体或 {}, 小写响应头 dict)。"""
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     hdrs = dict(headers or {})
     if body or method in ("POST", "PUT", "PATCH"):
         hdrs.setdefault("Content-Length", str(len(body)))
@@ -680,5 +719,275 @@ def test_fronts_selftest_boundary_cases():
         for r in failed:
             print(f"边界用例失败：{r.name} 期望 {r.expected} 实际 {r.actual}")
         assert not failed, f"{len(failed)} 个边界用例失败"
+    finally:
+        w.close()
+
+
+# ---- 9. P2d-2：默认窗口查询由前端本地回答 ----
+
+def _unix_http(sock_path: str, path: str,
+               timeout: float = 10.0) -> tuple[int, bytes]:
+    """对某 Unix 套接字发一个 GET，返回 (状态码, 响应体)。
+
+    引擎只监听 Unix 套接字（前端模式不监听 TCP），测试用它绕过前端直查引擎，
+    与前端（对外端口）的响应做逐字节对照。
+    """
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        s.sendall((f"GET {path} HTTP/1.1\r\nHost: engine\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            part = s.recv(65536)
+            if not part:
+                break
+            buf += part
+        head, _, body = buf.partition(b"\r\n\r\n")
+        head_txt = head.decode("latin-1")
+        status = int(head_txt.split(" ", 2)[1])
+        for line in head_txt.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                cl = int(line.split(":", 1)[1].strip())
+                while len(body) < cl:
+                    part = s.recv(65536)
+                    if not part:
+                        break
+                    body += part
+                break
+        return status, body
+    finally:
+        s.close()
+
+
+def _engine_info(w: _Wrapper) -> dict:
+    """引擎内部 HTTP 的 /debug/info：query 计数（topk/stats）与 query_sock 路径。
+
+    引擎的 Unix 套接字路径在临时目录里（不对外暴露），从它自己内部 HTTP 的
+    /debug/info 读回（wrapper 以 FLOWLENS_DEBUG=1 起服务，故该端点存在）。
+    """
+    st, body = _unix_http(w.query_sock, "/debug/info")
+    assert st == 200, (st, body[:200])
+    return json.loads(body.decode("utf-8"))
+
+
+def _body_without_mem(body: bytes) -> dict:
+    """响应体去掉 memory_bytes 后的 JSON（前端与引擎的 memory_bytes 口径不同）。"""
+    d = json.loads(body.decode("utf-8"))
+    d.pop("memory_bytes", None)
+    return d
+
+
+def test_fronts_default_window_answered_locally():
+    """默认窗口查询由前端本地回答：
+
+    - 一致性：同一时刻对前端（对外端口）与引擎（内部 Unix HTTP）请求同一
+      /v1/topk（url、user，k=1/10/100）与 /v1/stats，除 memory_bytes 外
+      响应体一致（两次请求要在同一秒内完成，否则 from/to 可能不同——重试
+      几次取 from/to 对齐的一次）；
+    - 引擎侧计数：默认窗口查询不增引擎的 query 计数（前端本地回答），
+      带 at / 非 60 秒窗口的查询（转发）才增。
+    """
+    w = _start_front_service(fronts=2)
+    try:
+        # 写入一批数据（热键明确，top 无歧义），等 2 秒让快照稳定
+        st, out, _ = _http_json(w.port, "POST", "/v1/ingest", _mk_body(2000, "snap"))
+        assert st == 202, out
+        time.sleep(2.0)
+        info = _engine_info(w)
+        sock = info["query_sock"]
+        assert sock == w.query_sock
+        base = dict(info["query"])
+        queries = [f"/v1/topk?by={d}&k={k}" for d in ("url", "user")
+                   for k in (1, 10, 100)] + ["/v1/stats"]
+        ok = False
+        for _ in range(6):
+            ok = True
+            for path in queries:
+                stf, bf, _ = _http_json(w.port, "GET", path)
+                ste, be = _unix_http(sock, path)
+                assert stf == ste == 200, (path, stf, ste)
+                if _body_without_mem(bf) != _body_without_mem(be):
+                    ok = False     # from/to 跨秒了，重试
+                    break
+            if ok:
+                break
+            time.sleep(0.3)
+        assert ok, "前端与引擎的默认窗口响应未能对齐（from/to 跨秒）"
+        # 引擎侧计数不增：全部默认窗口查询都由前端本地回答
+        assert _engine_info(w)["query"] == base, (base, _engine_info(w)["query"])
+        # 带 at 的 topk（转发）：引擎计数 topk +1
+        at = int(time.time() * 1000) - 1000
+        assert _http_json(w.port, "GET",
+                          f"/v1/topk?window=60s&k=5&by=url&at={at}")[0] == 200
+        aft2 = _engine_info(w)["query"]
+        assert aft2["topk"] == base["topk"] + 1 and aft2["stats"] == base["stats"], (base, aft2)
+        # 非 60 秒窗口的 stats（转发）：引擎计数 stats +1
+        assert _http_json(w.port, "GET", "/v1/stats?window=30s")[0] == 200
+        aft3 = _engine_info(w)["query"]
+        assert aft3["stats"] == base["stats"] + 1 and aft3["topk"] == aft2["topk"]
+    finally:
+        w.close()
+
+
+def test_fronts_local_default_matches_single_process():
+    """前端本地回答的默认窗口查询与单进程模式（同一批数据）结果一致：
+    topk 的 key 与 count 逐项相等，stats 的近似字段等值。"""
+    import orjson
+    import random
+    r = random.Random(23)
+    now = int(time.time() * 1000)
+    evs = []
+    for i in range(3000):
+        if i < 1500:
+            hot = i // 300
+            evs.append({"event_id": f"ld-{now}-{i}", "user_id": f"hu{hot}",
+                        "url": f"/ld/hot{hot}", "ts": now - (i % 1500),
+                        "bytes": 100 + (i % 40)})
+        else:
+            evs.append({"event_id": f"ld-{now}-{i}", "user_id": f"u{r.randrange(300)}",
+                        "url": f"/ld/t/x{i}", "ts": now - (i % 1500),
+                        "bytes": 100 + (i % 40)})
+    body = orjson.dumps(evs)
+    wf = _start_front_service(fronts=1)
+    ws = _start_front_service(fronts=0)
+    try:
+        for svc in (wf, ws):
+            st, out, _ = _http_json(svc.port, "POST", "/v1/ingest", body)
+            assert st == 202, out
+            assert out["accepted"] == 3000
+        time.sleep(2.0)   # 让两个服务的快照都稳定
+        for by in ("url", "user"):
+            for _ in range(6):
+                _, df, _ = _http_json(wf.port, "GET", f"/v1/topk?by={by}&k=10")
+                _, ds, _ = _http_json(ws.port, "GET", f"/v1/topk?by={by}&k=10")
+                if (df["from"], df["to"]) == (ds["from"], ds["to"]):
+                    break
+                time.sleep(0.3)
+            assert (df["from"], df["to"]) == (ds["from"], ds["to"]), (by, df, ds)
+            assert [it["key"] for it in df["items"]] == \
+                   [it["key"] for it in ds["items"]], (by, df, ds)
+            assert [it["count"] for it in df["items"]] == \
+                   [it["count"] for it in ds["items"]], (by, df, ds)
+        for _ in range(6):
+            _, sf, _ = _http_json(wf.port, "GET", "/v1/stats")
+            _, ss, _ = _http_json(ws.port, "GET", "/v1/stats")
+            if sf["from"] == ss["from"]:
+                break
+            time.sleep(0.3)
+        assert sf["from"] == ss["from"], (sf, ss)
+        assert sf["approx_distinct_users"] == ss["approx_distinct_users"], (sf, ss)
+        assert sf["approx_p95_bytes"] == ss["approx_p95_bytes"], (sf, ss)
+    finally:
+        wf.close()
+        ws.close()
+
+
+def test_fronts_forward_cases_parity_with_single():
+    """转发的情况（带 at、window=30s、非法参数 k=0 / window=abc）结果与单进程
+    模式一致：状态码相等；错误体（400）逐字节相等（前端本地用同一 QueryParams
+    校验，或转发后由引擎回）。"""
+    now = int(time.time() * 1000)
+    cases = [
+        f"/v1/topk?window=60s&k=5&by=url&at={now - 5000}",  # 200（转发回放）
+        "/v1/stats?window=30s",                             # 200（转发回放）
+        "/v1/topk?window=60s&k=0&by=url",                   # 400
+        "/v1/topk?window=abc",                              # 400
+        "/v1/stats?window=abc",                             # 400
+    ]
+    wf = _start_front_service(fronts=2)
+    ws = _start_front_service(fronts=0)
+    try:
+        for path in cases:
+            stf, outf, _ = _http_json(wf.port, "GET", path)
+            sts, outs, _ = _http_json(ws.port, "GET", path)
+            assert stf == sts, (path, stf, sts)
+            if stf == 400:
+                assert outf == outs, (path, outf, outs)
+            elif stf == 200:
+                assert set(outf) == set(outs), (path, set(outf), set(outs))
+                assert outf["k"] == outs["k"] and outf["by"] == outs["by"]
+    finally:
+        wf.close()
+        ws.close()
+
+
+def test_fronts_degraded_local_answer():
+    """第 3 级降级：前端本地回答的默认窗口查询 degraded 为 true；sample_rate
+    与引擎一致（shared.sample_weight / degraded 由引擎快照回调写入）。"""
+    # 208037478/268435456 = 0.78×256MB < x < 0.90×256MB → 第 3 级（degraded、weight 1）
+    w = _start_front_service(fronts=1, test_mem="208037478,268435456")
+    try:
+        assert _wait_level3(w.port), "未进入第 3 级"
+        st, out, _ = _http_json(w.port, "GET", "/v1/topk?by=url&k=10")
+        assert st == 200
+        assert out["degraded"] is True
+        wgt = _healthz(w.port)["degrade"]["sample_weight"]
+        if wgt > 1:
+            assert out["sample_rate"] == 1.0 / wgt
+        else:
+            assert "sample_rate" not in out
+        st, s, _ = _http_json(w.port, "GET", "/v1/stats")
+        assert st == 200 and s["degraded"] is True
+    finally:
+        w.close()
+
+
+def _wait_level3(port: int, timeout: float = 10.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _healthz(port)["degrade"]["level"] >= 3:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def test_fronts_stale_snapshot_forwards():
+    """快照过期：暂停引擎（SIGSTOP）约 4 秒，前端的默认窗口查询转为转发
+    （引擎冻结 → 内部 HTTP 无响应、查询挂起/超时）；恢复（SIGCONT）后前端
+    重新收到快照、默认窗口查询恢复本地回答（快速 200）。
+
+    这一项对真实进程时序敏感（指令："如果不稳定，改为单元测试
+    FrontState.fresh_snapshot"——新鲜性判定本身已由 tests/test_hub.py 的
+    test_front_state_freshness 与 tests/test_frontend.py 的
+    test_front_topk_stale_snapshot_proxies 覆盖，本用例做真实进程的验证）。
+    """
+    w = _start_front_service(fronts=1)
+    try:
+        st, out, _ = _http_json(w.port, "POST", "/v1/ingest", _mk_body(500, "stale"))
+        assert st == 202, out
+        time.sleep(2.0)   # 让前端拿到快照（本地回答就绪）
+        engine = w.engine_pid
+        os.kill(engine, signal.SIGSTOP)
+        try:
+            time.sleep(4.0)   # 快照在超过 3 秒未收到 → fresh_snapshot 返回 None
+            t0 = time.time()
+            try:
+                st, _, _ = _http_json(w.port, "GET", "/v1/topk?by=url&k=10",
+                                      timeout=6.0)
+                # 转发时引擎冻结：要么挂到超时、要么连接被拒。本地回答（<100ms）
+                # 不应发生——它依赖 fresh_snapshot，此刻必为 None
+                dt = time.time() - t0
+                if st == 200 and dt < 0.05:
+                    pytest.fail(f"快照过期后仍在 {dt*1000:.0f}ms 内本地回答")
+            except (socket.timeout, TimeoutError, ConnectionError):
+                pass   # 转发挂起 / 引擎无响应：符合预期
+        finally:
+            os.kill(engine, signal.SIGCONT)
+        # 恢复后：前端重新收到快照，默认窗口查询恢复本地回答（快速 200）
+        deadline = time.time() + 10
+        ok = False
+        while time.time() < deadline:
+            try:
+                t0 = time.time()
+                st, _, _ = _http_json(w.port, "GET", "/v1/topk?by=url&k=10")
+                if st == 200 and time.time() - t0 < 1.0:
+                    ok = True
+                    break
+            except (socket.timeout, TimeoutError, ConnectionError):
+                pass
+            time.sleep(0.5)
+        assert ok, "恢复后前端默认窗口查询未恢复本地回答"
+        assert _healthz(w.port)["ok"] is True
     finally:
         w.close()
