@@ -68,6 +68,11 @@ class SharedState:
         self.n = n
         self.level = ctx.Value("i", 0, lock=False)        # 引擎写：当前降级级别
         self.tight = ctx.Value("b", 0, lock=False)        # 引擎写：1 表示第 3 级起收紧额度
+        # P2d-2 二：前端回答默认窗口查询需要的引擎状态（引擎在快照回调里每秒写一次，
+        # 见 hub.make_on_snapshot；degraded 与 level 同源于控制器的当前级别）
+        self.degraded = ctx.Value("b", 0, lock=False)     # 引擎写：1 表示降级中
+        self.sample_weight = ctx.Value("i", 1, lock=False)  # 引擎写：带权采样权重
+        self.mem_bytes = ctx.Value("q", 0, lock=False)    # 引擎写：内存读数（memory_reader）
         self.pending = ctx.Array("q", n, lock=False)      # 前端 i 写：在途额度已预留的字节
         self.raw_pending = ctx.Array("q", n, lock=False)  # 前端 i 写：原始体额度已预留的字节
         self.ingest_rejected = ctx.Array("q", n, lock=False)  # 前端 i 写：在途额度拒绝累计

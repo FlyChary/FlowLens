@@ -15,7 +15,9 @@ import tempfile
 
 from aiohttp import web
 
-from .api.app import create_app, make_engine
+from .api.app import (create_app, degrade_controller_key, make_engine,
+                      memory_reader_key)
+from .hub import SnapshotHub, make_on_snapshot
 from .ipc import MSG_ACK, MSG_BATCH, decode_to_parsed, read_msg, send_msg
 from .intern import url_intern, user_intern
 from .errors import FlowLensError
@@ -25,16 +27,21 @@ from .timewin import Clock
 log = logging.getLogger("flowlens")
 
 
-async def serve_front(reader, writer, svc) -> None:
+async def serve_front(reader, writer, svc, hub=None) -> None:
     """写入通道的服务端（P2d-1 5.2）：每个前端一条连接、一个协程。
 
     读取 BATCH → decode_to_parsed（只对不重复字符串驻留）→ svc.write_parsed（与单进程
     同一套切块写引擎）→ 回 ACK。同一连接上的请求按顺序处理即可（写入本来就被信号量
     串行化）。引擎写入路径只会产生 FlowLensError（400/413/415/422/503），转成
     (req_id, "error", status, message, retry_after) 回给前端还原成同样的异常。
+
+    快照广播（P2d-2 二）：开始读取循环前 hub.add(writer)（新连接立即拿到当前快照），
+    退出（finally）hub.discard(writer)。hub 为 None（单进程/测试）时跳过。
     """
     iu = url_intern.intern if url_intern is not None else None
     ir = user_intern.intern if user_intern is not None else None
+    if hub is not None:
+        hub.add(writer)
     try:
         while True:
             try:
@@ -51,6 +58,8 @@ async def serve_front(reader, writer, svc) -> None:
                        getattr(e, "retry_after", None))
             await send_msg(writer, MSG_ACK, ack)
     finally:
+        if hub is not None:
+            hub.discard(writer)
         writer.close()
 
 
@@ -172,6 +181,10 @@ def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
     # memory_reader=_env_memory_reader：支持 FLOWLENS_TEST_MEM 注入（测试进第 4 级用）
     app = create_app(engine, ingest_service, query_service, fronts=sup.shared,
                      memory_reader=_env_memory_reader)
+    # 快照广播（P2d-2 二）：每次替换快照后，把快照与降级/采样/内存状态发给所有前端
+    hub = SnapshotHub()
+    engine.on_snapshot = make_on_snapshot(hub, sup.shared, app[degrade_controller_key],
+                                          app[memory_reader_key])
 
     async def run():
         runner = web.AppRunner(app, auto_decompress=False, lingering_time=lingering)
@@ -179,7 +192,7 @@ def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
         # 前端模式：只起 Unix 内部 HTTP（给前端转发查询），不监听 TCP
         await web.UnixSite(runner, query_sock).start()
         server = await asyncio.start_unix_server(
-            lambda r, w: serve_front(r, w, ingest_service), path=ingest_sock)
+            lambda r, w: serve_front(r, w, ingest_service, hub), path=ingest_sock)
         monitor_task = asyncio.create_task(sup.monitor())
         log.info("FlowLens 前端模式就绪：%d 个前端、内部 HTTP %s、写入通道 %s",
                  n_fronts, query_sock, ingest_sock)
@@ -212,6 +225,8 @@ def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
                 await monitor_task
             except asyncio.CancelledError:
                 pass
+            engine.on_snapshot = None   # 停止快照回调（不再广播）
+            await hub.close()
             sup.stop()
             server.close()
             await server.wait_closed()

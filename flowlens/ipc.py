@@ -18,7 +18,15 @@ from dataclasses import dataclass
 
 MSG_BATCH = 1   # 前端 → 引擎：一个写入请求的解析结果
 MSG_ACK = 2     # 引擎 → 前端：写入结果或错误
+MSG_SNAPSHOT = 3   # 引擎 → 前端：最新快照（P2d-2 快照广播）
 _HDR = struct.Struct("<IB")   # 负载长度（字节）+ 消息类型
+
+
+def pack_msg(mtype: int, obj) -> bytes:
+    """序列化成一整帧（头 + 负载）。快照广播用它：一次序列化、发给多个连接，
+    且"一次 write 写出整帧"保证不同消息在字节流中不交错（见 hub.py）。"""
+    data = pickle.dumps(obj, protocol=5)
+    return _HDR.pack(len(data), mtype) + data
 
 
 async def send_msg(writer: asyncio.StreamWriter, mtype: int, obj) -> None:

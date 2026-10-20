@@ -117,6 +117,17 @@ def test_read_msg_ack_roundtrip():
     assert mtype == MSG_ACK and obj == ack
 
 
+def test_pack_msg_one_frame():
+    """pack_msg 把头 + 负载合成一整帧，read_msg 能还原（快照广播用：一次序列化发多端）。"""
+    from flowlens.ipc import MSG_SNAPSHOT, pack_msg
+    obj = {"a": 1, "b": [2, 3]}
+    frame = pack_msg(MSG_SNAPSHOT, obj)
+    assert frame[:_HDR.size] == _HDR.pack(len(frame) - _HDR.size, MSG_SNAPSHOT)
+    reader = _ChunkedReader(_split_random(frame, seed=2, pieces=4))
+    mtype, out = asyncio.run(read_msg(reader))
+    assert mtype == MSG_SNAPSHOT and out == obj
+
+
 def test_read_msg_incomplete_raises():
     """连接在消息中途关闭：readexactly 抛 IncompleteReadError（调用方处理）。"""
     w = _wire_batch_sample(3)

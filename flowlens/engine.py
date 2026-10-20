@@ -83,6 +83,11 @@ class _Plan:
 
 
 class Engine:
+    # 快照替换后的回调（P2d-2 二）：前端模式下由 __main__ 设置（广播快照 + 发布
+    # 共享状态），单进程模式为 None。回调必须**同步**（只做序列化与安排发送，
+    # 不能 await）——它被 refresh_snapshot / refresh_snapshot_async 在事件循环里同步调用。
+    on_snapshot = None   # Callable[[Snapshot], None] | None
+
     def __init__(self, cfg: Config, clock: Clock,
                  controller: "DegradeController | None" = None):
         self.cfg = cfg
@@ -155,6 +160,8 @@ class Engine:
             unseen.append(u)
         distinct_users, p95_bytes = self._snapshot_stats(r)
         self.snapshot = self._build_snapshot(now, r, tops, unseen, distinct_users, p95_bytes)
+        if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot)
         return self.snapshot
 
     async def refresh_snapshot_async(self) -> Snapshot:
@@ -173,6 +180,8 @@ class Engine:
         await asyncio.sleep(0)  # 统计概要之前让出
         distinct_users, p95_bytes = self._snapshot_stats(r)
         self.snapshot = self._build_snapshot(now, r, tops, unseen, distinct_users, p95_bytes)
+        if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot)
         return self.snapshot
 
     def tick(self) -> None:

@@ -14,6 +14,7 @@ import asyncio
 import itertools
 import logging
 import signal
+import time
 
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
@@ -23,11 +24,37 @@ from .engine import IngestResult
 from .errors import (BadRequest, FlowLensError, Overloaded, PayloadTooLarge,
                      TooOld, UnsupportedEncoding)
 from .ingest import MAX_PENDING_BYTES, decode_body
-from .ipc import MSG_ACK, MSG_BATCH, encode_parsed, read_msg, send_msg
+from .ipc import MSG_ACK, MSG_BATCH, MSG_SNAPSHOT, encode_parsed, read_msg, send_msg
 from .parse_pool import parse_body
 from .supervisor import DegradeView, RawSlotAdmission, SlotAdmission
 
 log = logging.getLogger("flowlens.frontend")
+
+
+class FrontState:
+    """前端本地的只读副本（P2d-2 二.4）：引擎广播来的最新快照及其接收时刻。
+
+    快照是引擎"每秒整体替换、只读不改"的对象（engine.Snapshot 冻结 dataclass），
+    复制一份给前端是安全的。回答查询用的 degraded / sample_weight / memory_bytes
+    直接从共享内存读（引擎在每次快照回调里写，见 hub.make_on_snapshot）。
+    """
+
+    def __init__(self, shared):
+        self.shared = shared
+        self.snapshot = None            # 最新快照（Snapshot）
+        self.snapshot_recv_ms = 0.0     # 单调钟毫秒，收到快照的时刻
+
+    def fresh_snapshot(self):
+        """快照存在且在最近 3 秒内收到，才用于回答；否则转发给引擎（由引擎决定）。
+
+        引擎被暂停/卡住（不再产生新快照）时，前端的本地副本会过期——此时转发
+        给引擎，由引擎按自己的实时状态回答或拒绝，避免前端拿过期快照继续答。
+        """
+        if self.snapshot is None:
+            return None
+        if time.monotonic() * 1000 - self.snapshot_recv_ms > 3000:
+            return None
+        return self.snapshot
 
 
 def _error_from_ack(msg) -> FlowLensError:
@@ -52,10 +79,14 @@ class EngineConnection:
     多个并发写入共享这条连接，靠 req_id 区分；发送用锁串行化，保证一条消息的
     头与体连续写出（不与其他消息交错）。连接断开时，所有在途请求以 Overloaded
     失败（引擎侧尚未去重，调用方重试安全），并回调 on_lost 让前端主协程退出。
+
+    除 ACK 外还接收快照广播（P2d-2 二.4）：MSG_SNAPSHOT 帧整体存入 FrontState
+    （state.snapshot），供前端的默认窗口查询本地回答。
     """
 
-    def __init__(self, reader, writer, on_lost):
+    def __init__(self, reader, writer, on_lost, state: "FrontState | None" = None):
         self._r, self._w, self._on_lost = reader, writer, on_lost
+        self._state = state
         self._ids = itertools.count(1)
         self._waiting: dict[int, asyncio.Future] = {}
         self._send_lock = asyncio.Lock()
@@ -77,6 +108,11 @@ class EngineConnection:
         try:
             while True:
                 mtype, msg = await read_msg(self._r)
+                if mtype == MSG_SNAPSHOT:
+                    if self._state is not None:
+                        self._state.snapshot = msg
+                        self._state.snapshot_recv_ms = time.monotonic() * 1000
+                    continue
                 if mtype != MSG_ACK:
                     continue
                 fut = self._waiting.get(msg[0])
