@@ -132,21 +132,6 @@ def test_pending_limit_env_override(monkeypatch):
     assert _read_pending_limit() == DEFAULT_PENDING_BYTES
 
 
-def test_pooled_pending_limit_env_override(monkeypatch):
-    """P1c 一.3：进程池开启时在途额度默认 8 MB；FLOWLENS_MAX_PENDING_BYTES 仍可覆盖。"""
-    from flowlens.ingest import pooled_pending_limit, POOLED_PENDING_BYTES
-    assert POOLED_PENDING_BYTES == 8 * 1024 * 1024  # 默认 8 MB
-    monkeypatch.delenv("FLOWLENS_MAX_PENDING_BYTES", raising=False)
-    assert pooled_pending_limit() == 8 * 1024 * 1024
-    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "6291456")  # 6 MB
-    assert pooled_pending_limit() == 6 * 1024 * 1024
-    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "not-a-number")
-    assert pooled_pending_limit() == 8 * 1024 * 1024
-    monkeypatch.setenv("FLOWLENS_MAX_PENDING_BYTES", "-5")
-    assert pooled_pending_limit() == 8 * 1024 * 1024
-    monkeypatch.delenv("FLOWLENS_MAX_PENDING_BYTES")
-
-
 def test_raw_budget_limit_env_override(monkeypatch):
     """FLOWLENS_RAW_BUDGET_BYTES 覆盖原始请求体额度上限：合法值生效，非法/空/非正退回默认 8 MB。"""
     from flowlens.api.app import _read_raw_budget_limit, DEFAULT_RAW_BUDGET_LIMIT
@@ -440,11 +425,11 @@ def test_ingest_parsed_equals_ingest():
     run(json.dumps([5, "str", None]).encode())
 
 
-def test_ingest_pooled_503_then_retry_not_deduped():
-    """P1 §3.2 / 规则 2：进程池路径下在途额度满 → 503（预留在池提交之前），释放后重试不判重。"""
+def test_ingest_503_then_retry_not_deduped():
+    """规则 2：在途额度满 → 503（预留在解析之前），释放后重试不判重。"""
     eng = Engine(Config(), FakeClock(NOW))
     adm = Admission()
-    svc = IngestService(eng, adm, parse_pool=_FakePool())
+    svc = IngestService(eng, adm)
     body = _body_rand(100)
 
     async def main():
@@ -454,68 +439,42 @@ def test_ingest_pooled_503_then_retry_not_deduped():
             raise AssertionError("应抛 Overloaded")
         except Overloaded as e:
             assert e.retry_after == 1
-        # 被拒的 e* 不应写进 Bloom（预留在解析与池提交之前）。释放后重试必须被正常接受
+        # 被拒的 e* 不应写进 Bloom（预留在解析之前）。释放后重试必须被正常接受
         adm.release(MAX_PENDING_BYTES)
         r = await svc.ingest(body, None)
         assert r.accepted == 100 and r.deduped == 0
     asyncio.run(main())
 
 
-def _FakePool():
-    """一个恒返回单进程 parse 结果的"进程池"替身（不真起子进程），让 svc 走 _ingest_pooled。"""
-    from flowlens.parse_pool import parse_body
+def test_write_parsed_equals_ingest(monkeypatch):
+    """P2d-1 写入核心等价性：同一请求体分别走"已解析"路径（decode_body→parse_body→
+    write_parsed→POOLED_CHUNK_EVENTS 切块→invalid 放首块）与单进程路径
+    （decode_body→validate→ingest），写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
+    覆盖长尾、gzip、NDJSON、全随机——前端进程经写入通道写引擎最终走的就是 write_parsed，
+    它与单进程 ingest 必须等价，端到端"前端模式 vs 单进程"的等价性才有基础。
 
-    class _FakePool:
-        available = True
-        num_workers = 1
-
-        def __init__(self):
-            self.rebuilt = False
-
-        def submit(self, raw):
-            import concurrent.futures as cf
-            f = cf.Future()
-            f.set_result(parse_body(raw))
-            return f
-
-        def rebuild(self):
-            self.rebuilt = True
-
-        def close(self):
-            pass
-
-    return _FakePool()
-
-
-def test_pool_path_full_equivalence(monkeypatch):
-    """P1 §3.1（经 IngestService 的完整路径）：同一请求体分别走进程池路径（替身池，走
-    decode_body→parse_body→ingest_parsed→POOLED_CHUNK_EVENTS 切块→invalid 放首块）与单进程
-    路径（decode_body→validate→ingest），写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
-    覆盖 P1 点名的长尾、gzip、NDJSON、全随机。
-
-    两条路径**用同一块大小切块**才能逐项相等：进程池路径用 POOLED_CHUNK_EVENTS（10000），
-    单进程路径用 CHUNK_EVENTS（默认 2000）。块大小不同会在高基数流量的 Top-K 名单深尾部
-    产生差异（TopK 堆成员对"逐秒 observe 分批顺序"敏感，sketch 固有性质、非 bug）。本用例
-    验证的是"路径"（in-proc vs 进程池）等价，故临时把 CHUNK_EVENTS 对齐到
+    两条路径用同一块大小切块才能逐项相等：write_parsed 用 POOLED_CHUNK_EVENTS（10000），
+    单进程 ingest 用 CHUNK_EVENTS（默认 2000）。块大小不同会在高基数流量的 Top-K 名单深
+    尾部产生差异（sketch 固有性质、非 bug）。故临时把 CHUNK_EVENTS 对齐到
     POOLED_CHUNK_EVENTS，把块大小这个性能旋钮固定住、只留路径变量。
     """
+    from flowlens.ingest import decode_body
+    from flowlens.parse_pool import parse_body
     monkeypatch.setattr(ing_mod, "CHUNK_EVENTS", ing_mod.POOLED_CHUNK_EVENTS)
     eng, svc = _svc()
-    svc._pool = _FakePool()
-    svc._parse_inproc = False          # 强制走 _ingest_pooled（替身池）
     eng2 = Engine(Config(), FakeClock(NOW))
     s2 = IngestService(eng2, Admission())  # 单进程路径
 
     async def run(body, enc):
-        r_pooled = await svc.ingest(body, enc)
+        r_parsed = await svc.write_parsed(parse_body(decode_body(body, enc)))
         r_inproc = await s2.ingest(body, enc)
-        assert r_pooled == r_inproc
+        assert r_parsed == r_inproc
         assert _snap_sig(eng) == _snap_sig(eng2)
         assert _cnt_sig(eng) == _cnt_sig(eng2)
 
     async def main():
         plain = _body_rand(6000)
-        await run(plain, None)                                   # 长尾，跨 3 个块
+        await run(plain, None)                                   # 长尾，跨多个块
         await run(_gzip(plain), "gzip")                          # gzip（解压后等价）
         # NDJSON（逐行）
         evs = json.loads(plain)

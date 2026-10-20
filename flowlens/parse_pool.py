@@ -1,48 +1,36 @@
-"""解析进程池（P1）：把逐条处理里的"解析"部分搬到多个子进程，主进程只留单写者部分。
+"""解析的纯计算部分（P1 起，P2d-1 起只保留纯函数）。
 
-为什么要搬：T11a 剖析显示每条事件里约 9.5 μs 花在"解压、load_array、validate（含归一化）、
-三个 key 的哈希"上，这部分彼此独立、只读，可以并行；主进程只剩 classify、Bloom 去重、按秒
-分组、写入秒桶、tick（约 3.5 μs）——这些**必须**单写者、无锁，不能并行。
+本模块原是"解析进程池"（P1）：把逐条处理里的"解析"部分搬到多个子进程。P2d-1 起
+**进程池被前端进程架构取代**（前端进程自己解析、经写入通道把 ParsedBatch 发给
+引擎；ParsePool / FLOWLENS_PARSE_WORKERS 已删除，见 docs/lanes/P2-notes.md P2d-1）。
+保留下来的都是**纯计算 / 纯数据**，前端进程与测试直接 import：
 
-分工（用户决定一）：**gzip 解压留在主进程**。在途额度按"解压后字节数"预留，而解压后大小
-只有解压完才知道；若把解压放进子进程，主进程就没法在交出去之前完成预留，"先预留、再解析、
-再去重"的顺序会被打破。所以：主进程 decode_body（解压）→ 预留 → 把**解压后的字节**交给子
-进程 → 子进程只做 load_array、validate（含归一化）、三列 64 位哈希 → 拿回 ParsedBatch →
-主进程写入引擎 → finally 释放预留。load_array 抛的 BadRequest 原样传回，预留照常在 finally
-释放（被拒/报错的请求都没写去重，重试安全）。
+- ParsedBatch：解析结果的列式数据（三列 64 位哈希与 ts/nbytes/urls/users 逐行对齐）
+- parse_body：解压后字节 → load_array + validate + 三列哈希（前端进程的执行体）
+- available_cpus：实际可用逻辑核数（前端数计算 resolve_front_count 用）
 
-子进程只 import 完成解析所需的模块（orjson、flowlens.model、flowlens.hashing），**不 import
-aiohttp 与引擎**（见 flowlens/model.py：只依赖 numpy/orjson/errors/intern）。
-
-用 multiprocessing 的 **spawn** 上下文（不 fork）：在 __main__ 里、创建引擎**之前**启动并
-预热，让子进程在主进程分配大块统计内存之前就存在（用户决定三），避免子进程继承主进程的大块
-内存（fork 会 COW 继承，spawn 不会）。
+哈希自检的历史说明：解析子进程时代，主进程把固定串的期望哈希传给子进程自检
+（防 PYTHONHASHSEED 不一致导致两边 hash() 不同）。前端进程与引擎同环境启动、
+PYTHONHASHSEED 在 __main__ 启动时统一检查告警，自检逻辑随之删除。
 """
 
 import os
-import logging
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 
-from .hashing import key_hash, key_hashes
+from .hashing import key_hashes
 from .model import load_array, validate
-
-log = logging.getLogger(__name__)
-
-# 哈希自检用的固定字符串：主进程算好期望值传给子进程，子进程启动时重算，不一致就报错退出
-# （防止 PYTHONHASHSEED 不一致导致两边 hash() 不同——那样去重/分桶会错乱且极难排查）。
-_SELFTEST_STR = "flowlens-selftest"
 
 
 @dataclass
 class ParsedBatch:
-    """子进程解析后回传的小对象（必须可 pickle）：只有数组与字符串列表，无对象引用。
+    """解析结果的小对象（必须可 pickle）：只有数组与字符串列表，无对象引用。
 
-    三列 64 位哈希与 ts/nbytes/urls/users 逐行对齐（长度相同）；event_id 本身不需要回传
-    ——主进程只用到它的哈希（去重 + 采样），不引用字符串。invalid 是 validate 剔除的条数。
+    前端进程 parse_body 产出后经写入通道发给引擎（ipc.WireBatch 在传输前把字符串列
+    去重）。三列 64 位哈希与 ts/nbytes/urls/users 逐行对齐（长度相同）；event_id 本身
+    不需要回传——引擎只用到它的哈希（去重 + 采样），不引用字符串。invalid 是被 validate
+    剔除的不合法条数。
     """
 
     ts: np.ndarray      # 毫秒，int64
@@ -72,28 +60,13 @@ class ParsedBatch:
         )
 
 
-def _selfcheck(expected: int) -> None:
-    """子进程 initializer：重算固定串的哈希，与主进程传入的期望值比较，不一致就报错退出。
-
-    用 SystemExit 而非异常：让进程池干净地标记为 broken（BrokenProcessPool），主进程据此
-    重建并给当前请求 503。
-    """
-    got = key_hash(_SELFTEST_STR)
-    if got != expected:
-        raise SystemExit(f"解析子进程哈希自检失败（期望 {expected:#x}，实得 {got:#x}）："
-                         "PYTHONHASHSEED 不一致，两边 hash() 不同，必须固定后再启动")
-
-
-def _worker_noop() -> None:
-    """预热用：一个模块级 no-op，spawn 上下文里必须可 pickle（lambda 不行）。"""
-    return None
-
-
 def parse_body(raw: bytes) -> ParsedBatch:
-    """子进程任务函数：输入**解压后的**字节，做 load_array + validate + 三列哈希。
+    """纯计算部分（前端进程的执行体）：输入**解压后的**字节，做
+    load_array + validate + 三列 64 位哈希。
 
-    异常（BadRequest / PayloadTooLarge / UnsupportedEncoding 等）原样抛回主进程，由
-    IngestService 转成对应 HTTP 状态码。本函数不碰任何主进程的统计状态（纯读、纯计算）。
+    异常（BadRequest / PayloadTooLarge / UnsupportedEncoding 等）原样抛出，由调用方
+    （前端的错误中间件 / IngestService）转成对应 HTTP 状态码。本函数不碰任何统计状态
+    （纯读、纯计算），前端进程与引擎进程都可直接 import 使用。
     """
     arr = load_array(raw)
     batch = validate(arr)
@@ -152,87 +125,3 @@ def available_cpus() -> int:
     return n
 
 
-def resolve_worker_count() -> int:
-    """解析进程数：min(2, 可用核数 − 1)，小于 1 时不启用（返回 0）。
-
-    默认上限从 3 降到 2（P1c 一.2）：每个解析进程约多占 25 MB 常驻内存
-    （P1c §6 空闲内存实测），256 MB 容器下每少一个进程就少一份内存压力；
-    而 2 个解析进程的解析能力约 20 万条/秒以上，超过主进程的写入上限
-    （P1b §5：瓶颈在主进程），第 3 个没有收益。
-    FLOWLENS_PARSE_WORKERS 环境变量仍可覆盖（0 表示禁用；实验可显式开 3，
-    覆盖值夹在 [0, 3]）。
-    """
-    raw = os.environ.get("FLOWLENS_PARSE_WORKERS", "").strip()
-    if raw:
-        try:
-            v = int(raw)
-        except ValueError:
-            return 0
-        return max(0, min(3, v))
-    return max(0, min(2, available_cpus() - 1))
-
-
-class ParsePool:
-    """管理解析子进程池：创建（spawn + 哈希自检 initializer）、预热、提交、崩溃重建、关闭。
-
-    在 __main__ 里、创建引擎**之前**实例化，并靠预热迫使 n 个子进程立即启动（用户决定三）：
-    ProcessPoolExecutor 默认"用到才建"子进程，若等第一个请求才建，那时主进程已分配了大块
-    统计内存，spawn 虽不继承但仍希望子进程尽早独立存在。
-    """
-
-    def __init__(self, num_workers: int):
-        if num_workers < 1:
-            raise ValueError("ParsePool 需要至少 1 个 worker")
-        self.num_workers = num_workers
-        self._ctx = mp.get_context("spawn")
-        self._expected = key_hash(_SELFTEST_STR)  # 主进程算期望值（自检基准）
-        self._executor: ProcessPoolExecutor | None = None
-        self._build()
-
-    def _build(self) -> None:
-        """创建进程池并预热：提交 num_workers 个 no-op 并等待，迫使子进程全部启动。"""
-        self._executor = ProcessPoolExecutor(
-            max_workers=self.num_workers,
-            mp_context=self._ctx,
-            initializer=_selfcheck,
-            initargs=(self._expected,),
-        )
-        futs = [self._executor.submit(_worker_noop) for _ in range(self.num_workers)]
-        try:
-            for f in futs:
-                f.result()  # 触发 initializer（哈希自检）与首次任务，失败在此抛出
-        except BaseException:
-            # 自检失败 / 子进程崩溃：关掉半成品池再向上抛，避免泄漏管理线程与残留进程
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
-            raise
-
-    @property
-    def available(self) -> bool:
-        return self.num_workers > 0
-
-    def submit(self, raw: bytes):
-        """把解压后的字节交给子进程解析，返回 concurrent.futures.Future（结果是 ParsedBatch）。
-
-        调用方用 asyncio.wrap_future 把它桥接成 await 的 future；子进程抛的异常会经 result()
-        原样传出。
-        """
-        if self._executor is None:
-            raise RuntimeError("ParsePool 已关闭")
-        return self._executor.submit(parse_body, raw)
-
-    def rebuild(self) -> None:
-        """子进程崩溃（BrokenProcessPool 等）后重建整个进程池并重新预热。"""
-        log.warning("解析进程池重建（之前的子进程崩溃）")
-        try:
-            if self._executor is not None:
-                self._executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-        self._build()
-
-    def close(self) -> None:
-        """关闭进程池（应用关闭 / SIGTERM 时调用），不残留子进程。"""
-        if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-            self._executor = None

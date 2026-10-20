@@ -19,10 +19,11 @@ from flowlens.engine import IngestResult
 from flowlens.errors import (BadRequest, Overloaded, PayloadTooLarge, TooOld,
                              UnsupportedEncoding)
 from flowlens.frontend import (EngineConnection, FrontIngestService,
-                               _error_from_ack, create_front_app, per_front_limit)
+                               _error_from_ack, create_front_app)
 from flowlens.ipc import _HDR, MSG_ACK
 from flowlens.parse_pool import ParsedBatch
-from flowlens.supervisor import DegradeView, SharedState, SlotAdmission
+from flowlens.supervisor import (DegradeView, SharedState, SlotAdmission,
+                                 per_front_limit)
 
 NOW = 1_735_689_600_000
 

@@ -1,18 +1,57 @@
-"""启动入口：$env:PYTHONHASHSEED="0"; python -m flowlens --host 0.0.0.0 --port 8080。"""
+"""启动入口：$env:PYTHONHASHSEED="0"; python -m flowlens --host 0.0.0.0 --port 8080。
+
+单进程模式（前端数 0，默认）：与 P2d-1 之前完全相同——TCPSite 监听 8080、本进程解析。
+前端模式（前端数 > 0，仅 Linux）：先 spawn 出 n 个前端进程（SO_REUSEPORT 共享 8080），
+引擎不监听 TCP，只起 Unix 套接字的内部 HTTP（给前端转发查询）+ 写入通道（前端把
+解析结果发给引擎）；降级级别与额度经共享内存交换（见 flowlens/supervisor.py）。
+"""
 
 import argparse
 import asyncio
 import logging
 import os
 import signal
+import tempfile
 
 from aiohttp import web
 
 from .api.app import create_app, make_engine
-from .parse_pool import ParsePool, resolve_worker_count
+from .ipc import MSG_ACK, MSG_BATCH, decode_to_parsed, read_msg, send_msg
+from .intern import url_intern, user_intern
+from .errors import FlowLensError
+from .supervisor import FrontSupervisor, resolve_front_count
 from .timewin import Clock
 
 log = logging.getLogger("flowlens")
+
+
+async def serve_front(reader, writer, svc) -> None:
+    """写入通道的服务端（P2d-1 5.2）：每个前端一条连接、一个协程。
+
+    读取 BATCH → decode_to_parsed（只对不重复字符串驻留）→ svc.write_parsed（与单进程
+    同一套切块写引擎）→ 回 ACK。同一连接上的请求按顺序处理即可（写入本来就被信号量
+    串行化）。引擎写入路径只会产生 FlowLensError（400/413/415/422/503），转成
+    (req_id, "error", status, message, retry_after) 回给前端还原成同样的异常。
+    """
+    iu = url_intern.intern if url_intern is not None else None
+    ir = user_intern.intern if user_intern is not None else None
+    try:
+        while True:
+            try:
+                mtype, w = await read_msg(reader)
+            except (asyncio.IncompleteReadError, ConnectionError):
+                return
+            if mtype != MSG_BATCH:
+                continue
+            try:
+                r = await svc.write_parsed(decode_to_parsed(w, iu, ir))
+                ack = (w.req_id, "ok", r.accepted, r.deduped, r.late, r.invalid)
+            except FlowLensError as e:
+                ack = (w.req_id, "error", e.status, e.message,
+                       getattr(e, "retry_after", None))
+            await send_msg(writer, MSG_ACK, ack)
+    finally:
+        writer.close()
 
 
 def main() -> None:
@@ -31,50 +70,34 @@ def main() -> None:
         log.warning("PYTHONHASHSEED 未固定（或为 random），哈希结果每次启动不同，"
                     "落盘数据将来无法合并。请固定为具体值（推荐 0）。")
 
-    # 解析进程池（P1，用户决定三）：在创建引擎**之前**启动并预热。spawn 上下文不继承
-    # 主进程内存，但子进程要在主进程分配大块统计内存（Ring/Tree/Bloom）之前"真的"存在，
-    # 所以先 ParsePool（内部提交空任务迫使 n 个子进程启动）再 make_engine。核数不足
-    # （resolve_worker_count < 1）或 FLOWLENS_PARSE_WORKERS=0 时为 None，退回单进程路径。
-    pool = None
-    n_workers = resolve_worker_count()
-    if n_workers > 0:
-        pool = ParsePool(n_workers)
-        log.info("解析进程池已启动：%d 个子进程（哈希自检通过）", n_workers)
+    lingering = float(os.environ.get("FLOWLENS_LINGERING_TIME", "1"))
+    n_fronts, why = resolve_front_count()
+    log.info("前端数 %d（%s）", n_fronts, why)
 
-    engine, ingest_service, query_service = make_engine(Clock(), parse_pool=pool)
-    app = create_app(engine, ingest_service, query_service,
-                     parse_pool=pool)
+    if n_fronts > 0:
+        _run_with_fronts(args, n_fronts, lingering)
+    else:
+        # 单进程模式：与 P2d-1 之前完全相同（不再使用 ParsePool）
+        _run_single(args, lingering)
+
+
+def _run_single(args, lingering: float) -> None:
+    engine, ingest_service, query_service = make_engine(Clock())
+    app = create_app(engine, ingest_service, query_service)
 
     async def run():
         # auto_decompress=False：不在传输层自动解压 gzip 请求体。请求体保持压缩，
         # 由 ingest.decode_body 分块解压并做 4 MB 限制与解压炸弹防护；否则 aiohttp
         # 3.14+ 会先解压、Content-Encoding 头仍在，decode_body 二次 gunzip 会报错。
         # lingering_time：请求体没读完就返回响应时，服务端继续把剩余体读完的最长
-        # 时间（秒），期间不发响应、读完（或超时）才关连接。
-        # 生产定为 1（见 T6c 实测与 docs/PROGRESS.md 决策）：
-        #   - 413/503 响应仍在 finish_response 里立即发出，客户端拿 413 不靠 lingering；
-        #   - lingering 只影响"关连接前是否读完在途请求体"。定为 0 时，对"不发
-        #     Expect 直接灌 5 MB 体"的客户端，服务端发完 413 就立即关连接，而客户端
-        #     还在发送 → 接收缓冲区有未读数据 → 内核发 RST（而非 FIN）→ 客户端偶发
-        #     收到"连接被重置"而非 413（实测 aiohttp 客户端 2/40）。定为 1 时服务端
-        #     会把剩余体读完再关连接（干净 FIN），20/20 稳定收到 413，且 413 仍是
-        #     毫秒级返回、没有可感知的 1 秒延迟（drain 发生在响应发出之后）。
-        # 发 Expect: 100-continue 的客户端（curl 默认、aiohttp expect100）不受影响：
-        # 超大请求在发请求体之前就被 expect_handler 拒绝，根本没有在途体。
-        # 可用 FLOWLENS_LINGERING_TIME 覆盖以便做对比实验（默认 1）。
-        lingering = float(os.environ.get("FLOWLENS_LINGERING_TIME", "1"))
+        # 时间（秒）。生产定为 1（见 T6c 实测）：413/503 响应仍立即发出，lingering
+        # 只影响"关连接前是否读完在途请求体"，定为 1 时读完才关（干净 FIN，客户端
+        # 稳定收到 413 而非 RST）。详见 P2d-1 前的 __main__.py 注释。
         runner = web.AppRunner(app, auto_decompress=False, lingering_time=lingering)
         await runner.setup()
         site = web.TCPSite(runner, args.host, args.port)
         await site.start()
         log.info("FlowLens 监听 %s:%d", args.host, args.port)
-        # 优雅停机：等待一个停止事件，而不是 asyncio.Event().wait() 永远等下去。
-        # 在支持 loop.add_signal_handler 的平台（POSIX）上，为 SIGTERM 与 SIGINT
-        # 注册处理器，收到即置位停止事件；随后照常 runner.cleanup()，并记录收到的
-        # 信号（即退出原因）。这样 docker stop 的 SIGTERM 也能干净退出（退出码 0）。
-        #
-        # Windows 不支持 add_signal_handler（会抛 NotImplementedError），保留 Ctrl+C
-        # （KeyboardInterrupt）路径，不能因此报错——注册失败就退回那条路径。
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
 
@@ -104,7 +127,86 @@ def main() -> None:
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        # Windows：add_signal_handler 不可用，Ctrl+C 走这条路径
+        log.info("收到 Ctrl+C（KeyboardInterrupt），停止服务")
+
+
+def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
+    """前端模式：先起前端（spawn），再建引擎、起 Unix 内部 HTTP 与写入通道。"""
+    from .ingest import MAX_PENDING_BYTES, MAX_DECOMPRESSED_BYTES
+    from .api.app import (MAX_RAW_BODY_BYTES, RAW_BUDGET_LIMIT,
+                          TIGHT_ADMISSION_LIMIT, TIGHT_RAW_BUDGET_LIMIT)
+
+    tmpdir = tempfile.mkdtemp(prefix="flowlens-")
+    ingest_sock = os.path.join(tmpdir, "ingest.sock")
+    query_sock = os.path.join(tmpdir, "query.sock")
+    # 每前端额度（4.3）：正常 = 合计 ÷ n（有下限），收紧 = 收紧合计 ÷ n（不设下限）
+    sup = FrontSupervisor(
+        n_fronts, args.host, args.port, ingest_sock, query_sock, lingering,
+        adm_total=MAX_PENDING_BYTES, adm_tight_total=TIGHT_ADMISSION_LIMIT,
+        raw_total=RAW_BUDGET_LIMIT, raw_tight_total=TIGHT_RAW_BUDGET_LIMIT,
+        adm_floor=MAX_DECOMPRESSED_BYTES, raw_floor=MAX_RAW_BODY_BYTES)
+    log.info("前端额度合计：在途 正常 %d / 收紧 %d；原始体 正常 %d / 收紧 %d"
+             "（每前端 在途 %d / %d，原始体 %d / %d）",
+             sup.shared.adm_total, sup.shared.adm_tight_total,
+             sup.shared.raw_total, sup.shared.raw_tight_total,
+             sup.adm_normal, sup.adm_tight, sup.raw_normal, sup.raw_tight)
+    sup.start_all()                       # 先启动前端（spawn，不继承大块内存）
+    engine, ingest_service, query_service = make_engine(Clock())
+    app = create_app(engine, ingest_service, query_service, fronts=sup.shared)
+
+    async def run():
+        runner = web.AppRunner(app, auto_decompress=False, lingering_time=lingering)
+        await runner.setup()
+        # 前端模式：只起 Unix 内部 HTTP（给前端转发查询），不监听 TCP
+        await web.UnixSite(runner, query_sock).start()
+        server = await asyncio.start_unix_server(
+            lambda r, w: serve_front(r, w, ingest_service), path=ingest_sock)
+        monitor_task = asyncio.create_task(sup.monitor())
+        log.info("FlowLens 前端模式就绪：%d 个前端、内部 HTTP %s、写入通道 %s",
+                 n_fronts, query_sock, ingest_sock)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _on_signal(signum: int) -> None:
+            log.info("收到信号 %s，停止服务", signal.Signals(signum).name)
+            stop.set()
+
+        registered: list[signal.Signals] = []
+        if hasattr(signal, "SIGTERM"):
+            for _sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(_sig, _on_signal, _sig)
+                    registered.append(_sig)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    log.warning("无法注册信号处理器 %s（平台不支持或非主线程），"
+                                "Ctrl+C 仍可停止", signal.Signals(_sig).name)
+        try:
+            await stop.wait()
+        finally:
+            for _sig in registered:
+                try:
+                    loop.remove_signal_handler(_sig)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    pass
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+            sup.stop()
+            server.close()
+            await server.wait_closed()
+            await runner.cleanup()
+            # 删除临时套接字目录
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
         log.info("收到 Ctrl+C（KeyboardInterrupt），停止服务")
 
 

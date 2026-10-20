@@ -133,12 +133,6 @@ class FrontIngestService:
             self.admission.release(n)
 
 
-def per_front_limit(total: int, n: int, floor: int) -> int:
-    """总额度按前端数平均，但每个前端的正常额度不能低于单请求上限 floor，
-    否则一个合法的大请求（最大 floor 字节）永远预留不到。"""
-    return max(total // n, floor)
-
-
 front_ingest_key = web.AppKey("front_ingest", FrontIngestService)
 upstream_key = web.AppKey("upstream", ClientSession)
 

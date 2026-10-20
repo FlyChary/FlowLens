@@ -42,11 +42,11 @@ from ..degrade import DegradeController
 from ..engine import Engine
 from ..errors import FlowLensError, Overloaded, PayloadTooLarge
 from ..ingest import Admission, IngestService
-from ..parse_pool import ParsePool
 from ..memstat import memory_bytes, memory_current_bytes, memory_limit_bytes
 from ..model import clear_norm_cache
 from ..query import QueryService
 from ..ticker import Ticker, malloc_trim
+from ..supervisor import FrontsBudgetView
 from . import debug
 from .params import QueryParams
 from .stream import (DEFAULT_HEARTBEAT_SEC, DEFAULT_MAX_GROUPS,
@@ -92,7 +92,6 @@ ticker_task_key = web.AppKey("ticker_task", asyncio.Task)
 stream_manager_key = web.AppKey("stream_manager", StreamManager)
 degrade_controller_key = web.AppKey("degrade_controller", DegradeController)
 memory_reader_key = web.AppKey("memory_reader", Callable)
-parse_pool_key = web.AppKey("parse_pool", ParsePool)
 
 
 def _default_memory_reader() -> tuple[int, int | None]:
@@ -108,15 +107,29 @@ def _default_memory_current_reader() -> int:
 def create_app(engine: Engine, ingest_service: IngestService,
                query_service: QueryService, *, tick_period: float = 1.0,
                memory_reader: Callable[[], tuple[int, int | None]] | None = None,
-               parse_pool: "ParsePool | None" = None
+               fronts=None
                ) -> web.Application:
     # client_max_size=0（不限制）：4 MB 上限由 _read_raw_body 自己执行，
     # 否则 aiohttp 会在 handler 之前以自己的 413 拒绝，RawBudget 预留就没机会了
     app = web.Application(client_max_size=0, middlewares=[_error_middleware])
     app[ingest_service_key] = ingest_service
     app[query_service_key] = query_service
-    # RawBudget 由 app 持有（create_app 的参数形式保持不变）
-    app[raw_budget_key] = Admission(limit=RAW_BUDGET_LIMIT)
+    # 额度（在途 admission 与 RawBudget）。单进程模式：各一个本地 Admission。
+    # 前端模式（fronts 非 None）：换成 FrontsBudgetView——把各前端写在共享数组里的
+    # 占用/拒绝汇总成一个"Admission 的样子"。在途视图替换 ingest_service.admission
+    # （Ticker 的 occupancy 与 _healthz 的 ingest_rejected 都读它，即各前端合计）；
+    # RawBudget 视图放 raw_budget_key（_healthz 的 raw_rejected 读它）。两者共用的
+    # 降级副作用（第 3 级收紧）：_make_degrade_change_hook 设 admission.limit 时，
+    # 视图只翻转共享的 tight 标志，实际每前端额度由各前端自行选择。
+    if fronts is not None:
+        app[raw_budget_key] = FrontsBudgetView(
+            fronts, fronts.raw_pending, fronts.raw_rejected,
+            fronts.raw_total, fronts.raw_tight_total)
+        ingest_service.admission = FrontsBudgetView(
+            fronts, fronts.pending, fronts.ingest_rejected,
+            fronts.adm_total, fronts.adm_tight_total)
+    else:
+        app[raw_budget_key] = Admission(limit=RAW_BUDGET_LIMIT)
     # 降级控制器（T8）：挂在 app 上，并与 engine（采样权重）和 query_service
     # （暂停回放）共享同一个实例——否则 engine 的采样与 query 的暂停各看各的级别，
     # 而"占用率触发第 1 级"这类只有 app 层才喂得进来的状态两边会不一致。
@@ -150,11 +163,6 @@ def create_app(engine: Engine, ingest_service: IngestService,
         write_timeout=DEFAULT_WRITE_TIMEOUT_SEC,
     )
     app[stream_manager_key] = manager
-    # 解析进程池（P1）：挂在 app 上，应用关闭（含 SIGTERM）时 _stop_parse_pool 关闭，
-    # 不残留子进程。IngestService 已持有同一个 pool 实例（make_engine 里传入）。
-    if parse_pool is not None:
-        app[parse_pool_key] = parse_pool
-        app.on_shutdown.append(_stop_parse_pool)
     app.on_startup.append(_start_ticker)
     app.on_shutdown.append(_stop_ticker)
     app.on_shutdown.append(_stop_stream)
@@ -176,14 +184,21 @@ def _make_degrade_change_hook(app: web.Application):
 
     做成工厂、闭包捕获 app，而不是把 app 传进控制器——控制器保持纯逻辑、不依赖
     aiohttp。只在实际变化时调用一次，所以"进入第 3 级清缓存"确实只在进入那一刻发生。
+
+    前端模式下 admission / raw_budget 是 FrontsBudgetView：设 limit 只翻转共享的
+    tight 标志（各前端按标志自行选额度）；并在 on_change 里把新级别发布到
+    shared.level（前端据此 reject_ingest）。单进程模式没有 shared，跳过发布。
     """
     admission = app[ingest_service_key].admission
     raw_budget = app[raw_budget_key]
     query_service = app[query_service_key]
     normal_adm, tight_adm = admission.limit, TIGHT_ADMISSION_LIMIT
     normal_raw, tight_raw = raw_budget.limit, TIGHT_RAW_BUDGET_LIMIT
+    shared = getattr(admission, "_s", None)   # FrontsBudgetView 持有 shared；本地 Admission 没有
 
     def on_change(old: int, new: int) -> None:
+        if shared is not None:
+            shared.level.value = new   # 前端读取（reject_ingest = level >= 4）
         if new >= 3:
             if old < 3:
                 # 进入第 3 级：收紧两个预算，并清一次结果缓存与 URL 归一化缓存
@@ -471,25 +486,13 @@ async def _stop_stream(app: web.Application) -> None:
     await app[stream_manager_key].close()
 
 
-async def _stop_parse_pool(app: web.Application) -> None:
-    # 应用关闭（含 SIGTERM）：关闭解析进程池，不残留子进程（P1 §3.5）。
-    # on_shutdown handler 必须是 async（aiohttp 会 await 它）；只在传入了进程池时才注册。
-    app[parse_pool_key].close()
-
-
-def make_engine(clock=None, parse_pool: "ParsePool | None" = None
-                ) -> tuple[Engine, IngestService, QueryService]:
+def make_engine(clock=None) -> tuple[Engine, IngestService, QueryService]:
     """按默认 Config 组装 engine + 服务（__main__ 用）。
 
-    parse_pool 非 None 时 IngestService 走进程池路径（把解压后的字节交给子进程解析），
-    且**在途额度默认 8 MB**（pooled_pending_limit；P1c 一.3，池开时解析并行、
-    4 MB 会过早拒绝，环境变量仍可覆盖），否则走现有单进程路径（核数不足 /
-    FLOWLENS_PARSE_WORKERS=0，在途额度默认 4 MB 不变）。
+    在途额度这里先建一个本地 Admission（单进程模式直接用）。前端模式下 create_app
+    会把它替换成 FrontsBudgetView（各前端合计的引擎侧视图），这里不需要知道前端。
     """
     from ..config import Config
-    from ..ingest import pooled_pending_limit
     from ..timewin import Clock
     engine = Engine(Config(), clock or Clock())
-    admission = Admission(limit=pooled_pending_limit()) if parse_pool is not None \
-        else Admission()
-    return engine, IngestService(engine, admission, parse_pool=parse_pool), QueryService(engine)
+    return engine, IngestService(engine, Admission()), QueryService(engine)

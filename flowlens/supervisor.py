@@ -6,12 +6,17 @@
 - 前端 i 只写自己的第 i 个槽位（在途/原始体的预留字节与拒绝计数）；
 - 每槽只有一个写者，读者读到的是某一时刻的值即可，所有共享对象 lock=False。
 
-前端进程由 FrontSupervisor 用 spawn 上下文拉起并监控（见第五节 5.4）。
+前端进程由 FrontSupervisor 用 spawn 上下文拉起并监控（第五节 5.4）：意外退出的
+前端由 monitor 任务在重启前清零它的额度槽位（它的预留不会再释放，不清零会占死
+引擎侧的合计额度）。
 """
 
+import asyncio
 import logging
+import multiprocessing as mp
 import os
 import sys
+import time
 
 from .ingest import Admission
 from .memstat import memory_limit_bytes
@@ -180,3 +185,87 @@ class FrontsBudgetView:
     @property
     def rejected(self) -> int:
         return sum(self._r)
+
+
+def per_front_limit(total: int, n: int, floor: int) -> int:
+    """总额度按前端数平均，但每个前端的正常额度不能低于单请求上限 floor，
+    否则一个合法的大请求（最大 floor 字节）永远预留不到。"""
+    return max(total // n, floor)
+
+
+class FrontSupervisor:
+    """前端进程的启动与监控（第五节 5.4）：spawn 拉起 n 个前端，monitor 每秒检查，
+    意外退出的先清零额度槽位再重新拉起；stop 在停机时 terminate→kill。
+
+    每前端的额度（正常/收紧、在途/原始体）在这里按 per_front_limit 算好，作为
+    Process 参数传给前端（spawn 子进程不继承主进程内存，但 sharedctypes 与基本
+    类型可以 pickle 传递）。因为有 floor 下限，前端数较多时**合计**会略高于设定值
+    （例如在途 16 MB ÷ 4 前端 < 4 MB 时，每前端抬到 4 MB、合计 16 MB 不变；
+    16 MB ÷ 6 前端 < 4 MB 时每前端 4 MB、合计 24 MB）——启动日志与 P2-notes 记录
+    实际合计。
+    """
+
+    def __init__(self, n: int, host: str, port: int, ingest_sock: str, query_sock: str,
+                 lingering: float,
+                 adm_total: int, adm_tight_total: int,
+                 raw_total: int, raw_tight_total: int,
+                 adm_floor: int, raw_floor: int):
+        self.ctx = mp.get_context("spawn")
+        self.shared = SharedState(self.ctx, n)
+        self.n = n
+        self._args = (host, port, ingest_sock, query_sock)
+        self._lingering = lingering
+        self.procs: list = [None] * n
+        self._stopping = False
+        # 每前端额度（第 4.3 节）：正常 = per_front_limit(合计, n, 单请求上限)，
+        # 收紧 = 收紧合计 // n（不设下限——降级期间"单个请求上限暂时降低"的语义，
+        # 与单进程模式一致）
+        self.adm_normal = per_front_limit(adm_total, n, adm_floor)
+        self.adm_tight = adm_tight_total // n
+        self.raw_normal = per_front_limit(raw_total, n, raw_floor)
+        self.raw_tight = raw_tight_total // n
+        # 各前端的**实际合计**（供 create_app 建 FrontsBudgetView 与启动日志）。
+        # 存在 shared 上（普通属性，不进 pickle、只给引擎进程用；各前端进程拿到的是
+        # 同一 sharedctypes 但不需要这些标量）。
+        self.shared.adm_total = self.adm_normal * n
+        self.shared.adm_tight_total = self.adm_tight * n
+        self.shared.raw_total = self.raw_normal * n
+        self.shared.raw_tight_total = self.raw_tight * n
+
+    def start_all(self) -> None:
+        for i in range(self.n):
+            self._start(i)
+
+    def _start(self, i: int) -> None:
+        from .frontend import front_main
+        p = self.ctx.Process(
+            target=front_main, name=f"flowlens-front{i}",
+            args=(i, *self._args, self.shared,
+                  self.adm_normal, self.adm_tight,
+                  self.raw_normal, self.raw_tight, self._lingering))
+        p.start()
+        self.procs[i] = p
+
+    async def monitor(self) -> None:
+        """每秒检查一次：意外退出的前端清零它的预留（它不会再释放，不清零会占死
+        引擎侧的合计额度），再重新拉起。"""
+        while not self._stopping:
+            await asyncio.sleep(1)
+            for i, p in enumerate(self.procs):
+                if p is not None and not p.is_alive() and not self._stopping:
+                    log.warning("前端 %d 退出（exitcode=%s），重新启动", i, p.exitcode)
+                    self.shared.reset_slot(i)
+                    self._start(i)
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self._stopping = True
+        for p in self.procs:
+            if p is not None and p.is_alive():
+                p.terminate()                       # SIGTERM
+        deadline = time.monotonic() + timeout
+        for p in self.procs:
+            if p is not None:
+                p.join(max(0.0, deadline - time.monotonic()))
+                if p.is_alive():
+                    p.kill()
+                    p.join(1)

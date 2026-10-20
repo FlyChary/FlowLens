@@ -12,13 +12,12 @@
 import asyncio
 import os
 import zlib
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 
 from .errors import BadRequest, Overloaded, PayloadTooLarge, UnsupportedEncoding
 from .engine import Engine, IngestResult
 from .model import load_array, validate
-from .parse_pool import ParsePool, ParsedBatch
+from .parse_pool import ParsedBatch
 
 MAX_BODY_BYTES = 4 * 1024 * 1024             # 请求体（压缩后）上限
 MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024     # 单个请求解压后上限，超过提示拆分
@@ -45,38 +44,15 @@ def _read_pending_limit() -> int:
 
 MAX_PENDING_BYTES = _read_pending_limit()
 
-# 进程池开启时的在途额度默认值（P1c 一.3，8 MB）：池开时解析并行、在途解析增多，
-# 4 MB 会过早拒绝（P1b 里 12 万/秒档主进程 CPU 已 ~80%，在途窗口要放得下"解析比
-# 写入慢"时的排队）。依据（P1c 一.3）：同时在途的请求数 = 每秒请求数 × 每个请求
-# 占额度的时长——每秒 10 万条约 20 个请求、每个请求占额度约 0.2~0.3 秒，约 4~6
-# 个请求、3~5 MB，8 MB 留有余量。单进程路径仍用 DEFAULT_PENDING_BYTES（4 MB）。
-POOLED_PENDING_BYTES = 8 * 1024 * 1024
-
-
-def pooled_pending_limit() -> int:
-    """进程池开启时的在途额度（字节）：FLOWLENS_MAX_PENDING_BYTES 已设置且为正数
-    时用环境变量的值，否则 8 MB（P1c 一.3）。
-
-    环境变量对单进程路径与进程池路径都可覆盖（后者不设时默认 8 MB 而不是 4 MB，
-    见 POOLED_PENDING_BYTES 的依据）。
-    """
-    raw = os.environ.get("FLOWLENS_MAX_PENDING_BYTES", "").strip()
-    if raw:
-        try:
-            v = int(raw)
-            if v > 0:
-                return v
-        except ValueError:
-            pass
-    return POOLED_PENDING_BYTES
 # 每次让出事件循环前写入引擎的事件数（P1 第 2 节 / 用户决定五）：从 5000 降到 2000。
 # 依据：写入引擎每条约 2.5 μs，单块 2000 条约 5 ms；混合负载下查询 p99 高的原因是
 # 查询排在多个写入块之后，缩短单块同步耗时能压低事件循环被独占的时间。
 CHUNK_EVENTS = 2000
-# 进程池路径的写入块大小（P1b 二点五）：跨进程传输可忽略（0.1 μs/条），主进程每条耗时
-# 严重依赖块大小（每块有按秒分组、逐维度去重统计、numpy 调用、筛选候选等固定开销）——
-# 审查方实测块 2000 约 2.98 μs/条、块 10000 约 1.88 μs/条。有写入信号量，同一时刻只写一块
-# （块 10000 约 25 ms），查询最多等一块，仍在 50 ms 内。故进程池路径取 10000。
+# 已解析路径（write_parsed，前端进程架构 P2d-1 起）的写入块大小（P1b 二点五）：
+# 跨进程传输可忽略（0.1 μs/条），主进程每条耗时严重依赖块大小（每块有按秒分组、
+# 逐维度去重统计、numpy 调用、筛选候选等固定开销）——审查方实测块 2000 约
+# 2.98 μs/条、块 10000 约 1.88 μs/条。有写入信号量，同一时刻只写一块（块 10000
+# 约 25 ms），查询最多等一块，仍在 50 ms 内。故已解析路径取 10000。
 # 注意：Top-K 名单是近似结构、堆成员对"逐秒 observe 的分批顺序"敏感——不同块大小会在
 # 名单深尾部产生少量差异（见 test_ingest 的等价性用例说明），这是 sketch 的固有性质，非 bug。
 POOLED_CHUNK_EVENTS = 10000
@@ -182,25 +158,24 @@ class Admission:
 
 
 class IngestService:
-    """写入请求处理（P1 起）：decode → 按解压后字节预留 → 解析（进程池或本进程）→
-    分块写入引擎（信号量保护）。
+    """写入请求处理：decode → 按解压后字节预留 → 解析（本进程 validate）→ 分块写入引擎
+    （信号量保护）。
 
-    顺序固定（CLAUDE.md 规则 2 + 用户决定一）：
-      decode_body（解压，主进程）→ 按**解压后字节数** try_reserve（在解析与去重之前）
-      → 解析（进程池可用则交给子进程，否则本进程 validate）→ 分块写引擎 → finally release。
+    顺序固定（CLAUDE.md 规则 2）：
+      decode_body（解压）→ 按**解压后字节数** try_reserve（在解析与去重之前）
+      → 本进程 load_array + 分块 validate → 分块写引擎 → finally release。
     预留失败 / 解析异常都**不写任何去重状态**，调用方重试不会被判重。
 
-    解析进程只算"纯计算"部分（load_array、validate、三列哈希）；**去重、采样、写桶全部
-    只在主进程**的 engine._ingest_core 里做，单写者、无锁、语义与单进程完全一致。
+    解析（load_array + validate + 三列哈希）是纯计算部分；**去重、采样、写桶全部只在
+    引擎**的 engine._ingest_core 里做，单写者、无锁。前端进程架构（P2d-1）下，解析被
+    搬到前端进程，IngestService 只保留"已解析结果 → 分块写引擎"的 write_parsed，
+    进程池路径已删除（ParsePool 被前端进程取代）。
     """
 
     def __init__(self, engine: Engine, admission: Admission,
-                 parse_pool: ParsePool | None = None,
                  engine_write_concurrency: int = DEFAULT_ENGINE_WRITE_CONCURRENCY):
         self.engine = engine
         self.admission = admission
-        self._pool = parse_pool
-        self._parse_inproc = parse_pool is None or not parse_pool.available
         self._write_sem = None  # 延迟到事件循环里创建（见 _get_write_sem）
         self._write_concurrency = max(1, engine_write_concurrency)
 
@@ -217,27 +192,24 @@ class IngestService:
         # 2. 按解压后字节数预留容量：必须在解析和任何去重之前（CLAUDE.md 规则 2）
         n_bytes = len(raw)
         if not self.admission.try_reserve(n_bytes):
-            # 第 3 级把在途上限收紧到 2 MB（单进程 4 MB→2 MB，池开 8 MB→2 MB）：
-            # 这期间超出 2 MB 的请求预留不下，走这里的 503（而不是 413）——有意的、
-            # 暂时性的，退出降级即可成功。
+            # 第 3 级把在途上限收紧到 2 MB（单进程 4 MB→2 MB）：这期间超出 2 MB 的
+            # 请求预留不下，走这里的 503（而不是 413）——有意的、暂时性的，退出降级即可成功。
             if self.admission.limit < MAX_PENDING_BYTES:
                 mb = self.admission.limit // (1024 * 1024)
                 raise Overloaded(
                     f"降级期间单个请求的上限暂时为 {mb} MB，请稍后重试", retry_after=1)
             raise Overloaded(retry_after=1)
         try:
-            if self._parse_inproc:
-                return await self._ingest_inproc(raw)
-            return await self._ingest_pooled(raw)
+            return await self._ingest_inproc(raw)
         finally:
             self.admission.release(n_bytes)
 
     async def _ingest_inproc(self, raw: bytes) -> IngestResult:
-        """单进程路径（现有路径）：本进程 load_array + 分块 validate + engine.ingest。
+        """本进程路径：load_array + 分块 validate + engine.ingest。
 
-        结构与改动前一致（逐块 validate→ingest→释放 dict→块间让出），只是块大小改为
-        2000（CHUNK_EVENTS），且"写入引擎"这段受信号量保护（决定五：串行化、避免多块
-        背靠背独占事件循环）。validate 是纯函数、每块各带 invalid 计数，逐块累加。
+        逐块 validate→ingest→释放 dict→块间让出，块大小 CHUNK_EVENTS（2000），"写入引擎"
+        这段受信号量保护（决定五：串行化、避免多块背靠背独占事件循环）。validate 是纯
+        函数、每块各带 invalid 计数，逐块累加。
         """
         arr = load_array(raw)
         n = len(arr)
@@ -257,26 +229,14 @@ class IngestService:
                     await asyncio.sleep(0)  # 让出事件循环
         return total
 
-    async def _ingest_pooled(self, raw: bytes) -> IngestResult:
-        """进程池路径：把**解压后**的字节交给子进程解析（load_array+validate+三列哈希），
-        拿回 ParsedBatch 后按 POOLED_CHUNK_EVENTS 切块、分块写引擎（信号量保护、块间让出）。
+    async def write_parsed(self, parsed: ParsedBatch) -> IngestResult:
+        """已解析结果的写入（P2d-1：写入通道服务端复用）：按 POOLED_CHUNK_EVENTS 切块，
+        首块加回整批的 invalid，在写入信号量下逐块调用 engine.ingest_parsed，块间让出。
 
-        解压已在主进程完成（决定一）；子进程只做纯计算，异常（BadRequest 等）原样传回。
-        子进程崩溃（BrokenProcessPool）时重建进程池、当前请求 503（此时**尚未去重**，
-        重试安全，P1 §1.5 / 规则 2）。
+        整批 invalid 必须让**引擎计数器**也计到（与 engine.ingest 更新 counters.invalid
+        口径一致）：放在第一个块上（chunk 默认 invalid=0）。全非法请求体 parsed 为空、
+        切不出块，用单块承载 invalid，保证计数器仍计到。
         """
-        try:
-            fut = self._pool.submit(raw)  # 池已坏时 submit 会**同步**抛 BrokenProcessPool
-            parsed = await asyncio.wrap_future(fut)  # 或等待期间抛（子进程处理中崩溃）
-        except BrokenProcessPool:
-            # 子进程崩溃（submit 或处理期间）→ 重建进程池；此时**尚未去重**，当前请求
-            # 返回 503 + Retry-After（P1 §1.5 / 规则 2），调用方重发安全。
-            self._pool.rebuild()
-            raise Overloaded("解析进程不可用，请重试", retry_after=1) from None
-        # 切块写引擎。整批 invalid 必须让**引擎计数器**也计到（与单进程路径
-        # engine.ingest 更新 counters.invalid 口径一致）：把它放在第一个块上（chunk 默认
-        # invalid=0，这里给首块赋上整批 invalid）。全非法请求体 parsed 为空、切不出块，
-        # 用单块承载 invalid，保证计数器仍计到（test_ingest_all_invalid_chunked_counted）。
         chunks = [parsed.chunk(i, i + POOLED_CHUNK_EVENTS)
                   for i in range(0, len(parsed), POOLED_CHUNK_EVENTS)]
         if not chunks:
