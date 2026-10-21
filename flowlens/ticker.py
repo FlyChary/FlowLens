@@ -152,6 +152,7 @@ class Ticker:
             self.last_tick_delay_ms = (start - next_at) * 1000.0
             try:
                 t0 = loop.time()
+                tick_start_ms = int(time.time() * 1000)  # tick 开始（供探针归因对齐）
                 fa = loop.time()
                 self.engine.advance()
                 fin_ms = (loop.time() - fa) * 1000.0
@@ -164,7 +165,7 @@ class Ticker:
                 self._update_degrade()
                 self._maybe_trim(loop.time())
                 if self.loop_probe is not None:
-                    self.loop_probe.record_tick(fin_ms, snap_ms)
+                    self.loop_probe.record_tick(fin_ms, snap_ms, tick_start_ms)
             except Exception:
                 # 单拍失败不退出后台任务：记完整异常、计数，继续下一拍。
                 # 只捕获 Exception——CancelledError（3.11+ 属 BaseException）照常向上传播

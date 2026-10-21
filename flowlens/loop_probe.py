@@ -71,28 +71,28 @@ class LoopProbe:
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
-        next_t = time.monotonic() + self.interval
+        next_t = loop.time() + self.interval
         report_at = next_t
         while not self._stop.is_set():
-            delay = next_t - time.monotonic()
-            if delay > 0:
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                    return  # stop 被置位
-                except asyncio.TimeoutError:
-                    pass
-            # call_soon 回调：从"计划时刻"到"实际执行"之差就是事件循环被独占的延迟
-            planned = time.monotonic()
+            # 用 loop.call_at 把小任务安排到 next_t：若事件循环在 next_t 之前被
+            # 长任务（定稿/快照/写入块）占住，回调就被推到解除阻塞之后才跑，
+            # "实际执行时刻 − 计划时刻"正是那段独占延迟。
+            # 不能用 wait_for/sleep 睡到点再 call_soon：定时器回调本身在阻塞
+            # 期间无法返回，"计划时刻"会取在解除阻塞之后，把最长的那段漏掉
+            # （P2d-3 二.3 首跑的测量缺陷）。
             done = asyncio.Event()
 
             def _task() -> None:
-                self._sample_us.append((time.monotonic() - planned) * 1e6)
+                self._sample_us.append((loop.time() - next_t) * 1e6)
                 self._sample_ts.append(int(time.time() * 1000))
                 done.set()
 
-            loop.call_soon(_task)
+            loop.call_at(next_t, _task)
             await done.wait()
-            next_t = planned + self.interval
+            next_t += self.interval
+            if loop.time() > next_t + self.interval:
+                # 落后超过一个周期（发生了长阻塞）：不追赶积压，重新锚定
+                next_t = loop.time() + self.interval
             if time.monotonic() >= report_at:
                 self._report()
                 report_at += self.report_every
@@ -117,12 +117,17 @@ class LoopProbe:
             return ""
         return ", ".join(f"{a:.0f}μs@{t}" for a, t in self._top)
 
-    def record_tick(self, finalize_ms: float, snapshot_ms: float) -> None:
-        """每拍定稿与快照各自的耗时（ms）与时刻，仅启用时由 Ticker 调用。"""
+    def record_tick(self, finalize_ms: float, snapshot_ms: float,
+                    start_ms: int) -> None:
+        """每拍定稿与快照各自的耗时（ms）与**tick 开始时刻**，仅启用时由 Ticker 调用。
+
+        开始时刻（而非结束时刻）供与"最长几次延迟"的时刻对齐：一次延迟落在
+        [start, start + 定稿 + 快照] 窗内即可归因为本拍。
+        """
         if not self.enabled:
             return
         log.info("tick 分解 定稿(advance)=%.2f ms 快照=%.2f ms @%d",
-                 finalize_ms, snapshot_ms, int(time.time() * 1000))
+                 finalize_ms, snapshot_ms, start_ms)
 
 
 def make_loop_probe() -> LoopProbe:

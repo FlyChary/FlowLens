@@ -12,6 +12,7 @@
 import asyncio
 import logging
 import os
+import time
 import zlib
 from dataclasses import dataclass
 
@@ -21,6 +22,14 @@ from .model import load_array, validate
 from .parse_pool import ParsedBatch
 
 log = logging.getLogger(__name__)
+
+# 写入块耗时诊断（P2d-3 二.3）：仅 FLOWLENS_DEBUG=1 时每块记一行（块大小、
+# ingest_parsed 耗时 ms、时刻），供与事件循环最长延迟对齐归因；生产零开销
+# （模块 import 时定一次，热路径里只判一个 bool）。
+# 口径与 api.debug.is_enabled() 相同，但不 import 它：api/__init__ 会拉起
+# app、app 又 import ingest，循环导入；环境变量在进程生命周期内不变，
+# import 时读一次等价。
+WRITE_CHUNK_DEBUG = os.environ.get("FLOWLENS_DEBUG") == "1"
 
 MAX_BODY_BYTES = 4 * 1024 * 1024             # 请求体（压缩后）上限
 MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024     # 单个请求解压后上限，超过提示拆分
@@ -274,7 +283,16 @@ class IngestService:
         total = IngestResult(0, 0, 0, 0)
         async with sem:
             for idx, chunk in enumerate(chunks):
-                total = self._add(total, self.engine.ingest_parsed(chunk))
+                # FLOWLENS_DEBUG=1：记录同步写入块的耗时（ms 与时刻）——块是
+                # 事件循环里连续执行的同步段，与探针最长延迟对齐可归因到"写入块"
+                if WRITE_CHUNK_DEBUG:
+                    _t0 = time.monotonic()
+                    total = self._add(total, self.engine.ingest_parsed(chunk))
+                    log.info("写入块 %d 条 ingest_parsed=%.2f ms @%d",
+                             len(chunk), (time.monotonic() - _t0) * 1000.0,
+                             int(time.time() * 1000))
+                else:
+                    total = self._add(total, self.engine.ingest_parsed(chunk))
                 if idx + 1 < len(chunks):
                     await asyncio.sleep(0)  # 块间让出事件循环
         return total

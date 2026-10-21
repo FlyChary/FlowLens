@@ -34,7 +34,7 @@ def test_disabled_probe_creates_no_task(monkeypatch):
         probe.start()                      # 未启用：应不创建任何任务
         await asyncio.sleep(0)
         assert set(asyncio.all_tasks()) == created, "未启用探针不应创建后台任务"
-        probe.record_tick(1.0, 2.0)        # 未启用：空操作、不抛
+        probe.record_tick(1.0, 2.0, 1000)  # 未启用：空操作、不抛
         assert probe.final_top() == ""
 
     asyncio.run(_run())
@@ -87,6 +87,6 @@ def test_enabled_probe_reports_and_top(monkeypatch, caplog):
                for r in caplog.records)
     # record_tick 启用时记一行日志（定稿/快照分解）
     with caplog.at_level("INFO", logger="flowlens.loop_probe"):
-        probe.record_tick(3.0, 4.0)
+        probe.record_tick(3.0, 4.0, 2000)
     assert any("tick 分解" in r.message for r in caplog.records)
 
