@@ -208,6 +208,11 @@ def _make_degrade_change_hook(app: web.Application):
     def on_change(old: int, new: int) -> None:
         if shared is not None:
             shared.level.value = new   # 前端读取（reject_ingest = level >= 4）
+            # P2d-2 二.3：级别变化时立即发布"回答查询用"的降级状态，不等下一次
+            # 快照回调（最多 1 秒）。sample_weight 从控制器现读（与 on_snapshot
+            # 同一口径：占用率 > 0.95 为 4、第 2 级起为 2、其余 1）。
+            shared.degraded.value = 1 if app[degrade_controller_key].degraded else 0
+            shared.sample_weight.value = app[degrade_controller_key].sample_weight
         if new >= 3:
             if old < 3:
                 # 进入第 3 级：收紧两个预算，并清一次结果缓存与 URL 归一化缓存

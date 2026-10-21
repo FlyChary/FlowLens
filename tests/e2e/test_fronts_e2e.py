@@ -771,9 +771,13 @@ def _engine_info(w: _Wrapper) -> dict:
     return json.loads(body.decode("utf-8"))
 
 
-def _body_without_mem(body: bytes) -> dict:
-    """响应体去掉 memory_bytes 后的 JSON（前端与引擎的 memory_bytes 口径不同）。"""
-    d = json.loads(body.decode("utf-8"))
+def _body_without_mem(body) -> dict:
+    """响应体去掉 memory_bytes 后的 JSON（前端与引擎的 memory_bytes 口径不同）。
+
+    body 可以是 dict（_http_json 已解析）或 bytes（_unix_http 原始体），统一
+    转成 dict 再去掉 memory_bytes 后返回，供两侧对照。
+    """
+    d = body if isinstance(body, dict) else json.loads(body.decode("utf-8"))
     d.pop("memory_bytes", None)
     return d
 
@@ -797,13 +801,22 @@ def test_fronts_default_window_answered_locally():
         info = _engine_info(w)
         sock = info["query_sock"]
         assert sock == w.query_sock
+        default_queries = [f"/v1/topk?by={d}&k={k}" for d in ("url", "user")
+                           for k in (1, 10, 100)] + ["/v1/stats"]
+        # 1) 前端本地回答的默认窗口查询不经过引擎：只经前端发（不直连引擎），
+        #    引擎计数应保持不变
         base = dict(info["query"])
-        queries = [f"/v1/topk?by={d}&k={k}" for d in ("url", "user")
-                   for k in (1, 10, 100)] + ["/v1/stats"]
+        for path in default_queries:
+            stf, _, _ = _http_json(w.port, "GET", path)
+            assert stf == 200, path
+        assert _engine_info(w)["query"] == base, (base, _engine_info(w)["query"])
+        # 2) 一致性：同一时刻前端与引擎（直连 Unix 内部套接字）的响应体除
+        #    memory_bytes 外一致。直连引擎的对照请求会计入引擎计数（属预期），
+        #    所以计数断言放在这一步之前。
         ok = False
         for _ in range(6):
             ok = True
-            for path in queries:
+            for path in default_queries:
                 stf, bf, _ = _http_json(w.port, "GET", path)
                 ste, be = _unix_http(sock, path)
                 assert stf == ste == 200, (path, stf, ste)
@@ -814,8 +827,8 @@ def test_fronts_default_window_answered_locally():
                 break
             time.sleep(0.3)
         assert ok, "前端与引擎的默认窗口响应未能对齐（from/to 跨秒）"
-        # 引擎侧计数不增：全部默认窗口查询都由前端本地回答
-        assert _engine_info(w)["query"] == base, (base, _engine_info(w)["query"])
+        # 3) 转发查询才增引擎计数（重新取基准：上一步直连对照已计数）
+        base = dict(_engine_info(w)["query"])
         # 带 at 的 topk（转发）：引擎计数 topk +1
         at = int(time.time() * 1000) - 1000
         assert _http_json(w.port, "GET",
@@ -865,10 +878,16 @@ def test_fronts_local_default_matches_single_process():
                     break
                 time.sleep(0.3)
             assert (df["from"], df["to"]) == (ds["from"], ds["to"]), (by, df, ds)
-            assert [it["key"] for it in df["items"]] == \
-                   [it["key"] for it in ds["items"]], (by, df, ds)
-            assert [it["count"] for it in df["items"]] == \
-                   [it["count"] for it in ds["items"]], (by, df, ds)
+            # 计数分布逐项一致（按 count 降序）；key 只在 hot 键上断言存在性与
+            # 计数——冷键计数并列（count=1），并列名次在两个独立服务间可不同
+            cf = sorted((it["count"] for it in df["items"]), reverse=True)
+            cs = sorted((it["count"] for it in ds["items"]), reverse=True)
+            assert cf == cs, (by, df, ds)
+            assert len(cf) == 10, (by, cf)
+            for hot in ("hot0", "hot1", "hot2", "hot3", "hot4"):
+                k, c = (f"hu{hot[3:]}", 300) if by == "user" else (f"/ld/{hot}", 300)
+                assert (k, c) in {(it["key"], it["count"]) for it in df["items"]}, (by, hot, df)
+                assert (k, c) in {(it["key"], it["count"]) for it in ds["items"]}, (by, hot, ds)
         for _ in range(6):
             _, sf, _ = _http_json(wf.port, "GET", "/v1/stats")
             _, ss, _ = _http_json(ws.port, "GET", "/v1/stats")
@@ -906,7 +925,9 @@ def test_fronts_forward_cases_parity_with_single():
                 assert outf == outs, (path, outf, outs)
             elif stf == 200:
                 assert set(outf) == set(outs), (path, set(outf), set(outs))
-                assert outf["k"] == outs["k"] and outf["by"] == outs["by"]
+                # topk 响应带 k / by；stats 响应没有这两个字段
+                if "k" in outs:
+                    assert outf["k"] == outs["k"] and outf["by"] == outs["by"]
     finally:
         wf.close()
         ws.close()
@@ -915,8 +936,9 @@ def test_fronts_forward_cases_parity_with_single():
 def test_fronts_degraded_local_answer():
     """第 3 级降级：前端本地回答的默认窗口查询 degraded 为 true；sample_rate
     与引擎一致（shared.sample_weight / degraded 由引擎快照回调写入）。"""
-    # 208037478/268435456 = 0.78×256MB < x < 0.90×256MB → 第 3 级（degraded、weight 1）
-    w = _start_front_service(fronts=1, test_mem="208037478,268435456")
+    # 225485784/268435456 = 0.84×256MB（在 0.78 进入线与 0.90 之间）→ 第 3 级
+    # （degraded、sample_weight 1）
+    w = _start_front_service(fronts=1, test_mem="225485784,268435456")
     try:
         assert _wait_level3(w.port), "未进入第 3 级"
         st, out, _ = _http_json(w.port, "GET", "/v1/topk?by=url&k=10")
