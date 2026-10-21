@@ -445,13 +445,35 @@ def parse_front_count(log_text: str) -> tuple[int | None, str]:
     return int(m.group(1)), m.group(2)
 
 
-async def read_front_count(container: str) -> tuple[int | None, str]:
+async def _docker_logs(container: str) -> str:
+    """`docker logs` 的合并输出（stdout + stderr）。
+
+    flowlens 的启动日志（含"前端数 N（原因）"）经 logging 写到**容器 stderr**，
+    `docker logs` 把它复述到自身 stdout；但 `_run` 只捕 stdout、丢了 stderr 分支，
+    故这里单独用 stderr=STDOUT 合并读取，两路都不丢。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "logs", container, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    return out.decode(errors="replace")
+
+
+async def read_front_count(container: str, retries: int = 10,
+                           delay: float = 0.5) -> tuple[int | None, str]:
     """从 `docker logs` 读启动日志的前端数，返回 (N, 原因)。
 
     P2d-3 第零节第 2 条：每次实验启动容器后都要确认真实的前端数，记进结果文件；
-    与预期不符时立即停止该实验并报告。
+    与预期不符时立即停止该实验并报告。"前端数"是启动时第一行日志，但 `docker logs`
+    在容器刚起来时可能短暂读不到（日志驱动缓冲），故重试几秒再判定。
     """
-    out = await _run(["docker", "logs", container])
+    out = ""
+    for _ in range(retries):
+        out = await _docker_logs(container)
+        n, reason = parse_front_count(out)
+        if n is not None:
+            return n, reason
+        await asyncio.sleep(delay)
     return parse_front_count(out)
 
 
@@ -1173,6 +1195,9 @@ async def run_sustained(svc: Service, outdir: str, *, rate: int,
                 continue
             ws = [(s.get("healthz") or {}).get("memory_bytes") for s in win]
             ws = [w for w in ws if w is not None]
+            # memory.current（原始 cgroup 读数，含页缓存）峰值——第一节每分钟行要求
+            memcur = [(s.get("healthz") or {}).get("memory_current_bytes") for s in win]
+            memcur = [w for w in memcur if w is not None]
             rss = [s.get("rss_anon_bytes") for s in win]
             rss = [r for r in rss if r is not None]
             # 该分钟的峰值降级级别（逐秒采样取最大，比"分钟末读数"更能暴露
@@ -1210,6 +1235,7 @@ async def run_sustained(svc: Service, outdir: str, *, rate: int,
             per_minute.append({
                 "minute": m,
                 "ws_peak_mb": mem_mb(max(ws)) if ws else None,
+                "memcur_peak_mb": mem_mb(max(memcur)) if memcur else None,
                 "rss_anon_peak_mb": mem_mb(max(rss)) if rss else None,
                 "level": lvl,
                 "accepted": macc, "sent": sum(sent),
