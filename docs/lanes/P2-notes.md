@@ -769,3 +769,204 @@ SSE 两组均 **0 连接错误**、1430 帧、20 订阅者。写入侧 140/200 �
 - Windows `pytest -q -m slow`（`__main__.py` 改动，必须跑）：**9 passed**（114 s）。
 - `docker build --target test`（WSL，Python 3.12 全量快测试）：**通过**。
 - 结果文件：`results/p2d1/s7_fronts3.json`（四档）、`results/p2d1/s7_idle.json`（空闲）。
+
+# P2d-2 过程记录：快照广播 + 前端直接回答默认窗口查询 + 前端分块解析
+
+> 环境同 P2d-1：WSL2 + Docker（评测同口径），服务核 0,2,4,6，压测核 8-15（8 worker）。
+> **本任务落地 `docs/instructions/P2d-2.md`**：P2c 实测默认窗口 topk 的 p99 78/102 ms
+> （p50 仅 2~13 ms）——查询本身快，慢在排队（都排在引擎的事件循环里）。本任务：
+> ① 引擎每次替换快照后经写入通道广播给所有前端（`Engine.on_snapshot` 回调 +
+> `SnapshotHub`）；② 不带 at、60 秒窗口的 /v1/topk 与 /v1/stats 由前端用本地快照副本
+> 直接回答（引擎与前端用同一组纯函数 `topk_from_snapshot` / `stats_from_snapshot` /
+> `stats_body` / `topk_data` 生成响应，逐字节一致）；③ 前端解析请求体改分块
+> （`parse_chunks`，每 1000 条一块、块间 `await asyncio.sleep(0)` 让出事件循环），
+> 5000 条请求的单次阻塞从 ~45 ms 降到 ~10 ms。另顺手处理 P2d-1 审查项：
+> FLOWLENS_TEST_MEM 只在 FLOWLENS_DEBUG=1 时生效。
+> **镜像** `flowlens:p2d2` = 本任务代码（lane-c HEAD）。
+> 新增：`flowlens/hub.py`（SnapshotHub + make_on_snapshot）；
+> 改动：`flowlens/query.py`（三个纯函数）、`flowlens/api/app.py`（stats_body、
+> 引擎侧查询计数、on_change 补写 shared）、`flowlens/api/debug.py`（/debug/info）、
+> `flowlens/ipc.py`（MSG_SNAPSHOT、pack_msg）、`flowlens/engine.py`（on_snapshot）、
+> `flowlens/frontend.py`（FrontState、_front_topk/_front_stats、分块解析）、
+> `flowlens/parse_pool.py`（parse_chunks/concat_parsed）、`flowlens/__main__.py`
+> （FLOWLENS_TEST_MEM 仅调试、快照广播接入）、`flowlens/supervisor.py`（SharedState
+> 三值 degraded/sample_weight/mem_bytes）。
+
+## 一、各节完成情况
+
+| 节 | 内容 | 落地 |
+|---|---|---|
+| 一 | 快照生成响应的纯函数 | `query.is_snapshot_query` / `topk_from_snapshot` / `stats_from_snapshot`、`app.stats_body`。`QueryService.topk/stats` 默认分支改为调用它们（行为不变），引擎 `_stats` 改走 `stats_body` |
+| 二 | 快照广播 | `engine.on_snapshot`（refresh_snapshot 与 refresh_snapshot_async 两处赋值后调用）；`ipc.MSG_SNAPSHOT` + `pack_msg`（一次序列化、整帧发出）；`hub.SnapshotHub`（只留最新帧，新连接补发）；`SharedState` 增 degraded/sample_weight/mem_bytes；前端 `EngineConnection` 读循环收 MSG_SNAPSHOT 存 `FrontState` |
+| 三 | 前端回答默认窗口查询 | `_front_topk` / `_front_stats`：`fresh_snapshot()`（3 秒内收到才用）非空且 `is_snapshot_query` 成立时本地答，否则原样 `_proxy`。参数解析与引擎同一份 `QueryParams.from_request` |
+| 四 | 前端分块解析 | `parse_pool.parse_chunks`（load_array 一次、validate 与哈希按块）/ `concat_parsed`；`FrontIngestService.ingest` 逐块 `await asyncio.sleep(0)`。`FRONT_PARSE_CHUNK=1000` |
+| 五 | FLOWLENS_TEST_MEM 仅调试 | `_env_memory_reader`：FLOWLENS_DEBUG=1 才读；未开调试却设了则警告并忽略；生效时启动日志 WARNING 写明被覆盖。e2e wrapper 对 test_mem 场景自动补 FLOWLENS_DEBUG=1 |
+| 六 | 测试 | 单测（query/hub/frontend/parse_pool 各节新增）+ 前端模式 e2e 新增 5 组（本地应答一致性、与单进程等价、转发对照、降级本地应答、快照过期转发）+ selftest 边界用例（P2d-1 已有，本任务不改） |
+| 七 | 性能检查 | 见第六节（S2 14 万/20 万 ×120 s + s1 20 万 ×20 s，对照 P2c 第二节） |
+
+## 二、"需要确认"项的实测结论
+
+1. **`_stats` 响应字典字段与顺序**：与参考代码假设一致（window_ms/from/to/
+   approx_distinct_users/approx_p95_bytes/memory_bytes/degraded），原样搬进
+   `app.stats_body`，`_stats` 改为 `return _json_response(stats_body(s, mem_bytes,
+   ctrl.degraded))`。
+2. **`sample_weight` 是否只在级别变化时改变**：**不是**——`degrade.py` 的
+   `sample_weight` 属性为"占用率 > 0.95 → 4、第 2 级起 → 2、其余 1"，同一级别内也会
+   随占用率在 1/2/4 之间切换。因此按参考代码取"每次快照回调写一次"（最多晚 1 秒）；
+   级别变化时 `on_change` 再立即写一次（见第三节第 2 条）。
+3. **引擎 `_topk`/`_stats` 在 `QueryParams.from_request` 之后、读快照之前还有没有
+   别的检查**：有，`QueryService._check_window`（1~600 秒）与 `_check_k`（1~100）
+   第二道校验，但两者的取值范围与 params 层完全相同（params 的 window 1~600 秒、
+   k 1~100），对通过 `from_request` 的默认窗口查询**不会触发**——前端只做
+   `from_request` 即与引擎等价（e2e `test_fronts_error_parity_with_single` 验证
+   k=0 / window=abc 的 400 体逐字节一致）。
+4. **引擎 `_topk` 是否在读快照前就因第 1 级"回放暂停"拒绝**：**否**——
+   `QueryService.topk` 的快照分支（`is_snapshot_query`）在 `replay_paused` 检查
+   **之前**返回，默认窗口查询在第 1 级照常读快照（`_stats` 同理：快照分支在
+   replay_paused 之前）。前端本地回答不受降级级别 1/2 的"回放暂停"影响，与引擎一致。
+5. **空数组与 NDJSON 坏行在分块解析下的行为**：`parse_chunks` 对 0 条事件产出
+   **一个空块**（`range(0, max(len,1), chunk)`），`concat_parsed([空块])` 直接返回
+   该块，与 `parse_body` 相同；NDJSON 中坏行由 `load_array` 放占位值、`validate`
+   计入 invalid——切分不改变计数（`tests/test_parse_pool.py` 对 chunk=1/7/1000/10000
+   逐项比对覆盖：长尾、全随机、含各种非法事件、空数组、NDJSON、单个对象）。
+6. **`pack_msg` 一次 write 整帧与 ACK 不交错**：写入通道是 asyncio 单线程，
+   `send_msg`（ACK）的写头与写负载之间没有 await，`SnapshotHub._flush` 对每个 writer
+   也是**一次 `w.write(frame)` 写出整帧**（头 + 负载同一次 write），因此 ACK 帧与
+   快照帧在字节流中不会交错（`tests/test_hub.py::test_snapshot_frame_and_ack_interleave_on_stream`
+   在真实字节流上验证）。
+
+## 三、第六节测试修复（收尾时发现 e2e 三个用例在 Linux 上从未跑过而失败）
+
+第六节提交（f0552e6）时 e2e 新增的 5 个用例只在 Windows 上被 skip（非 Linux），
+**首次在 Linux 上运行（收尾的 `docker build --target test`）时 3 个失败**，全部为
+测试代码问题（前一段会话因 API 中断，误报了"docker 构建通过"）：
+
+1. **`test_fronts_default_window_answered_locally`**：`_body_without_mem` 对
+   `_http_json` 返回的 dict 调 `.decode`（AttributeError）；且一致性对照用
+   `_unix_http` **直连引擎**发查询，本身就给引擎计数 +6 topk/+1 stats，后面的
+   "引擎计数不增"断言在结构上不可能成立。修复：helper 兼容 dict/bytes；**先**做
+   纯前端查询 + 计数不增断言，**再**做前端 vs 引擎直连的一致性对照（对照请求的
+   计数属预期，其后重新取计数基准），最后验证转发查询才增计数。
+2. **`test_fronts_forward_cases_parity_with_single`**：对 `/v1/stats` 响应断言
+   `outf["k"]`（stats 响应没有 k 字段，KeyError）。修复：仅 topk 响应断言 k/by。
+3. **`test_fronts_degraded_local_answer`**：`test_mem="208037478,268435456"`
+   = 0.775 × 256 MB，**低于第 3 级进入线 0.78（209379656 B）**，引擎根本进不了
+   第 3 级。修复：改 0.84 × 256 MB（225485784 B，在 0.78 与 0.90 之间）。
+4. **`test_fronts_local_default_matches_single_process`（既有 flaky，顺带修）**：
+   逐 key 断言两个独立服务 top-10 完全相同，但冷键计数并列（count=1），并列名次
+   在两个独立服务间可不同。修复：改为断言**计数分布**逐项相同 + hot 键（各 300 次，
+   无并列）的 key 与 count 在两边都存在。
+5. **`flowlens/api/app.py` 的实现缺口（非测试问题）**：参考代码 2.3 要求"降级级别
+   变化时立即写 degraded 与 sample_weight"，但实现里 `on_change` 只写了
+   `shared.level`——前端回答查询读的 `shared.degraded` / `shared.sample_weight`
+   只有快照回调（每秒一次）更新，级别变化后最多 1 秒内前端会用**陈旧的 degraded**
+   回答（第 3 个 e2e 失败的真实根因：引擎 healthz 已第 3 级、前端答 degraded=False）。
+   修复：`on_change` 里补写 `shared.degraded` 与 `shared.sample_weight`（从控制器
+   现读，与 on_snapshot 同一口径）。
+
+## 四、第六节测试覆盖
+
+- **一致性**（`test_fronts_default_window_answered_locally`）：写入后等 2 s，对同一
+  时刻前端（对外端口）与引擎（内部 Unix HTTP，经 `/debug/info` 报回的
+  query_sock）请求 topk（url/user × k=1/10/100）与 stats，除 memory_bytes 外逐字节
+  相同（跨秒重试 6 次取对齐的一次）。
+- **确实在前端回答**：引擎 `/v1/topk` / `/v1/stats` 计数（`query_counter`，
+  `/debug/info` 读）——纯前端的默认窗口查询不增计数；带 at / window=30s 的查询
+  各 +1。
+- **转发对照**（`test_fronts_forward_cases_parity_with_single`）：带 at（200）、
+  window=30s（200）、k=0（400）、window=abc（400）与单进程模式同状态码、400 错误体
+  逐字节相同。
+- **与单进程等价**（`test_fronts_local_default_matches_single_process`）：同一批数据
+  写进前端模式与单进程模式，topk 计数分布逐项相同、hot 键 key+count 一致，stats 的
+  distinct_users / p95 等值。
+- **降级状态**（`test_fronts_degraded_local_answer`）：FLOWLENS_TEST_MEM=0.84×256MB
+  进第 3 级，前端本地答的 degraded=true、sample_rate 与引擎一致（weight=1 时无
+  sample_rate 字段）。
+- **快照过期**（`test_fronts_stale_snapshot_forwards`）：SIGSTOP 引擎 4 s，前端默认
+  查询转转发（挂起/超时，不在 <50 ms 内本地答）；SIGCONT 后恢复本地回答。新鲜性
+  判定本身另有单测（test_hub / test_frontend）。
+- **selftest 边界用例**（`test_fronts_selftest_boundary_cases`，P2d-1 已有）：
+  tools/boundary_cases.py 全部用例对前端模式通过（指令第六节第 3 条）。
+
+## 五、第六节测试修复的验证
+
+- `docker build --target test`（WSL，Python 3.12 全量快测试）：**485 passed,
+  2 skipped, 9 deselected**（构建通过；修复前为 3 failed / 483 passed）。
+- Windows `pytest -q`：470 passed, 17 skipped（17 = 12 前端 e2e + 5 其他非 Linux/
+  环境跳过），`pytest -q -m slow` 9 passed（`__main__.py` 有改动，必须跑）。
+
+## 六、第七节性能检查：512 MB、3 前端、两额度各 16 MB、S2 14 万/20 万 ×120 s
+
+`s1_measure` / `experiments.py S2`（服务核 0,2,4,6、压测核 8-15、8 worker、batch 5000、
+快速模式；镜像 `flowlens:p2d2`）。WSL 宿主压测前确认空闲（load ≈ 0）。
+写入侧两档都 **100% 接受、0 拒写、全程 0 级**（20 万/秒 20 s 档 us/ev 2.71，
+与 P2d-1 第七节的 2.99 相当——分块解析只发生在前端，不影响引擎）。
+
+### 6.1 默认窗口查询（本任务目标：p99 < 50 ms）
+
+**关键口径**：S2 的 `query_loop` 里 `topk_default` 用 `window=60s`（默认窗口，
+前端本地答），但 `stats` 用**随机 10~60 s 窗口**（实测 20 万/秒档 169 条里只有
+2 条 window=60s，其余 15~60 s 全走转发/回放，不是"默认 stats"）。所以 S2 的
+`stats` 行**不能**拿来代表"默认 stats"。默认窗口的 topk 与 stats 各以 ~40/s
+并发 20 万/秒写入单独测（`tools/exp/p2d2_default_probe.py`，先用 /healthz 的
+events_ingested 增量确认写入确实 200000/s 再采样，避免空转假低值）：
+
+| 查询（60s、不带 at，前端本地答） | 20 万/秒 p50/p95/p99 (ms) | max |
+|---|---|---|
+| topk（by=url, k=10） | 1.7 / 15.8 / **20.3** | 32.5 |
+| stats | 1.4 / 12.4 / **15.5** | 22.9 |
+
+**两档默认窗口 topk+stats 的 p99 均 < 21 ms，满足 p99 < 50 ms 目标。** 对照
+P2c 第二节（同条件、单进程池、默认 topk p99 78 ms@14 万 / 102 ms@20 万）：
+默认窗口查询搬到前端本地快照后，p99 从 78/102 降到 **~20 ms**（约 4 倍），
+p50 维持 ~2 ms。原因：默认窗口查询不再进引擎事件循环排队，前端本地读快照
+直接答（~2 ms 计算）；p99 的 20 ms 尾是前端自身事件循环解析写块（1000 条/块
+~10 ms）的让出，已比引擎写块（5000 条）短。
+
+### 6.2 S2 全量查询（对照 P2c 第二节）
+
+| 查询类型 | 14 万/秒 p50/p95/p99 | 20 万/秒 p50/p95/p99 | P2c 单进程池 14/20 万 p99 |
+|---|---|---|---|
+| topk_default（60s，本地答） | 1.7 / 19.8 / **29.5** | 1.9 / 23.1 / **29.5** | 78.1 / 101.8 |
+| topk_replay（at+window，转发引擎） | 6.3 / 45.0 / **71.4** | 16.4 / 74.8 / **112.5** | 73.1 / 109.2 |
+| stats（随机 10~60s，**多数转发引擎**） | 6.3 / 40.5 / **76.9** | 21.0 / 71.6 / **121.7** | 59.5 / 85.5 |
+
+SSE 两组 **0 连接错误**、1420/1430 帧、20 订阅者。
+
+- **topk_default（默认窗口）p99 29.5 ms**：满足 <50 ms 目标（6.1 的 40/s 专测
+  更干净：20.3 ms）。比 P2c 的 78/102 降 ~2.6~3.4 倍。
+- **topk_replay / stats（转发引擎）**：仍走引擎事件循环（带 at / 非 60s 窗口
+  必须回放合并），p99 与 P2c 同量级（71/112 vs 73/109；stats 随机窗口 77/122
+  vs 59/85）。**回放查询不经本任务的优化路径，如实报告**——本任务只优化
+  "默认窗口"这一类，回放查询要降 p99 需另做（P2c 已注明是独立后续项）。
+  stats 在 20 万/秒 p99 略高于 P2c（122 vs 85），因前端本地答占用了前端
+  事件循环、且随机窗口 stats 转发后仍排队在引擎——非本任务目标，不作对比结论。
+
+### 6.3 CPU 与内存
+
+| 写入速率 | 引擎 CPU%（中位/峰） | 前端合计 CPU%（中位/峰） | 工作集峰值 | 最大降级 |
+|---|---|---|---|---|
+| 14 万/秒 | 44.5 / 56.6 | 95.6 / 104.4 | 340.6 MiB | 0 |
+| 20 万/秒 | 69.5 / 84.9 | 147.6 / 167.4 | 314.0 MiB | 0 |
+
+引擎（主进程）CPU 在 20 万/秒中位 69.5%——比 P2d-1 第七节的 42.8%（s1 20 万档）
+高，因为 S2 额外叠加了查询与 SSE 的引擎侧负载（回放 topk + 随机窗口 stats 转发
++ SSE 生产），而 s1 只测写入。前端合计 CPU 中位 147.6%（3 前端 ~49%/个），
+含解析 + 本地答默认窗口查询。工作集峰值 314~341 MiB，远低于 512 MB 上限与
+第 3 级线（400 MiB），全程 0 级、0 拒写。
+
+`s1 @20 万/秒 ×20 s`（纯写入）：us/ev **2.71**、引擎 CPU 38.7%、前端合计 92.7%、
+接受率 99.99%、0 拒写、工作集 277.5 MiB、0 级——**与 P2d-1 第七节 2.99 相当**
+（分块解析不应影响引擎，实测确认）。
+
+### 6.4 结论
+
+- **本任务目标达成**：默认窗口（60s、不带 at）的 topk 与 stats，前端本地答，
+  20 万/秒下 p99 **20.3 / 15.5 ms**（< 50 ms 目标，约 4 倍优于 P2c 单进程池的
+  102 ms）。
+- **回放查询（带 at / 非 60s 窗口）不受本任务影响**：仍经引擎事件循环，p99
+  与 P2c 同量级（如实报告，非本任务范围）。
+- **引擎每条 μs 不受影响**：s1 20 万档 2.71 us/ev，与 P2d-1 的 2.99 相当。
+- 结果文件：`results/p2d2/s1_fronts3.json`、`results/20261021_083826/S2/`
+  （14 万）、`results/20261021_084047/S2/`（20 万）、
+  `results/p2d2/probe_result.txt`（默认窗口专测）。
