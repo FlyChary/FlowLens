@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from .bounds import Result, top_k
 from .degrade import DegradeController
 from .dims import Dim
-from .engine import Engine
+from .engine import Engine, Snapshot
 from .errors import BadRequest, Overloaded
 from .timewin import sec, split_range, watermark
 
@@ -48,6 +48,27 @@ class StatsAnswer:
     to_ms: int
     distinct_users: float
     p95_bytes: float
+
+
+# ---- 快照 → 答案的纯函数（P2d-2 一）：引擎 QueryService 与前端进程共用，
+# ---- 保证两边从同一份快照生成的响应逐字节一致。
+
+def is_snapshot_query(at_ms, window_ms: int, k: int | None, top_n: int) -> bool:
+    """默认窗口查询：不带 at、window 为 60 秒；topk 时还要求 k 不超过快照保留的
+    条数（k 为 None 表示不查 k，如 stats）。"""
+    return at_ms is None and window_ms == DEFAULT_WINDOW_MS and (k is None or k <= top_n)
+
+
+def topk_from_snapshot(snap: Snapshot, d: Dim, k: int, window_ms: int) -> TopKAnswer:
+    """从快照生成默认窗口 Top-K 答案（不做任何合并计算）。"""
+    return TopKAnswer(d, k, window_ms, snap.from_ms, snap.to_ms, False,
+                      snap.tops[d][:k], snap.unseen_upper[d])
+
+
+def stats_from_snapshot(snap: Snapshot, window_ms: int) -> StatsAnswer:
+    """从快照生成默认窗口统计答案（不做任何合并计算）。"""
+    return StatsAnswer(window_ms, snap.from_ms, snap.to_ms,
+                       snap.distinct_users, snap.p95_bytes)
 
 
 class QueryService:
@@ -99,12 +120,8 @@ class QueryService:
         now = self.engine.clock.now_ms()
 
         # 默认窗口（不带 at、60 秒、k 不超过快照名单长度）：直接读快照，不做合并
-        if at_ms is None and window_ms == DEFAULT_WINDOW_MS and k <= self.engine.cfg.snapshot_top_n:
-            snap = self.engine.snapshot
-            return TopKAnswer(
-                d, k, window_ms, snap.from_ms, snap.to_ms, False,
-                snap.tops[d][:k], snap.unseen_upper[d],
-            )
+        if is_snapshot_query(at_ms, window_ms, k, self.engine.cfg.snapshot_top_n):
+            return topk_from_snapshot(self.engine.snapshot, d, k, window_ms)
 
         # 其余都是回放查询（带 at、或 window 不是 60 秒、或 k 超过快照名单长度）。
         # 第 1 级降级时暂停 HTTP 回放查询：返回 503 + Retry-After，读快照的默认查询
@@ -139,10 +156,8 @@ class QueryService:
         self._check_window(window_ms)
         now = self.engine.clock.now_ms()
 
-        if at_ms is None and window_ms == DEFAULT_WINDOW_MS:
-            snap = self.engine.snapshot
-            return StatsAnswer(window_ms, snap.from_ms, snap.to_ms,
-                               snap.distinct_users, snap.p95_bytes)
+        if is_snapshot_query(at_ms, window_ms, None, 0):
+            return stats_from_snapshot(self.engine.snapshot, window_ms)
 
         # 带 at 或非 60 秒窗口 = 回放（现场合并概要）。第 1 级降级时暂停，返回 503。
         if self.controller.replay_paused:

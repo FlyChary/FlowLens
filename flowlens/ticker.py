@@ -105,13 +105,17 @@ class Ticker:
 
     def __init__(self, engine: Engine, period: float = 1.0, *,
                  controller=None, admission=None, memory_reader=None,
-                 trim_period: float | None = None):
+                 trim_period: float | None = None, loop_probe=None):
         self.engine = engine
         self.period = period
         self.tick_count = 0              # 已完成的 tick 次数
         self.error_count = 0             # tick 抛异常的累计次数
         self.last_tick_duration_ms = 0.0  # 最近一次 tick（advance + 快照）耗时
         self.last_tick_delay_ms = 0.0     # 最近一次 tick 实际开始相对预定时间的延迟
+        # P2d-3 二.3：事件循环延迟探针（FLOWLENS_DEBUG=1 时启用）。每拍把定稿
+        # （advance）与快照（refresh_snapshot_async）各自的耗时喂给它，供与"最长
+        # 几次事件循环延迟"对齐。None 或 disabled 时 record_tick 为空操作。
+        self.loop_probe = loop_probe
         # 降级控制器（T8）与写入在途预留（occupancy 来源）：create_app 注入
         self.controller = controller
         self.admission = admission
@@ -148,13 +152,20 @@ class Ticker:
             self.last_tick_delay_ms = (start - next_at) * 1000.0
             try:
                 t0 = loop.time()
+                tick_start_ms = int(time.time() * 1000)  # tick 开始（供探针归因对齐）
+                fa = loop.time()
                 self.engine.advance()
+                fin_ms = (loop.time() - fa) * 1000.0
                 await asyncio.sleep(0)
+                fs = loop.time()
                 await self.engine.refresh_snapshot_async()
+                snap_ms = (loop.time() - fs) * 1000.0
                 self.last_tick_duration_ms = (loop.time() - t0) * 1000.0
                 self.tick_count += 1
                 self._update_degrade()
                 self._maybe_trim(loop.time())
+                if self.loop_probe is not None:
+                    self.loop_probe.record_tick(fin_ms, snap_ms, tick_start_ms)
             except Exception:
                 # 单拍失败不退出后台任务：记完整异常、计数，继续下一拍。
                 # 只捕获 Exception——CancelledError（3.11+ 属 BaseException）照常向上传播

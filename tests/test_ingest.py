@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import sys
 import zlib
 
@@ -12,7 +13,7 @@ import pytest
 import flowlens.ingest as ing_mod
 from flowlens.config import Config
 from flowlens.dims import Dim
-from flowlens.engine import Engine
+from flowlens.engine import Engine, IngestResult
 from flowlens.errors import BadRequest, Overloaded, PayloadTooLarge, UnsupportedEncoding
 from flowlens.ingest import Admission, IngestService, MAX_DECOMPRESSED_BYTES, MAX_PENDING_BYTES
 from flowlens.model import EventBatch
@@ -129,6 +130,46 @@ def test_pending_limit_env_override(monkeypatch):
     assert _read_pending_limit() == DEFAULT_PENDING_BYTES
     monkeypatch.delenv("FLOWLENS_MAX_PENDING_BYTES")
     assert _read_pending_limit() == DEFAULT_PENDING_BYTES
+
+
+def test_pooled_chunk_env_override(monkeypatch, caplog):
+    """FLOWLENS_POOLED_CHUNK_EVENTS 覆盖已解析路径写入块（P2d-3 五）：合法值生效，
+    非法/非正/空回退默认 10000；非法与非正回退时打印警告。"""
+    from flowlens.ingest import _read_pooled_chunk_events, DEFAULT_POOLED_CHUNK_EVENTS
+    assert DEFAULT_POOLED_CHUNK_EVENTS == 10000
+    # 合法值生效
+    monkeypatch.setenv("FLOWLENS_POOLED_CHUNK_EVENTS", "5000")
+    assert _read_pooled_chunk_events() == 5000
+    # 空 → 默认
+    monkeypatch.delenv("FLOWLENS_POOLED_CHUNK_EVENTS")
+    assert _read_pooled_chunk_events() == DEFAULT_POOLED_CHUNK_EVENTS
+    # 非法值 → 回退默认 + 打印警告
+    monkeypatch.setenv("FLOWLENS_POOLED_CHUNK_EVENTS", "not-a-number")
+    with caplog.at_level("WARNING", logger="flowlens.ingest"):
+        assert _read_pooled_chunk_events() == DEFAULT_POOLED_CHUNK_EVENTS
+    assert any("FLOWLENS_POOLED_CHUNK_EVENTS" in r.message and "not-a-number" in r.message
+               for r in caplog.records)
+    # 非正数 → 回退默认 + 打印警告
+    monkeypatch.setenv("FLOWLENS_POOLED_CHUNK_EVENTS", "0")
+    with caplog.at_level("WARNING", logger="flowlens.ingest"):
+        assert _read_pooled_chunk_events() == DEFAULT_POOLED_CHUNK_EVENTS
+    assert any("FLOWLENS_POOLED_CHUNK_EVENTS" in r.message and "0" in r.message
+               for r in caplog.records)
+    monkeypatch.delenv("FLOWLENS_POOLED_CHUNK_EVENTS")
+
+
+def test_raw_budget_limit_env_override(monkeypatch):
+    """FLOWLENS_RAW_BUDGET_BYTES 覆盖原始请求体额度上限：合法值生效，非法/空/非正退回默认 8 MB。"""
+    from flowlens.api.app import _read_raw_budget_limit, DEFAULT_RAW_BUDGET_LIMIT
+    assert DEFAULT_RAW_BUDGET_LIMIT == 8 * 1024 * 1024  # 默认 8 MB
+    monkeypatch.setenv("FLOWLENS_RAW_BUDGET_BYTES", "16777216")  # 16 MB
+    assert _read_raw_budget_limit() == 16 * 1024 * 1024
+    monkeypatch.setenv("FLOWLENS_RAW_BUDGET_BYTES", "not-a-number")
+    assert _read_raw_budget_limit() == DEFAULT_RAW_BUDGET_LIMIT
+    monkeypatch.setenv("FLOWLENS_RAW_BUDGET_BYTES", "-5")
+    assert _read_raw_budget_limit() == DEFAULT_RAW_BUDGET_LIMIT
+    monkeypatch.delenv("FLOWLENS_RAW_BUDGET_BYTES")
+    assert _read_raw_budget_limit() == DEFAULT_RAW_BUDGET_LIMIT
 
 
 def test_admission_limit_2mb_rejects_3mb():
@@ -323,6 +364,179 @@ def test_arr_elements_released_after_processing():
         assert len(arr) == 12000
         assert all(x is None for x in arr), "全部已处理元素应已置 None 以便释放"
     asyncio.run(main())
+
+
+# ---- P1：解析进程路径的等价性与正确性（决定一/五）----
+
+def _hash_seed_fixed() -> bool:
+    s = os.environ.get("PYTHONHASHSEED", "")
+    return bool(s) and s != "random"
+
+
+requires_seed = pytest.mark.skipif(
+    not _hash_seed_fixed(), reason="真子进程用例需要固定 PYTHONHASHSEED")
+
+
+def _body_rand(n: int, seed: int = 0) -> bytes:
+    """长尾 + query 不同的 body（跨块、含归一化路径）。"""
+    r = random.Random(seed)
+    evs = [{"event_id": f"e{seed * 100000 + i}", "user_id": f"u{r.randrange(50)}",
+            "url": f"/api/item/x{r.randrange(30)}?q={i}",
+            "ts": NOW - 1000 - (i % 900), "bytes": 10 + (i % 40)} for i in range(n)]
+    return json.dumps(evs).encode()
+
+
+def _snap_sig(eng) -> tuple:
+    s = eng.refresh_snapshot()
+    return (s.tops, s.distinct_users, s.p95_bytes)
+
+
+def _cnt_sig(eng) -> tuple:
+    c = eng.counters
+    return (c.events_ingested, c.deduped, c.late, c.invalid)
+
+
+def test_ingest_parsed_equals_ingest():
+    """P1 §3.1 核心（不依赖子进程）：同一 body，IngestService 单进程路径 vs 进程池路径
+    的"已解析结果"，写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
+
+    这里直接用 IngestService 的两条路径（in-proc 与 ParsedBatch），等价于"同一请求体
+    分别走进程池与单进程"（解析部分逻辑一致，只是 in-proc 用 validate、pooled 用
+    parse_body——两者产出同构，见 test_parse_pool）。覆盖长尾 / 全随机 / 含非法 / 批内重复。
+    """
+    from flowlens.parse_pool import parse_body
+    from flowlens.ingest import decode_body as _decode
+    # 本用例验证的是"写入核心"：同一解析结果走 in-proc（validate→ingest）与进程池
+    # （parse_body→ingest_parsed）是否等价。两条路径**用同一块大小切块**——in-proc
+    # 内部用 CHUNK_EVENTS（2000），这里手动切块也取它。之所以不取 POOLED_CHUNK_EVENTS
+    # （10000）：Top-K 名单是近似结构、堆成员对"逐秒 observe 的分批顺序"敏感，块大小
+    # 不同会在高基数流量的名单深尾部产生少量差异（sketch 固有性质，非 bug），那会污染
+    # 本用例想验证的写入核心等价性。块大小是性能旋钮、不是写入核心的正确性不变量。
+    CE = ing_mod.CHUNK_EVENTS
+
+    def run(body):
+        e1 = Engine(Config(), FakeClock(NOW))
+        s1 = IngestService(e1, Admission())
+        e2 = Engine(Config(), FakeClock(NOW))
+        # 进程池路径 = 本进程 parse_body + ingest_parsed（与子进程 parse_body 同一函数）
+        parsed = parse_body(_decode(body, None))
+
+        async def both():
+            r1 = await s1.ingest(body, None)
+            # 进程池写入核心口径：ingest_parsed + 与 in-proc 相同的块大小切块，整批
+            # invalid 放首块，让引擎计数器也计到
+            chunks = [parsed.chunk(i, i + CE) for i in range(0, len(parsed), CE)]
+            if not chunks:
+                chunks = [parsed.chunk(0, 0)]
+            chunks[0].invalid = parsed.invalid
+            total = IngestResult(0, 0, 0, 0)
+            for ch in chunks:
+                total = IngestService._add(total, e2.ingest_parsed(ch))
+            return r1, total
+        r1, r2 = asyncio.run(both())
+        assert r1 == r2, f"计数不一致 {r1} vs {r2}"
+        assert _snap_sig(e1) == _snap_sig(e2)
+        assert _cnt_sig(e1) == _cnt_sig(e2)
+
+    run(_body_rand(6000))                       # 长尾，跨 3 个块
+    r = random.Random(3)                        # 全随机不重复
+    rnd = [{"event_id": f"r{r.getrandbits(60)}", "user_id": f"ru{r.getrandbits(20)}",
+            "url": f"/r/{r.getrandbits(30)}", "ts": NOW - 1000, "bytes": 100} for _ in range(4000)]
+    run(json.dumps(rnd).encode())
+    bad = json.loads(_body_rand(3000))          # 含非法 + 批内重复
+    bad[7] = {"user_id": "x", "url": "/x", "ts": NOW - 100, "bytes": 1}   # 缺 event_id
+    bad[8] = dict(bad[0])
+    run(json.dumps(bad).encode())
+    # 全非法
+    run(json.dumps([5, "str", None]).encode())
+
+
+def test_ingest_503_then_retry_not_deduped():
+    """规则 2：在途额度满 → 503（预留在解析之前），释放后重试不判重。"""
+    eng = Engine(Config(), FakeClock(NOW))
+    adm = Admission()
+    svc = IngestService(eng, adm)
+    body = _body_rand(100)
+
+    async def main():
+        assert adm.try_reserve(MAX_PENDING_BYTES)
+        try:
+            await svc.ingest(body, None)
+            raise AssertionError("应抛 Overloaded")
+        except Overloaded as e:
+            assert e.retry_after == 1
+        # 被拒的 e* 不应写进 Bloom（预留在解析之前）。释放后重试必须被正常接受
+        adm.release(MAX_PENDING_BYTES)
+        r = await svc.ingest(body, None)
+        assert r.accepted == 100 and r.deduped == 0
+    asyncio.run(main())
+
+
+def test_write_parsed_equals_ingest(monkeypatch):
+    """P2d-1 写入核心等价性：同一请求体分别走"已解析"路径（decode_body→parse_body→
+    write_parsed→POOLED_CHUNK_EVENTS 切块→invalid 放首块）与单进程路径
+    （decode_body→validate→ingest），写两个全新引擎，topk(url/user)/stats/计数器逐项相等。
+    覆盖长尾、gzip、NDJSON、全随机——前端进程经写入通道写引擎最终走的就是 write_parsed，
+    它与单进程 ingest 必须等价，端到端"前端模式 vs 单进程"的等价性才有基础。
+
+    两条路径用同一块大小切块才能逐项相等：write_parsed 用 POOLED_CHUNK_EVENTS（10000），
+    单进程 ingest 用 CHUNK_EVENTS（默认 2000）。块大小不同会在高基数流量的 Top-K 名单深
+    尾部产生差异（sketch 固有性质、非 bug）。故临时把 CHUNK_EVENTS 对齐到
+    POOLED_CHUNK_EVENTS，把块大小这个性能旋钮固定住、只留路径变量。
+    """
+    from flowlens.ingest import decode_body
+    from flowlens.parse_pool import parse_body
+    monkeypatch.setattr(ing_mod, "CHUNK_EVENTS", ing_mod.POOLED_CHUNK_EVENTS)
+    eng, svc = _svc()
+    eng2 = Engine(Config(), FakeClock(NOW))
+    s2 = IngestService(eng2, Admission())  # 单进程路径
+
+    async def run(body, enc):
+        r_parsed = await svc.write_parsed(parse_body(decode_body(body, enc)))
+        r_inproc = await s2.ingest(body, enc)
+        assert r_parsed == r_inproc
+        assert _snap_sig(eng) == _snap_sig(eng2)
+        assert _cnt_sig(eng) == _cnt_sig(eng2)
+
+    async def main():
+        plain = _body_rand(6000)
+        await run(plain, None)                                   # 长尾，跨多个块
+        await run(_gzip(plain), "gzip")                          # gzip（解压后等价）
+        # NDJSON（逐行）
+        evs = json.loads(plain)
+        ndjson = b"\n".join(json.dumps(e).encode() for e in evs)
+        await run(ndjson, None)
+        r = random.Random(7)                                     # 全随机不重复
+        rnd = [{"event_id": f"r{r.getrandbits(60)}", "user_id": f"ru{r.getrandbits(20)}",
+                "url": f"/r/{r.getrandbits(30)}", "ts": NOW - 1000, "bytes": 100} for _ in range(4000)]
+        await run(json.dumps(rnd).encode(), None)
+    asyncio.run(main())
+
+
+def test_engine_write_semaphore_serializes():
+    """决定五：写入引擎受 Semaphore(1) 保护——两个并发请求的"写引擎"区间不重叠。"""
+    eng = Engine(Config(), FakeClock(NOW))
+    svc = IngestService(eng, Admission())
+    overlaps = {"n": 0}
+    active = {"n": 0}
+    orig = eng.ingest
+
+    def spy(batch, *a, **k):
+        active["n"] += 1
+        if active["n"] > 1:
+            overlaps["n"] += 1
+        try:
+            return orig(batch, *a, **k)
+        finally:
+            active["n"] -= 1
+
+    eng.ingest = spy
+
+    async def main():
+        body = _body_rand(3000)
+        await asyncio.gather(svc.ingest(body, None), svc.ingest(body, None))
+    asyncio.run(main())
+    assert overlaps["n"] == 0, "Semaphore(1) 应串行化写引擎，两请求写区间不重叠"
 
 
 # ---- Ticker ----

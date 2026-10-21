@@ -27,6 +27,36 @@ docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple 
 
 > 注意：服务要求 `PYTHONHASHSEED` 固定（`run.sh` 与 Dockerfile 已固定为 0）。字符串哈希值随该种子变化，未固定时启动会打印警告。
 
+## 运行模式
+
+服务启动时**自动决定前端进程数**：在 Linux、可用核数 ≥ 2、内存上限 ≥ 384 MB 时，启用 `min(3, 核数 − 1)` 个**前端进程**——多个进程通过 `SO_REUSEPORT` 共同监听同一端口，负责接收与解析写入请求、直接回答默认窗口查询；引擎主进程只保留去重、写统计结构、每秒 tick 与降级。其余情况（含非 Linux、核数 < 2、内存上限 < 384 MB）为**单进程**。启动日志会打印实际的前端数与原因，例如：
+
+```
+2026-10-21 07:04:59,106 INFO flowlens 前端数 0（内存上限 256 MB < 384 MB）
+```
+
+- **256 MB 容器下为单进程模式**（内存上限 < 384 MB 自动退回，这也是评测环境实际运行的配置）。
+- 想体验前端模式，用 512 MB 启动即可（不设置 `FLOWLENS_FRONTENDS`，由服务自动判断）：
+
+```bash
+docker run --rm --memory=512m -p 8080:8080 flowlens   # 多核下自动开 min(3, 核数−1) 个前端
+```
+
+## 配置
+
+环境变量（均以代码中的实际默认值为准；不设置即取默认值）：
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `FLOWLENS_FRONTENDS` | 显式指定前端进程数（`0` 禁用）；不设置则按"运行模式"自动判断 | 自动 |
+| `FLOWLENS_MAX_PENDING_BYTES` | 在途（已预留、未写完）请求体的总字节上限 | 4 MB（4194304） |
+| `FLOWLENS_RAW_BUDGET_BYTES` | 正在读取/持有的原始请求体字节总上限 | 8 MB（8388608） |
+| `FLOWLENS_POOLED_CHUNK_EVENTS` | 已解析写入路径（前端架构）单次写入引擎的事件块大小 | 10000 |
+| `FLOWLENS_INTERN_USER_CAP` | user 字符串驻留表上限（满则整体清空；设 `0` 关闭驻留） | 8192 |
+| `FLOWLENS_INTERN_URL_CAP` | url 归一化结果驻留表上限（满则整体清空；设 `0` 关闭驻留） | 32768 |
+| `FLOWLENS_DEBUG` | `1` 时开启只读调试接口 `GET /debug/structure` 与 `FLOWLENS_TEST_MEM` | 未开启 |
+| `FLOWLENS_TEST_MEM` | 注入假的内存读数（`0~1` 的比例）以触发降级——**仅在 `FLOWLENS_DEBUG=1` 时生效，只用于测试** | — |
+
 ## 接口一览
 
 | 方法 | 路径 | 用途 |
@@ -157,6 +187,8 @@ pytest -q -m slow         # 慢测试（等价性对照、打包守护）
 - [docs/perf/](docs/perf/) — 性能剖析报告（`T11a-report.md`：单核 CPU 上限、事件循环延迟、瓶颈定位）
 - [docs/EXPERIMENTS_FORMAT.md](docs/EXPERIMENTS_FORMAT.md) + [tools/experiments.py](tools/experiments.py) — 如何复现实验场景（S1 吞吐 / S2 混合负载 / S3 精度 / S4 攻击 / S5 过载）
 - [docs/PROGRESS.md](docs/PROGRESS.md) — 进度交接单（已定决策、未解决问题、基准数据）
+- [docs/lanes/P1-notes.md](docs/lanes/P1-notes.md) — 提交后的性能优化过程（P1 解析进程池，已被 P2d-1 前端架构取代）
+- [docs/lanes/P2-notes.md](docs/lanes/P2-notes.md) — 提交后的性能优化过程（P2 前端进程架构：剖析、快速压测、快照广播、完整验证）
 - [docs/research/初期调研.md](docs/research/初期调研.md) — 提交前的独立算法调研（HyperLogLog / HyperLogLog++ 等）
 
 ## 已知限制

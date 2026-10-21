@@ -83,6 +83,11 @@ class _Plan:
 
 
 class Engine:
+    # 快照替换后的回调（P2d-2 二）：前端模式下由 __main__ 设置（广播快照 + 发布
+    # 共享状态），单进程模式为 None。回调必须**同步**（只做序列化与安排发送，
+    # 不能 await）——它被 refresh_snapshot / refresh_snapshot_async 在事件循环里同步调用。
+    on_snapshot = None   # Callable[[Snapshot], None] | None
+
     def __init__(self, cfg: Config, clock: Clock,
                  controller: "DegradeController | None" = None):
         self.cfg = cfg
@@ -155,6 +160,8 @@ class Engine:
             unseen.append(u)
         distinct_users, p95_bytes = self._snapshot_stats(r)
         self.snapshot = self._build_snapshot(now, r, tops, unseen, distinct_users, p95_bytes)
+        if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot)
         return self.snapshot
 
     async def refresh_snapshot_async(self) -> Snapshot:
@@ -173,6 +180,8 @@ class Engine:
         await asyncio.sleep(0)  # 统计概要之前让出
         distinct_users, p95_bytes = self._snapshot_stats(r)
         self.snapshot = self._build_snapshot(now, r, tops, unseen, distinct_users, p95_bytes)
+        if self.on_snapshot is not None:
+            self.on_snapshot(self.snapshot)
         return self.snapshot
 
     def tick(self) -> None:
@@ -182,13 +191,46 @@ class Engine:
 
     # ---- 写入 ----
     def ingest(self, batch: EventBatch, weight: int | None = None) -> IngestResult:
-        """写入一批事件。weight 缺省时取控制器当前的 sample_weight（T8 带权采样）。
+        """写入一批事件（外层入口，保持原签名与行为）。
 
-        采样（weight > 1）：按 event_id 哈希做**确定性**采样，保留比例 1/weight。
-        同一事件被重试时取舍一致（取决于 event_id 本身，与时间无关）。采样只作用于
-        Top-K 名单（hh）与 url 维度的 p95（DDSketch）；HLL（user 维 stats）与
-        event_id 去重始终全量。weight == 1（未降级）时走原来的 DimBucket.observe，
-        正常路径结果与 T7b 完全一致。
+        自己算出三列 64 位哈希（event_id / url / user）后交给 _ingest_core。
+        Ticker、基准、测试都直接调用它。采样语义（weight > 1）见 _ingest_core。
+        """
+        return self._ingest_core(batch,
+                                 key_hashes(batch.ids),
+                                 key_hashes(batch.urls),
+                                 key_hashes(batch.users),
+                                 weight)
+
+    def ingest_parsed(self, parsed, weight: int | None = None) -> IngestResult:
+        """解析进程路径的写入入口（P1）：解析进程已在子进程里完成 load_array +
+        validate + 三列哈希，这里组装成 EventBatch（ids 留空——核心不引用 batch.ids，
+        event_id 只用传入的 h_id 做去重与采样）后调用**同一个** _ingest_core，不复制写入逻辑。
+
+        user / url 的字符串驻留放在核心里、写入秒桶之前做：解析进程传回的字符串
+        都是新对象，必须在主进程驻留后才能共享（驻留表只在主进程有意义，见
+        flowlens/intern.py）。
+        """
+        batch = EventBatch(
+            ids=[], urls=parsed.urls, users=parsed.users,
+            ts=parsed.ts, nbytes=parsed.nbytes, invalid=parsed.invalid,
+        )
+        return self._ingest_core(batch, parsed.h_id, parsed.h_url, parsed.h_user, weight)
+
+    def _ingest_core(self, batch: EventBatch, h_id: np.ndarray, h_url: np.ndarray,
+                     h_user: np.ndarray, weight: int | None) -> IngestResult:
+        """写入核心：classify → 去重 → 采样 → 按秒分组 → 写入秒桶。单写者、无锁。
+
+        三列 64 位哈希由调用方传入，与 batch 的各列**逐行对齐**（长度 == len(batch)）：
+        外层 ingest 自己算好再传；解析进程路径（ingest_parsed）直接传子进程算好的，
+        不重算。核心内部**不再调用 key_hashes**（原实现里三处 key_hashes 改为对传入
+        数组按下标/重排取子集，语义、顺序、计数与拆分前逐行对应、完全不变）。
+
+        weight 缺省时取控制器当前的 sample_weight（T8 带权采样）。采样（weight > 1）
+        按 event_id 哈希做**确定性**取舍，保留比例 1/weight：同一事件无论重试多少次、
+        何时重试，取舍都一致（取决于 event_id 本身，与时间无关）。采样只作用于 Top-K
+        名单（hh）与 url 维的 p95（DDSketch）；HLL（user 维 stats）与 event_id 去重
+        始终全量。weight == 1（未降级）时走 DimBucket.observe，正常路径结果与 T7b 完全一致。
         """
         now = self.clock.now_ms()
         self.bloom.advance(now)  # 幂等，确保当前范围的代已就绪
@@ -208,11 +250,11 @@ class Engine:
         if n:
             a_idx = np.flatnonzero(accept)
             a_ts = ts[a_idx]
-            # event_id 的哈希在去重时算一次；采样（w>1）还要按它取模判取舍，直接按下标
-            # 复用（见下面 h_id = h_id_all[keep]），不再重算——这段只在降级时跑，而
-            # 降级本身就因 CPU 紧张，重算浪费。同一批里同一 event_id 两次哈希结果相同
-            # （hash 是字符串的纯函数），复用不改变确定性采样语义。
-            h_id_all = key_hashes([batch.ids[i] for i in a_idx.tolist()])
+            # event_id 的哈希在去重时用一次（传入的整批哈希按下标取子集），采样
+            # （w>1）还要按它取模判取舍，直接按下标复用（见下面 h_id = h_id_k[order]），
+            # 不再重算——同一批里同一 event_id 两次哈希结果相同（hash 是字符串的纯
+            # 函数），复用不改变确定性采样语义。
+            h_id_all = h_id[a_idx]
             dup, active = self.bloom.check_and_set(h_id_all, a_ts)
             # 干净划分：写进去的 = ~dup & active；没写进去的里，active 的算重复、
             # active 为 False 的（正常不会出现）算迟到
@@ -228,27 +270,29 @@ class Engine:
                 users = np.asarray(batch.users, dtype=object)[k_idx]
                 if user_intern is not None:
                     # 写入秒桶前对 user_id 驻留（C3）：相同内容返回同一字符串对象，
-                    # 长尾流量下各秒桶、叶子、节点共享同一份，减少重复对象
+                    # 长尾流量下各秒桶、叶子、节点共享同一份，减少重复对象。解析进程
+                    # 传回的字符串都是新对象，驻留必须在这里（主进程）做才能共享。
                     users = np.fromiter((user_intern.intern(u) for u in users), dtype=object)
                 urls = np.asarray(batch.urls, dtype=object)[k_idx]
-                # 采样按 event_id 哈希取模判取舍（确定性、与时间无关）：同一事件无论
-                # 重试多少次、何时重试，取舍都一致；与"这次是不是重复"解耦。哈希直接
-                # 复用去重时算好的 h_id_all（按下标 keep 取子集），不再重算。
-                h_id = h_id_all[keep] if w > 1 else None
+                # 传入的整批哈希按下标取"保留子集"，再按秒重排（与原 key_hashes 后的
+                # 对齐方式逐行对应）
+                h_id_k = h_id_all[keep]
+                h_url_k = h_url[k_idx]
+                h_user_k = h_user[k_idx]
                 # 按秒分组：一次 argsort 排好秒号后按边界切片，而不是对每一秒做整批布尔掩码
                 order = np.argsort(a_ts2 // 1000, kind="stable")
                 a_ts2 = a_ts2[order]
-                if h_id is not None:
-                    h_id = h_id[order]
                 a_bytes = a_bytes[order]
                 users = users[order]
                 urls = urls[order]
+                h_url = h_url_k[order]
+                h_user = h_user_k[order]
+                h_id = h_id_k[order] if w > 1 else None
                 s_all = a_ts2 // 1000
                 bnd = np.flatnonzero(np.r_[True, s_all[1:] != s_all[:-1]])
                 bnd = np.append(bnd, len(s_all))
-                # 两维度的哈希始终全量算（HLL 不采样；不采样路径也用到 url 哈希）
-                h_user = key_hashes(users)
-                h_url = key_hashes(urls)
+                # 两维度的哈希始终全量（HLL 不采样；不采样路径也用到 url 哈希），
+                # 这里直接复用传入数组的子集，不再 key_hashes
                 weights = np.full(len(s_all), w, dtype=np.uint64)
                 if w > 1:
                     # 采样（weight>1）：采样掩码 h_id % w == 0 保留（确定性、与时间无关）

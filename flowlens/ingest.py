@@ -10,13 +10,26 @@
 """
 
 import asyncio
+import logging
 import os
+import time
 import zlib
 from dataclasses import dataclass
 
 from .errors import BadRequest, Overloaded, PayloadTooLarge, UnsupportedEncoding
 from .engine import Engine, IngestResult
 from .model import load_array, validate
+from .parse_pool import ParsedBatch
+
+log = logging.getLogger(__name__)
+
+# 写入块耗时诊断（P2d-3 二.3）：仅 FLOWLENS_DEBUG=1 时每块记一行（块大小、
+# ingest_parsed 耗时 ms、时刻），供与事件循环最长延迟对齐归因；生产零开销
+# （模块 import 时定一次，热路径里只判一个 bool）。
+# 口径与 api.debug.is_enabled() 相同，但不 import 它：api/__init__ 会拉起
+# app、app 又 import ingest，循环导入；环境变量在进程生命周期内不变，
+# import 时读一次等价。
+WRITE_CHUNK_DEBUG = os.environ.get("FLOWLENS_DEBUG") == "1"
 
 MAX_BODY_BYTES = 4 * 1024 * 1024             # 请求体（压缩后）上限
 MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024     # 单个请求解压后上限，超过提示拆分
@@ -42,7 +55,47 @@ def _read_pending_limit() -> int:
 
 
 MAX_PENDING_BYTES = _read_pending_limit()
-CHUNK_EVENTS = 5000                          # 每次让出事件循环前处理的事件数
+
+# 每次让出事件循环前写入引擎的事件数（P1 第 2 节 / 用户决定五）：从 5000 降到 2000。
+# 依据：写入引擎每条约 2.5 μs，单块 2000 条约 5 ms；混合负载下查询 p99 高的原因是
+# 查询排在多个写入块之后，缩短单块同步耗时能压低事件循环被独占的时间。
+CHUNK_EVENTS = 2000
+# 已解析路径（write_parsed，前端进程架构 P2d-1 起）的写入块大小（P1b 二点五）：
+# 跨进程传输可忽略（0.1 μs/条），主进程每条耗时严重依赖块大小（每块有按秒分组、
+# 逐维度去重统计、numpy 调用、筛选候选等固定开销）——审查方实测块 2000 约
+# 2.98 μs/条、块 10000 约 1.88 μs/条。有写入信号量，同一时刻只写一块（块 10000
+# 约 25 ms），查询最多等一块，仍在 50 ms 内。故已解析路径取 10000。
+# 注意：Top-K 名单是近似结构、堆成员对"逐秒 observe 的分批顺序"敏感——不同块大小会在
+# 名单深尾部产生少量差异（见 test_ingest 的等价性用例说明），这是 sketch 的固有性质，非 bug。
+DEFAULT_POOLED_CHUNK_EVENTS = 10000
+
+
+def _read_pooled_chunk_events() -> int:
+    """从 FLOWLENS_POOLED_CHUNK_EVENTS 读已解析路径的写入块大小。
+
+    缺省/非法/非正数都退回默认 10000。P2d-3 第二节的对比实验用它把块降到 5000，
+    验证"缩短写块对回放查询 p99 的影响"。生产不设该变量，行为与原来一致。
+    """
+    raw = os.environ.get("FLOWLENS_POOLED_CHUNK_EVENTS", "").strip()
+    if not raw:
+        return DEFAULT_POOLED_CHUNK_EVENTS
+    try:
+        v = int(raw)
+    except ValueError:
+        log.warning("FLOWLENS_POOLED_CHUNK_EVENTS=%r 非法，回退默认 %d",
+                    raw, DEFAULT_POOLED_CHUNK_EVENTS)
+        return DEFAULT_POOLED_CHUNK_EVENTS
+    if v <= 0:
+        log.warning("FLOWLENS_POOLED_CHUNK_EVENTS=%r 非正数，回退默认 %d",
+                    raw, DEFAULT_POOLED_CHUNK_EVENTS)
+        return DEFAULT_POOLED_CHUNK_EVENTS
+    return v
+
+
+POOLED_CHUNK_EVENTS = _read_pooled_chunk_events()
+# "写入引擎"这一步同时进行的请求数上限（用户决定五）：写入引擎是单写者，串行化避免
+# 多个写入块背靠背独占事件循环、拖高查询 p99。
+DEFAULT_ENGINE_WRITE_CONCURRENCY = 1
 
 # gzip 解压分块：输入每次喂这么多压缩字节，输出用 max_length 限制，
 # 避免把整个解压结果一次性放进内存（解压炸弹防护）。
@@ -106,6 +159,10 @@ class Admission:
 
     limit: int = MAX_PENDING_BYTES
     _pending: int = 0
+    # 因预留失败（额度满）被拒绝的请求数（503 来源之一）。供 /healthz 暴露，
+    # 诊断 S1 高 503 到底是"在途额度"（本实例，ingest_service.admission）还是
+    # "原始请求体额度"（app.py 的 raw_budget 实例）在拒。
+    rejected: int = 0
 
     @property
     def pending(self) -> int:
@@ -128,6 +185,7 @@ class Admission:
     def try_reserve(self, n: int) -> bool:
         """预留 n 字节；放不下返回 False（调用方应整体拒绝，不写任何去重状态）。"""
         if not self.can_reserve(n):
+            self.rejected += 1
             return False
         self._pending += n
         return True
@@ -137,51 +195,110 @@ class Admission:
 
 
 class IngestService:
-    """写入请求处理：decode → 按解压后字节预留 → 解析 → 分块 validate + engine.ingest。"""
+    """写入请求处理：decode → 按解压后字节预留 → 解析（本进程 validate）→ 分块写入引擎
+    （信号量保护）。
 
-    def __init__(self, engine: Engine, admission: Admission):
+    顺序固定（CLAUDE.md 规则 2）：
+      decode_body（解压）→ 按**解压后字节数** try_reserve（在解析与去重之前）
+      → 本进程 load_array + 分块 validate → 分块写引擎 → finally release。
+    预留失败 / 解析异常都**不写任何去重状态**，调用方重试不会被判重。
+
+    解析（load_array + validate + 三列哈希）是纯计算部分；**去重、采样、写桶全部只在
+    引擎**的 engine._ingest_core 里做，单写者、无锁。前端进程架构（P2d-1）下，解析被
+    搬到前端进程，IngestService 只保留"已解析结果 → 分块写引擎"的 write_parsed，
+    进程池路径已删除（ParsePool 被前端进程取代）。
+    """
+
+    def __init__(self, engine: Engine, admission: Admission,
+                 engine_write_concurrency: int = DEFAULT_ENGINE_WRITE_CONCURRENCY):
         self.engine = engine
         self.admission = admission
+        self._write_sem = None  # 延迟到事件循环里创建（见 _get_write_sem）
+        self._write_concurrency = max(1, engine_write_concurrency)
+
+    def _get_write_sem(self) -> asyncio.Semaphore:
+        """'写入引擎'这一步的信号量（决定五）。单写者串行化，避免多个写入块背靠背
+        独占事件循环。Semaphore 必须在事件循环里创建，这里按当前 loop 延迟初始化。"""
+        if self._write_sem is None:
+            self._write_sem = asyncio.Semaphore(self._write_concurrency)
+        return self._write_sem
 
     async def ingest(self, body: bytes, content_encoding: str | None) -> IngestResult:
         # 1. 解码（含 gzip 解压与大小检查），得到解压后的字节
         raw = decode_body(body, content_encoding)
-        # 2. 按解压后字节数预留容量：必须在解析和任何去重之前（CLAUDE.md 规则 2），
-        #    否则解析本身的内存（约 3.4 倍）挡不住
+        # 2. 按解压后字节数预留容量：必须在解析和任何去重之前（CLAUDE.md 规则 2）
         n_bytes = len(raw)
         if not self.admission.try_reserve(n_bytes):
-            # 第 3 级把在途上限从 4 MB 收紧到 2 MB：这期间解压后 2~4 MB 的请求预留
-            # 不下，走这里的 503（而不是 413）——有意的、暂时性的，退出降级即可成功。
-            # 错误信息里说明"降级期间单个请求的上限暂时为 2 MB"，让调用方知道是临时限制。
+            # 第 3 级把在途上限收紧到 2 MB（单进程 4 MB→2 MB）：这期间超出 2 MB 的
+            # 请求预留不下，走这里的 503（而不是 413）——有意的、暂时性的，退出降级即可成功。
             if self.admission.limit < MAX_PENDING_BYTES:
                 mb = self.admission.limit // (1024 * 1024)
                 raise Overloaded(
                     f"降级期间单个请求的上限暂时为 {mb} MB，请稍后重试", retry_after=1)
             raise Overloaded(retry_after=1)
         try:
-            # 3. 解析成元素列表（JSON 数组或 NDJSON，没有任何可解析内容时抛 BadRequest）
-            arr = load_array(raw)
-            n = len(arr)
-            # 4. 分块处理，块间让出事件循环
-            total = IngestResult(0, 0, 0, 0)
+            return await self._ingest_inproc(raw)
+        finally:
+            self.admission.release(n_bytes)
+
+    async def _ingest_inproc(self, raw: bytes) -> IngestResult:
+        """本进程路径：load_array + 分块 validate + engine.ingest。
+
+        逐块 validate→ingest→释放 dict→块间让出，块大小 CHUNK_EVENTS（2000），"写入引擎"
+        这段受信号量保护（决定五：串行化、避免多块背靠背独占事件循环）。validate 是纯
+        函数、每块各带 invalid 计数，逐块累加。
+        """
+        arr = load_array(raw)
+        n = len(arr)
+        sem = self._get_write_sem()
+        total = IngestResult(0, 0, 0, 0)
+        async with sem:
             for i in range(0, n, CHUNK_EVENTS):
                 j = min(i + CHUNK_EVENTS, n)
                 batch = validate(arr[i:j])
                 # 总是调用 engine.ingest：整块全非法时 batch 为空，engine.ingest
                 # 仍会返回 batch.invalid（其 invalid = batch.invalid + 未来事件），
-                # 用 `if batch:` 跳过会丢掉这块的 invalid 计数（F2 发现：NDJSON 让
-                # "全非法"请求体能走到这里；纯 JSON 数组 [5,"str",null] 同样受影响）
-                res = self.engine.ingest(batch)
-                total = IngestResult(
-                    total.accepted + res.accepted,
-                    total.deduped + res.deduped,
-                    total.late + res.late,
-                    total.invalid + res.invalid,
-                )
+                # 用 `if batch:` 跳过会丢掉这块的 invalid 计数
+                total = self._add(total, self.engine.ingest(batch))
                 # 已处理的元素置 None（等长切片赋值），让这些 dict 尽早释放
                 arr[i:j] = [None] * (j - i)
                 if j < n:
                     await asyncio.sleep(0)  # 让出事件循环
-            return total
-        finally:
-            self.admission.release(n_bytes)
+        return total
+
+    async def write_parsed(self, parsed: ParsedBatch) -> IngestResult:
+        """已解析结果的写入（P2d-1：写入通道服务端复用）：按 POOLED_CHUNK_EVENTS 切块，
+        首块加回整批的 invalid，在写入信号量下逐块调用 engine.ingest_parsed，块间让出。
+
+        整批 invalid 必须让**引擎计数器**也计到（与 engine.ingest 更新 counters.invalid
+        口径一致）：放在第一个块上（chunk 默认 invalid=0）。全非法请求体 parsed 为空、
+        切不出块，用单块承载 invalid，保证计数器仍计到。
+        """
+        chunks = [parsed.chunk(i, i + POOLED_CHUNK_EVENTS)
+                  for i in range(0, len(parsed), POOLED_CHUNK_EVENTS)]
+        if not chunks:
+            chunks = [parsed.chunk(0, 0)]
+        chunks[0].invalid = parsed.invalid
+        sem = self._get_write_sem()
+        total = IngestResult(0, 0, 0, 0)
+        async with sem:
+            for idx, chunk in enumerate(chunks):
+                # FLOWLENS_DEBUG=1：记录同步写入块的耗时（ms 与时刻）——块是
+                # 事件循环里连续执行的同步段，与探针最长延迟对齐可归因到"写入块"
+                if WRITE_CHUNK_DEBUG:
+                    _t0 = time.monotonic()
+                    total = self._add(total, self.engine.ingest_parsed(chunk))
+                    log.info("写入块 %d 条 ingest_parsed=%.2f ms @%d",
+                             len(chunk), (time.monotonic() - _t0) * 1000.0,
+                             int(time.time() * 1000))
+                else:
+                    total = self._add(total, self.engine.ingest_parsed(chunk))
+                if idx + 1 < len(chunks):
+                    await asyncio.sleep(0)  # 块间让出事件循环
+        return total
+
+    @staticmethod
+    def _add(a: IngestResult, b: IngestResult) -> IngestResult:
+        """累加两次写入的计数。"""
+        return IngestResult(a.accepted + b.accepted, a.deduped + b.deduped,
+                            a.late + b.late, a.invalid + b.invalid)

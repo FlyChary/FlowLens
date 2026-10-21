@@ -16,7 +16,8 @@ from flowlens.dims import Dim
 from flowlens.engine import Engine
 from flowlens.errors import BadRequest, TooOld
 from flowlens.model import EventBatch
-from flowlens.query import CACHE_CAP, QueryService
+from flowlens.query import (CACHE_CAP, QueryService, is_snapshot_query,
+                            stats_from_snapshot, topk_from_snapshot)
 from flowlens.timewin import FakeClock
 
 NOW = 1_735_689_600_000
@@ -186,6 +187,39 @@ def test_stats_default_reads_snapshot():
         assert s.distinct_users == snap.distinct_users
         assert s.p95_bytes == snap.p95_bytes
     _run(main())
+
+
+def test_snapshot_pure_functions_match_default_branch():
+    """P2d-2 一：topk_from_snapshot / stats_from_snapshot 与 QueryService 默认
+    分支（读快照、不做合并）的结果相同（引擎与前端共用这两个函数）。"""
+    async def main():
+        urls = [f"/x{i % 40}" for i in range(500)]
+        users = [f"u{i % 30}" for i in range(500)]
+        ts = [NOW - 2000 + (i % 1000) for i in range(500)]
+        eng = _engine_with((urls, users, ts))
+        eng.tick()
+        qs = QueryService(eng)
+        snap = eng.snapshot
+        for d in (Dim.URL, Dim.USER):
+            for k in (1, 10, 100):
+                via_qs = await qs.topk(d, 60_000, k, None)
+                via_fn = topk_from_snapshot(snap, d, k, 60_000)
+                assert via_qs == via_fn, (d, k)
+        s_via_qs = await qs.stats(60_000)
+        s_via_fn = stats_from_snapshot(snap, 60_000)
+        assert s_via_qs == s_via_fn
+
+    _run(main())
+
+
+def test_is_snapshot_query():
+    """默认窗口判定：不带 at、window 60 秒；topk 时 k 不超过快照名单长度。"""
+    assert is_snapshot_query(None, 60_000, None, 100)   # stats：k 为 None
+    assert is_snapshot_query(None, 60_000, 10, 100)
+    assert is_snapshot_query(None, 60_000, 100, 100)
+    assert not is_snapshot_query(None, 30_000, 10, 100)  # window 不是 60 秒
+    assert not is_snapshot_query(NOW - 1000, 60_000, 10, 100)  # 带 at
+    assert not is_snapshot_query(None, 60_000, 101, 100)  # k 超过快照名单长度
 
 
 def test_stats_other_window_approximate():

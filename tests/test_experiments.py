@@ -131,6 +131,79 @@ def test_merge_timeline_joins_by_second():
     assert merged2[0]["sent"] == 0 and merged2[0]["accepted"] == 0
 
 
+# ---- cpu_window_pct（P2d-3 二：整窗口引擎/前端合计 CPU%）----
+
+def _sample(t, main_cpu, *fronts):
+    procs = []
+    if main_cpu is not None:
+        procs.append({"pid": 1, "name": "main", "cpu_pct": main_cpu})
+    for i, f in enumerate(fronts):
+        procs.append({"pid": i + 2, "name": "parse", "cpu_pct": f})
+    return {"t": t, "procs": procs}
+
+
+def test_cpu_window_pct_sums_main_and_front():
+    # 窗口 10s：引擎每采样 100%（=1 核满）→ 10 CPU 秒 → 100%；
+    # 3 前端各 50%（合计 150%）→ 15 CPU 秒 → 150%
+    samples = [_sample(i * 1000, 100.0, 50.0, 50.0, 50.0) for i in range(11)]
+    c = ex.cpu_window_pct(samples)
+    assert c["engine_cpu_pct"] == 100.0
+    assert c["front_cpu_pct"] == 150.0
+
+
+def test_cpu_window_pct_single_process_front_zero():
+    # 单进程（前端数 0）：前端合计 0.0
+    samples = [_sample(i * 1000, 40.0) for i in range(5)]
+    c = ex.cpu_window_pct(samples)
+    assert c["engine_cpu_pct"] == 40.0
+    assert c["front_cpu_pct"] == 0.0
+
+
+def test_cpu_window_pct_empty():
+    assert ex.cpu_window_pct([]) == {"engine_cpu_pct": None, "front_cpu_pct": None}
+
+
+# ---- parse_front_count / _svc_fronts（P2d-3 第零节第 2 条）----
+
+def test_parse_front_count():
+    assert ex.parse_front_count("... 前端数 3（FLOWLENS_FRONTENDS=3） ...") == \
+        (3, "FLOWLENS_FRONTENDS=3")
+    assert ex.parse_front_count("前端数 0（内存上限 256 MB < 384 MB）") == \
+        (0, "内存上限 256 MB < 384 MB")
+    # 读不到该行：None + 原文末行
+    n, last = ex.parse_front_count("no front line here\nlast line")
+    assert n is None and last == "last line"
+
+
+def test_svc_fronts_stops_on_mismatch(monkeypatch):
+    class _S:
+        front_count = 2
+        front_reason = "FLOWLENS_FRONTENDS=2"
+    svc = _S()
+    # 无预期（未注入 env）：只记录、不核对
+    assert ex._svc_fronts(svc, {}) == (2, "FLOWLENS_FRONTENDS=2")
+    # 注入 FLOWLENS_FRONTENDS 相符：核对通过
+    assert ex._svc_fronts(svc, {"FLOWLENS_FRONTENDS": "2"}) == (2, "FLOWLENS_FRONTENDS=2")
+    # 注入 FLOWLENS_FRONTENDS 不符：抛错停止
+    with pytest.raises(RuntimeError):
+        ex._svc_fronts(svc, {"FLOWLENS_FRONTENDS": "3"})
+    # 显式 --expect-fronts 优先且不符：抛错
+    monkeypatch.setattr(ex, "EXPECT_FRONT", 0)
+    try:
+        with pytest.raises(RuntimeError):
+            ex._svc_fronts(svc, {})
+    finally:
+        monkeypatch.setattr(ex, "EXPECT_FRONT", None)
+
+
+def test_svc_fronts_stop_when_unreadable():
+    class _S:
+        front_count = None
+        front_reason = "docker 还没起来"
+    with pytest.raises(RuntimeError):
+        ex._svc_fronts(_S(), {})
+
+
 # ---- pick_finalized_intervals ----
 
 def test_pick_finalized_intervals_in_retention():

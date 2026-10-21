@@ -35,6 +35,13 @@
 8. **打包配置漏掉 `flowlens.api`**：`pyproject.toml` 手工列举 packages 漏了 `api` 子包，`pip install .` 装出缺子包的坏包、Docker 里 import 失败；改为 `packages.find`（`include = ["flowlens*"]`）自动发现，`tests/test_packaging.py` 用真实 `pip wheel .` 比对守护。
 9. **对比函数把空结果算作召回 100%**：`exact.compare` 原实现 `hits/n if n else 1.0` 在服务返回空（n=0）时记 1.0，把降级期空响应误判成完美精度（T10b 的 S3"召回 1.0/误差 0"即此假象）；改为"服务空、精确非空"记 0，两皆空才 1.0。
 
+### 5. 提交后的性能优化（P1、P2）
+
+- **本人做出的关键决定**：提交后继续以 20 万条/秒为目标；在"256 MB 内稳定翻倍"不可行后（P1c 实测：2× 解析 CPU 收益与 256 MB 稳定所需的内存余量互相冲突），选择"先在放宽内存（512 MB）的条件下证明设计可扩展"；批准解冻 `dedup.py`（Bloom 提速、本任务结束重冻）；坚持按检查点推进、一条线一条线地做（没有同时开两条支线）。
+- **测量方法上的教训**：原压测工具每条约 55 μs、与服务争抢资源，使 P1 得出的"上限约 13.4 万"偏低（P2a 改造后压测降到 ~0.75 μs/条才暴露真实能力）；在容器内用 `docker exec` 采样会占用服务的 CPU；按 1 Hz 监控对齐每档窗口导致数据错误，改为严格串行读取；长实验挂在会话下被 WSL2 宿主回收导致数据丢失，改为脱离会话、逐分钟/逐档写盘。
+- **AI 的判断被推翻或纠正的例子**：两次从吞吐/接受率数字得出"进程池负收益"（P1c 256 MB、P2c 256 MB），换算成"主进程每条耗时"后发现结论相反——主进程单写者事件循环才是瓶颈、池确实把主进程负载降了，只是 256 MB 的内存余量顶不掉；把"主进程每条耗时随负载上升"归因于 tick 扫描，隔离测量（`bench_tick`，FakeClock 驱动）后证明 tick 是每秒 ~65-85 ms 的固定税、不随吞吐涨（P2a 的"随吞吐涨"是饱和事件循环里 tick 与写路径重叠排队的假象）；一次误报"测试通过"（前一会话 API 中断后误判），Linux 上重跑发现 3 个 e2e 用例失败（全为测试代码问题，非实现）；P2d-2 中级别变化时 `on_change` 只更新了 `shared.level`、未立即更新前端用到的 `degraded`/`sample_weight` 共享状态，第六节补齐。
+- **结果（一句话）**：512 MB / 3 前端下每秒 20 万条持续 10 分钟 100% 接受、默认窗口查询 p99 34.8 ms（< 50 ms）、精度与已提交版本一致；256 MB（评测实际运行的自动单进程配置）每秒 8 万条 10 分钟 100% 接受、不拒写（已提交版本在同样条件下进第 4 级拒写）。
+
 ---
 
 > 以上由 AI 根据正文整理，**请本人核对**（每条都对应正文中的记录，未写正文之外的内容）。核对无误后即可作为提交材料。
@@ -513,7 +520,6 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - **用户修改/否决点**：① 用户确认"主线未跑实验，可以跑容器"；② 用户确认"允许改 app.py 的 `_healthz` 加 `malloc_trim` 只读字段"（原清单不允许改 app.py，例外放行）；③ 用户追加 **glibc mmap/trim 阈值对照实验（g5）** 并**批准改 Dockerfile**（例外放行）固化 `MALLOC_MMAP_THRESHOLD_=131072`/`MALLOC_TRIM_THRESHOLD_=131072`——实测峰值 −57.7 MiB、246/246s 全程第 0 级，是本组实验最大单项收益；S3/S4 不重跑、等合并后在最终代码上统一跑。
 - 消融结论：trim 是主杠杆（进 L4 拒写 → 不拒写、接受率 87.8%→100%）、驻留是次杠杆（中后段水位降 ~11 MiB、把"贴 3 级"压成"偶发尖峰"）、在途降 2 MB 无增益（保留为实验变量）。**T9b-B（缩 Bloom/Count-Min，需改冻结 config.py）不需要**——g5 已全程 0 级、无内存压力，且 C1 已证缩 Bloom/HLL 都是拿精度换内存。
 
-
 ### 2026-10-19 F2 收尾：去掉 tools 里写死的本机路径（tools/profile_server.py、tools/exp/run_matrix.sh）
 
 - 背景：F2 提交前检查发现 tools 里残留本机 WSL/Windows 绝对路径，换机器（如评测方全新克隆）会失效。
@@ -525,3 +531,118 @@ AI 最初用 Go 写了核心代码。我不熟悉 Go，答辩时无法讲清代�
 - 用户推送设计文档后触发：先 git pull（合入 docs/DESIGN.md 终版 + 新增 docs/DESIGN.pdf），再 git archive HEAD 打包。
 - 产物：仓库外 D:/tmp/flowlens-submission.zip（3.4 MB，158 条目，zip 校验 OK）。顶层核对齐全：README.md、Dockerfile、run.sh、constraints.txt、pyproject.toml、AI_LOG.md、flowlens/、tests/、tools/、docs/DESIGN.md 及 docs/ 配图（DESIGN.pdf 与 4 张 png）；确认无 .git、无顶层 results/ 混入（git archive 只取已提交内容，results/T11a 亦被 gitignore）。
 - 备注：zip 用 HEAD 版本，工作区里两处未提交改动（README.md +2 行、docs/research/初期调研.md、新图 docs/research/Count-Min Sketch.png）未包含，符合 F2"只含已提交文件"；zip 未提交进仓库。未触及热路径，未跑基准。
+
+### 2026-10-19 P1：解析进程池与写入并发限制（flowlens/parse_pool.py 新建、engine.py、ingest.py、api/app.py、__main__.py、tests/test_parse_pool.py、tests/test_ingest.py、tests/e2e/test_parse_pool_e2e.py）
+
+- **目标**：把"逐条处理"里可并行的纯计算（load_array、validate 含归一化、三列 64 位哈希，约 9.5 μs/条）搬到多个解析子进程，主进程只留必须单写者的 classify/Bloom/采样/写桶/tick（约 3.5 μs）。统计状态仍只在主进程，单写者、无锁、去重语义不变。
+- **用户五个关键决定（直接照做）**：① gzip 解压留在主进程（在途额度按解压后字节预留，解压后大小只有解压完才知道，解压进子进程会破坏"先预留再解析再去重"顺序）；② 解析进程数按"实际能用的核"算（`len(os.sched_getaffinity(0))` 与 cgroup cpu.max/cfs_quota 取小，`min(3, 核数−1)`，<1 不启用，FLOWLENS_PARSE_WORKERS 可覆盖）；③ 进程池在引擎创建**之前**启动并预热（spawn 上下文，initializer 做哈希自检）；④ 引擎写入核心只写一份（`ingest` 外层算哈希 → `_ingest_core`；新 `ingest_parsed` 组装 EventBatch 走同一核心；驻留在核心里、写桶前做）；⑤ 写引擎用 `asyncio.Semaphore(1)` 保护、按 2000 条分块、块间让出。
+- **AI 方案被修正/踩坑**：
+  1. **`BrokenProcessPool` 从 `concurrent.futures` 顶层 import 失败**——它在 `concurrent.futures.process`，改 import 路径。
+  2. **整批 invalid 的计数口径**：初版把 ParsedBatch 各子块 invalid 都设 0、只在响应上 `+extra_invalid`，导致**响应与引擎计数器不一致**（`counters.invalid` 没计到，`test_ingest_parsed_equals_ingest` 断言 `(…,1) == (…,0)` 挂）。改为**整批 invalid 放第一个块**（`engine.ingest_parsed` 会像单进程 `engine.ingest` 一样把它计入 counters），全非法时切不出块则用单空块承载，响应与计数器口径自然一致。
+  3. **子进程崩溃检测**：池已坏时 `submit()` 是**同步**抛 BrokenProcessPool（不是等到 await 才抛），初版 try 只包了 `await`、没包 `submit`，导致崩溃测试里异常直接漏出。改为 try 包住 `submit` 与 `await` 两步。
+  4. **`_build` 半成品池泄漏**：自检失败时 ProcessPoolExecutor 已建但预热抛异常，会留下管理线程与残留子进程。加 try/except 在失败时 `shutdown(wait=False, cancel_futures=True)` 并置 `_executor=None` 再抛。
+  5. **单进程路径不能"先 validate 全部再统一写"**：初版为了对称把 in-proc 也改成"先切块 validate 完、再统一写"，丢了原"逐块 validate→ingest→释放 dict→让出"的交错结构（大请求体会一次性 validate 全部才写、事件循环让出被破坏）。按决定五"不启用进程池时走现有路径"改回：in-proc 保持原交错结构、只是块大小 5000→2000 且写引擎段包进信号量；pooled 才走"子进程一次解析→主进程切块写"。
+  6. **`_stop_parse_pool` 忘了 async**：aiohttp 的 `on_shutdown` handler 会被 `await`，写成同步函数导致 `app.shutdown()` 时 `TypeError: NoneType can't be used in await`。改为 `async def`。
+- **等价性（核心，不依赖子进程，稳定跑）**：同一 body 经 `IngestService` 单进程路径（decode→validate→ingest）与进程池路径（decode→parse_body→ingest_parsed→2000 切块→invalid 放首块）写两个全新引擎，topk(url/user)/stats(distinct_users,p95)/计数器逐项相等；覆盖长尾（跨 3 块）、全随机不重复、含非法+批内重复、全非法、gzip、NDJSON。另 `test_ingest_parsed_equals_ingest` 直接对比 `ingest(parse_events)` 与 `ingest_parsed(ParsedBatch)` 两入口。
+- **正确性**：503 后重试不判重（预留在池提交之前）、BrokenProcessPool→重建→恢复、worker 数计算（核数 1/2/4 与 env 覆盖/非法/夹到 [0,3]）、自检不一致→构造期 BrokenProcessPool、close 后无残留子进程（join + is_alive）。
+- **验证**：Windows `pytest -q` **366 passed, 4 skipped, 9 deselected**（PYTHONHASHSEED=0，真子进程用例生效）；`-m slow` **9 passed**（engine 写入核心改了、保险起见跑）。基准（Windows 单次）：`bench_core 长尾` 约 29.9 万/秒（与 T10b 30.0 持平）、`bench_engine 每批 5000 engine.ingest` 2.31 μs/条（T10b 4.13、T8b 4.65——engine.ingest 拆分后更快，属本机时段波动，未变慢）。**容器实测（第四节）留待检查点二，本提交只到第三节等价性与正确性**。
+- **未做**：第四节容器实测（S1/S2/S3/S4/单核）、PROGRESS 容器数字，按 P1 时间盒留到检查点二。镜像标签 `flowlens:p1` 未动（容器阶段才用）。
+
+### 2026-10-19 支线 P1c：空闲内存基线（tools/idle_mem.py 新建）
+
+- 按 P1c 一的要求先测基线（池关 / 池开 3，256 MB 容器、空闲 5 秒）：池关工作集 71.5 MiB、池开 3 为 141.7 MiB，每个解析进程 RssAnon 约 18.8 MB（工作集增量约 23.5 MB/个，含碎片），与背景"约 25 MB"一致。
+- 测量工具 `tools/idle_mem.py`（WSL 宿主运行，与 s1_measure 同口径读宿主 /proc，不进容器）：主进程与各解析进程 RssAnon + /healthz 工作集/原始读数，断言解析进程数与期望一致。
+
+### 2026-10-19 支线 P1c：四项内存调整（逐项提交，逐项测空闲内存）
+
+- **一.1 线程数**：Dockerfile base 阶段 ENV 加 `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1`。容器内验证各解析 worker `Threads=1`、主进程 3（Python 主+GC+信号线程）。空闲：池关 71.5→70.2、池开 3 141.7→139.8 MiB（单项收益小，保留）。
+- **一.2 worker 默认 3→2**：`resolve_worker_count` 默认 `min(2, 核−1)`，env 覆盖仍夹 [0,3]（实验可显式 3）。测试期望更新（8/4/3 核→2）。空闲池开 2 = 121.2 MiB（比 3 省 18.6）。
+- **一.3 池开时在途额度默认 8 MB**：`ingest.py` 加 `POOLED_PENDING_BYTES=8MB` 与 `pooled_pending_limit()`（env 可覆盖），`make_engine` 池开时用它初始化 `Admission`；单进程路径不变（4 MB）。新增 `test_pooled_pending_limit_env_override`。
+- **一.4 进 3/4 级立即 malloc_trim**：`_make_degrade_change_hook` 的 on_change 里 `new>=3 and old<new`（级别升到 ≥3）调一次 `ticker.malloc_trim()`。测试 `test_entering_level3_calls_malloc_trim_once`（可控内存读数进 3 级→恰好一次；级别不变不重复；退出再进再调）。
+- **AI 方案被修正/说明**：① 一.4 的触发条件初版写成 `old<3 and new>=3`，被指令措辞"进入第 3 级或第 4 级的那一刻"纠正为 `old<new and new>=3`（3→4 也算进入第 4 级，也要 trim；4→3 回落不算）。② 空闲内存四项合并测（同一次构建），按进程数差值归因（调整 3/4 空闲无影响，注释写明）。③ Dockerfile 注释里"正式镜像内容与以前完全一致"一句与改动矛盾，改为"test 阶段只用于收尾验证"。
+- **验证**：Windows 本地 `pytest -q` 369 passed（+2 新测试）；`docker build`（含 test 阶段 pytest，Python 3.12）通过。镜像 `flowlens:p1c-2f`（--target app）。
+
+### 2026-10-19 支线 P1c：256 MB 下的验证（S1/S4/S3/单核，WSL docker，同 P1b 核分配）
+
+- **S1（池 2w + 8MB 默认）**：验收标准 1 不满足。4 万档 95%、进 3 级；6 万起 4 级。主进程 CPU 在 4 万档仅 19.6%——**瓶颈是内存不是 CPU**：工作集 20 秒爬到 222 MiB > L3 线（256×0.78≈199.7 MiB）→ L3 收紧额度 → 拒绝。P1b §5（512 MiB）同样 ~220 MiB 不降级，差异纯在 L3 线位置（199.7 vs 399 MiB）。
+- **S4（全随机 30k/s ×10 分钟）**：验收标准 2 不满足。第 1 分钟进 3 级、45 秒进 4 级，9/10 分钟卡 4 级，接受率 10.7%。调整 4 的 trim 生效（累计回收 30 MiB、57 次）但收不掉存活数据——满载平台 ~213 MiB > L4 退出线 209.9 MiB。
+- **备选配置（P1c §二指示，不放宽标准）**：6 MB 在途无效（与 C3 结论一致：在途窗口不是瓶颈）；**1 worker 是池配置里最好的**（4/6 万 100% L0、8 万 98.8% L3），但仍 <9 万。
+- **池关（单进程）对照**：8 万档工作集 200.6 MiB 同样碰 L3 + 主进程 CPU 87%——**统计状态常驻内存 ~200 MiB 是 256 MB 下的真约束**，池把解析 CPU 搬走（主进程 CPU% 65→30 @6万）但省不掉统计状态内存，2 worker 还顶 ~50 MiB 把 2w 配置推过 L4 线、接受率反而最低。**"2×单进程 @256MB" 买不到**：池的 2× 收益只在内存有余量（512 MB，P1b §5）时兑现。
+- **S3（30k/s 长尾 ×5 分钟，与精确解比）**：池 1w 进 4 级、200 抽样全 503（无有效样本）；池关 200/200 有效——召回 1.000、落界 100%、去重 0.98%、p95 0.10% 与 T9b g3 参照一致，计数误差 0.35%/0.48%（参照 0.05%/0.09%，因本机 256 MB 下 30k/s 也进 L3、采样权重 2）。
+- **单核对照（标准 4）**：`--cpuset-cpus=0` + s1_measure 新增 `--pool auto`（不注入 env，让服务自动决定）→ 解析进程数 0、4/6 万 100% L0，与已提交版本单核一致。**标准 4 满足**。
+- **AI 方案被修正/踩坑**：① s1_measure 的 `--pool on` 会注入 `FLOWLENS_PARSE_WORKERS`，单核对照若用它会把"自动退回单进程"覆盖成"强制 3 worker"——初版命令用错了，改为加 auto 档。② S4/S3 用 experiments.py（自带监控逐秒采样 + 精确解），S1 用 s1_measure（严格串行、CPU 秒口径），两个 driver 各取所长，未合并。③ 一次后台 S1 被系统低内存保护杀掉，留下孤儿容器；重跑前先清容器。
+
+### 2026-10-19 支线 P1c：收尾（S2 记录、验收表、DESIGN_TODO、最终验证）
+
+- **S2 混合负载（仅报告）**：写入 42k/s（池 1w 最大可持续 6 万 × 70%）+ 各类查询 + 20 个 SSE，120 秒：查询 p99 50~95 ms（已提交版 160~173 ms，**明显降低达成**——块 10000 + 池分担解析后事件循环独占时间变短）；工作集峰值 208.6 MiB 瞬时碰 L3、写入接受 99.3%。结果入 P1-notes §6.12。
+- **验收结论（P1-notes §6 总结）**：标准 1（S1 ≥9 万、2×、0 级）**不满足**、标准 2（S4）不满足、标准 3（S3）部分（池关达参照、池开精度作废）、标准 4（单核退回）**满足**、标准 5（pytest + docker build）**满足**。核心发现：**256 MB 下主进程统计状态常驻 ~200 MiB 本身贴 L3 线**，池的 2× 收益与 256 MB 的内存余量互斥；256 MB 下池配置里 1 worker 最好（6 万 100% L0、8 万 98.8% L3），但达不到验收组合。
+- **设计文档待改项**：按惯例记入 `docs/DESIGN_TODO.md` 第 29~34 条（§3.2 进程池与单写者、§3.1 在途额度 8 MB/块 10000、§3.6 进 3/4 级立即 trim、§5 内存表按实测重写、§7 P1c 实验表、§8 吞吐取舍），DESIGN.md 本身未动（用户另行更新）。
+- **最终验证**：`pytest -q` **369 passed, 4 skipped, 9 deselected**；`pytest -q -m slow` **9 passed**；`docker build --target test`（WSL，Python 3.12 全量快测试）通过。基准：`bench_core 长尾` 约 **27.8 万/秒**（本机单次，历史区间 20 万~30 万内，与 P1 提交时的 29.9 万持平，未变慢）。
+- **被否决/修正**：无（收尾无新方案）。**待用户确认**：① 256 MB 下验收标准 1/2 不满足是否接受（是否按"1 worker 为 256 MB 下池配置最优、2× 仅在 512 MB 兑现"合并进 main）；② 补发邮件的内容口径。
+
+### 2026-10-20 支线 P2a：冲刺 20 万/秒第 1 步——诊断与准备（只诊断与工具，未改 flowlens/）
+
+- **主进程剖析（py-spy，A/B 两组，详见 docs/lanes/P2-notes.md §一）**：A（lane-c 池 3、16 MB、512 MB、12 万/秒）主进程 7.5 μs 口径的构成——池通信 23.5%（~1.76 μs，QueueFeederThread 13.5% + 池管理线程 9.4%，两线程抢走主进程 23% 的 GIL）、写入引擎 46.4%（Bloom 22.2% 最大头、各维度 14.5%、tick 15.7%）；B（已提交版本单进程、256 MB、5 万/秒，10.5 μs 口径）——解析侧 46.3%（解压+orjson+校验+归一化 41.8%）、写入引擎 35.9%。**"主进程那约 6 μs 是什么"有了答案：池通信 ~1.8 + tick ~1.2 + 写入细项（P1 的 2.5 没细拆的 intern/秒分组/入口/Bloom 哈希派生）~1.5 + HTTP/事件循环 ~1.1 + 饱和档排队 ~1.0**。aiohttp 访问日志未开启（AppRunner 未传 access_log）。
+- **压测工具快速模式（tools/loadgen.py --fast）**：每 worker 预生成 32 个请求体模板（dict 里直接写占位再 orjson.dumps，O(n)），发送前 bytes.replace 两个等宽占位（13 位 ts + 12 位 event_id 序号）。每条压测 CPU 从 55.0 μs 降到 **0.75~0.77 μs（~73 倍）**；本机 8 核上 30/40/50 万每秒全部 100% 达成、CPU 仅 7~14%。正确性：打真实服务 10 万/秒 ×25 s，deduped=late=invalid=0。
+- **msgspec 与正则基准（tools/bench_parse.py 新建）**：msgspec Struct(gc=False) 比 orjson+validate 快 **1.23×**（长尾 3.57→2.89 μs/条）、解析一批 5000 条内存峰值 11.1→1.96 MiB；正则一次 sub 做 ID 段替换比逐段 fullmatch 快 **2.33×**（1.84→0.79 μs/条），与 tests 参考实现 20054 条模糊检查 0 不一致。msgspec 是**诊断用依赖**（WSL venv `~/.venv-p2`），不进项目依赖。
+- **路线估计（P2-notes §4.5）**：路线一（512 MB+池）纯 Python 上限 ~16-18 万（砍池通信+tick），20 万需再砍写入引擎；路线二（256 MB 单进程）msgspec+正则后 ~9.2 μs/条 ≈ 11 万 CPU 上限，但内存墙（统计状态 ~200 MiB 贴 L3 线）先顶死，现实 ~7-9 万。**20 万的下一步杠杆是写入核心与统计状态的原生化**（与 P1 总结方向一致）。
+- **AI 方案被修正/踩坑**：① 模板生成初版对 800 KB 串逐条 `bytes.replace(...,1)` 找占位是 O(n²)（32×10000 条 ~13 分钟、8 worker 全卡死），改为 dict 内写占位一次 dumps（11.4 s）。② `deadline` 原先在模板生成前起算，~11 s 生成吃掉短 --duration 的发送窗口（sent=0），改为生成后起算。③ 占位串必须互不为子串（`999…`/`888…`），否则先后 replace 互相破坏。④ 收尾时 `pytest` 挂 `test_loadgen_503_retry_and_archive`：`_worker_async` 新增读 `cfg["fast"]` 而测试的 `_cfg()` 没带该键——在 `tests/test_tools.py` 的 `_cfg()` 里补 `fast=False, fast_templates=32`（对齐 argparse 接口），修复后 369 passed。
+- **验证**：Windows `pytest -q` **369 passed, 4 skipped, 9 deselected**（PYTHONHASHSEED=0）；`docker build --target test`（WSL，Python 3.12）通过。未触及 bounds/sketch/Dockerfile（无需 slow）；未触及服务热路径（flowlens/ 未改，未跑基准）。
+
+### 2026-10-20 支线 P2b：Bloom 去重提速与 tick 剖析（dedup.py 经用户批准解冻，本任务结束重冻）
+
+- **一（输出不变的提速，dedup.py）**：`check_and_set` 判"代是否就绪"改 numpy 数组比较（`_gen_ids[gen_ids%代数]==gen_ids`，替代逐条列表推导），0.077→0.004 μs/条。写位曾按指令改"按字下标排序 + reduceat 合并 + 一次 |="，实测（标准镜像 numpy 2.5.4、稳态一代 ~200 万 id、批 1 万）`bitwise_or.at` 2.35 ms/批 vs reduceat 13.98 ms/批——**at 快 5.96×**（本布隆填充率 ~6%、同一字碰撞少、reduceat 被 argsort 主导），故**保留 at**。输出不变部分由 `tests/test_dedup.py` 的改前参考实现 `RefBloom` 对照守护（批内/跨批/跨代/未就绪代/轮换清空，k=6 与 k=12 各跑，每步比对 dup/active 与每代 words/n/代号）。
+- **二（减少 k，改变误判率，dedup.py + config 经 dedup 的 BloomConfig）**：`BloomConfig` 加 `k: int|None = 6`（None 按公式=12 行为不变、整数直接取用）。实测（`tools/bench_bloom.py`，per_gen 200 万、写满一代后查 100 万未写入 id）：k=12 0.030%/1.33 μs、k=8 0.044%/0.88、k=6 0.075%/0.66、k=4 0.197%/0.45。"误判率 ≤0.1%"下 **k=6 耗时最低**（比 k=12 省 0.676 μs/条、~51%）。设计文档 §3.1/§4 待更新（DESIGN_TODO 第 35 条）。
+- **三（tick 剖析，只诊断，未改 flowlens/）**：`tools/bench_tick.py`（FakeClock 驱动 Engine、运行时包装计时细分子步骤）。**关键发现：tick ~65-85 ms/s、不随吞吐涨**（长尾/随机 × 5/12/20 万，50k→200k 略降，噪声内）——修正 P2a"tick 随吞吐涨 40→141 ms"（那是饱和事件循环里 tick 与写路径重叠/排队的假象）。最大子项：定稿 CMS 入层（_Builder.accept，~26-36 ms，冻结 segtree.py）、快照 TopK（bounds.top_k，~18-27 ms，冻结 bounds.py）、组装时间片（~20 ms，engine.py）。建议：CMS 入层改"仅新增候选才重估"或按秒分摊、快照增量合并（缓存冻结历史段 top_k）、组装 Part 跨秒缓存；标注了哪些涉及冻结模块。
+- **四（端到端，s1_measure --fast，池 3、块 10000、两额度 16 MB、512 MB）**：before/after 各跑 12/16/20/24 万。主进程每条 μs 全档降、降幅随档位增大：12 万 5.26→4.87、16 万 5.31→4.96、20 万 5.71→4.92（20 万档降级 1→0、拒写消失）、24 万 6.55→5.18（发送达成 79.5%→96.7%）。20 万档 Δ=0.79 μs 与 bench_bloom 的 k（0.676）+判代（0.073）合计 ~0.75 量级自洽。py-spy 前后对照（12 万、容器内 root 采样）：**Bloom 占比 26.1%→16.1%**（降 10 个百分点），主进程 62%→53% CPU。
+- **AI 方案被修正/踩坑**：① 指令的 reduceat 写位方案实测更慢（5.96×），否决并保留 at（已在 dedup.py 注释与 P2-notes 写明原因）。② py-spy 原方案（P2a）在 WSL 宿主跑、需 sudo 密码；本任务改为**py-spy 在容器内以 root 运行**（`docker exec --user root`、容器 `--cap-add SYS_PTRACE`、主进程 pid=1，二进制从挂载的 venv 读入），免宿主 sudo 密码，口径同 P2a（tools/exp/p2b_pyspy_incontainer.sh）。③ 端到端 before/after 用 P2a 快速模式，主进程远未饱和（12 万档 42.5% CPU），故 before 基线 5.26 μs 比 P2a §1.1 的 7.52 μs（原模式压测、主进程 79.9% CPU）低——P2-notes 已注明口径差异，before/after 同用快速模式，delta 才是干净收益。
+- **验证**：Windows `pytest -q` **370 passed, 4 skipped, 9 deselected**（PYTHONHASHSEED=0，含新等价性测试）；`pytest -q -m slow` **9 passed**；`docker build --target test`（WSL，Python 3.12 全量快测试）通过；`bench_core 长尾` ~27.7 万/条（稳定读 277-281k，与 P1c 的 27.8 万持平、未变慢——首次 230k 为冷启动，3× 取中位 277k）。dedup.py 本任务结束重新冻结（PROGRESS"已定的决策"lane-c P2b）。
+
+### 2026-10-20 支线 P2c：验证每秒 20 万条，并用快速压测重测 256 MB（只验证、未改 flowlens/）
+
+- **一（512 MB、20 万/秒 ×10 分钟 + 停发 60s，A512 池 3/两额度 16 MB）**：用 `experiments.py SUST --fast --svc-mem 512m --sust-rate 200000 --sust-sec 600`（新增 `--svc-mem`/`--sust-rate`/`--sust-sec`，SUST 的 loadgen 走快速模式）。**不满足"20 万稳定达成"**：负载段第 0 级 416s/第 1 级 128s/第 2 级 56s（标准"第 1 级 ≤10s"不达标）、接受率 99.77%（≥99.5% 达标）、0.22% 拒绝（loadgen 503 重试耗尽 23 万条、healthz raw 5362+ingest 915）。工作集随 600s 保留期填满 141→**345 MiB**（P2b 的 20s 档只 257 MiB/0 级，差别在保留期填满）；瓶颈是 **CPU 饱和（主进程打满 1 核）→ 写路径排队、在途额度占用率升高（第 1/2 级由 occupancy 触发）**，不是 512 MB 内存墙（工作集 345 MiB 未过 L3 线 400，第 3/4 级未触发）。真实可持续 ≈**18.7 万/秒**（loadgen 背压压到 19 万发送、再扣拒绝）。停发 ~20s 回落 345→272 MiB。
+- **二（查询延迟，A512，`S2 --fast --s2-rate`）**：`run_s2` 加 `--s2-rate` 直接指定写入速率（14 万/20 万，S2_WRITE_FRAC 的 70% 推算被覆盖）。**p99<50ms 不满足**：14 万 topk_default 78/topk_replay 73/stats 59 ms；20 万 102/109/85 ms。p50 仅 2-13 ms（快照快），p99 尾是单事件循环查询排队（写块+tick 独占段），与 T11a-2 一致。SSE 两组 0 错误、1430 帧。
+- **三（精度，A512 原模式 3 万/秒×5 分钟 S3 + 精确解，200 区间）**：200/200 全 valid（degraded/rejected 0）、召回 1.000（两维）、计数误差 0.028%/0.045%、落界 100%、HLL 去重 0.979%（F1 参照 0.92%，HLL p=14 标准误差 0.81% 的 ~1.2σ 内）、p95 0.097%（参照 0.14%）。**k=6 的 Bloom 未损害精度**（只影响去重误判率）。
+- **四（256 MB 快速压测重测，S256/L256-0/L256-1/L256-2）**：`s1_measure --fast --stop-below 0.9`（新增 `--stop-below`）。**池在 256 MB 反而更差**：L256-1（池 1）10 万进 L3（202 MiB，worker 常驻挤余量）、L256-2（池 2）4 万 L3/8 万 L4（两 worker 顶 ~50-80 MiB 过 L4 线）。**lane-c 最佳 = L256-0（单进程 k=6）：10 万 100%/L0/175 MiB**（比 S256 的 194 低 19 MiB）。10 分钟长跑（`SUST --fast --sust-sec 600`，按指令进 L3 降一档重跑 10 万→8 万）：**256 MB 存在"保留期内存墙"**——保留期填满工作集 ~220-236 MiB 必进 L3；L256-0 8 万 L3 采样/100% 接受/0 拒写是"不拒写"上限，S256 8 万 L4 拒写 0.1%。
+- **五（单核对照，`--cpuset-cpus=0` + `--pool auto`）**：解析进程数 0（`resolve_worker_count` 1 核返回 0）、4/6 万 100%/L0，与 L256-0 一致。**单核退回单进程验证通过**。
+- **AI 方案被修正/踩坑**：① 初版 `run_sustained` 的 per_minute 接受率恒 0（`_monitor` 采样没有 accepted/sent 字段，`s.get("accepted",0)` 恒 0）——改用 `merge_timeline(samples, lg_seconds)` 的逐秒行取数；② per_minute 原用"±1s 分钟标记窗"（`sec-1<=t<=sec+1`），改**真分钟窗** `[t0+m*60, t0+(m+1)*60)` 并加主进程 CPU 秒/每条 μs（按逐秒 `procs` cpu_pct × 间隔积分）；③ argparse help 里 `%` 必须写 `%%`（否则 `_expand_help` 抛 ValueError）；④ WSL nohup 后台进程随会话回收被杀、留孤儿容器——改用 harness 的 run_in_background（跨 turn 存活、结束通知），首次 10 分钟长跑被系统低内存保护 reap（容器孤儿已清），重跑成功；⑤ WSL2 宿主 9000-9003 段 bind 报 98（保留段、无可见监听），实验改端口 12345；⑥ `flowlens:submitted` 的 `/healthz` 无 `raw_rejected`/`ingest_rejected`（P1 才加的诊断字段），S256 拒绝数从 loadgen 侧取。
+- **验证**：Windows `tests/test_experiments.py`+`tests/test_tools.py` **25 passed**（PYTHONHASHSEED=0）；未触及热路径与 bounds/sketch/heavy（未跑 slow、未跑性能基准，见汇报）；`docker build --target test`（Python 3.12 全量快测）372 passed, 2 skipped, 9 deselected。
+- **P2c 汇报用户确认（2026-10-20）与收尾改正**：① 接受"20 万/秒 = 短时（≤20 s）能力、10 分钟级约 18.7 万/秒"；用户指出降级原因是**主进程 CPU 饱和导致在途额度占用升高，不是内存**——与本任务实测一致（工作集 345 MiB 未过 512 MB 的 L3 线 400，第 1/2 级由 occupancy 触发、第 3/4 级由内存触发未到达）。据此改正了汇报与笔记中的两处问题：a)"187 万/秒"系"18.7 万/秒"笔误，共 8 处（P2-notes 2、PROGRESS 5、AI_LOG 1），同句"190 万发送"系"19 万"笔误一并改正 3 处（三个文件各 1），b)"保留期内存上涨叠加"的归因表述改为"CPU 饱和→在途额度占用升高"（保留期内存涨到 345 MiB 仍是事实、但它是 256 MB 内存墙的依据、不是 512 MB 降级的原因）。② 查询 p99 < 50 ms 列为下一任务（P3）验收目标。③ **lane-c 暂不合并**：合并前置条件 = 进程数决策须同时依据核数与 cgroup 内存上限，内存上限 < ~384 MB 自动退回单进程（当前只在核数 ≥ 2 时开池，评测环境 256 MB 多核会误开池）。④⑤ 环境备注与未跑项无异议。以上确认记入 PROGRESS"已定的决策"lane-c P2c 小节与"下一步"、P2-notes 第六节。
+
+### 2026-10-20 支线 P2d-1：前端进程架构（进程模型、写入通道、转发）
+
+- **落地内容**：把"HTTP 接入 + 解析"从引擎（单写者主进程）挪到 n 个前端进程（SO_REUSEPORT 共享 8080），引擎只保留去重、写统计结构、tick、降级、内部 HTTP（只在 Unix 套接字）。新增 `flowlens/supervisor.py`（前端数计算 `resolve_front_count` + 共享状态 `SharedState`/`SlotAdmission`/`RawSlotAdmission`/`FrontsBudgetView`/`DegradeView` + `FrontSupervisor`）、`flowlens/ipc.py`（写入通道消息格式 `<IB` 头 + pickle5、`WireBatch` 只传批内不重复字符串 + 下标数组）、`flowlens/frontend.py`（前端进程：SO_REUSEPORT TCPSite、POST /v1/ingest 本地解析后发引擎、其余原样转发 Unix 内部 HTTP、`EngineConnection` 按 req_id 关联 ACK）；改动 `ingest.py`（`write_parsed` 抽取）、`api/app.py`（`fronts=` 视图替换 admission/raw_budget）、`__main__.py`（双模式启动、`FLOWLENS_TEST_MEM` 注入）、`parse_pool.py`（删 `ParsePool`/`FLOWLENS_PARSE_WORKERS`，留 `ParsedBatch`/`parse_body`/`available_cpus`）。
+- **AI 方案被修正/否决**：① 参考代码骨架 `create_front_app` 放普通 `SlotAdmission`（limit 恒为 raw_normal），会让"第 3 级收紧原始体额度"在前端模式不生效——**补了 `RawSlotAdmission`**（limit 随共享 tight 标志现读现选），否决了骨架的恒值写法；② `SlotAdmission` 的 rejected 镜像参考代码给两选一，**选"改属性 + setter"**（`_ingest_expect` 发请求体前拒绝走不到 handler 的 finally，只有 setter 能镜像）；③ 参考代码"需要确认"的 `reject_ingest` 条件实测确认为 `level >= 4`、`IngestResult` 字段顺序确认为 `(accepted, deduped, late, invalid)`，均与假设一致；④ 405（路径对方法错）实测 aiohttp 3.14 会落到 catch-all 转发、由引擎回 405，**前端无需显式注册 405/404**。
+- **第 7 节性能（512 MB、3 前端、两额度各 16 MB、快速压测四档，对照 P2b 四进程池）**：引擎每条 μs 全档**近乎减半**（12 万 4.87→2.61、24 万 5.18→3.18）、引擎 CPU% 全档降（24 万 73.5%→54.5%）、**24 万档降级消失**（进程池 L1 拒 37/220、发送塌陷 96.7% → 前端 0 拒、100% 发送、99.98% 接受、全程 0 级）；前端合计 CPU%（51~110%）与进程池解析 worker 相当（总计算量没减少，收益在"引擎更轻、离 CPU 饱和更远"）；工作集峰值比进程池高 ~56-60 MiB（每前端是完整 aiohttp HTTP 服务、常驻 ~30 MiB ×3）。空闲：引擎 RssAnon 71.6 MiB、每前端 ~30.6 MiB。
+- **踩坑（结果丢失重跑）**：本节最初一次压测**未留任何结果**——S7 脚本里 `s1_measure.py` 漏了必填的 `--out` 参数（argparse 直接 SystemExit）、且脚本混用 `/d/dhy/...`（`mkdir`）与 `/mnt/d/dhy/...`（重定向）两套路径导致 `s7_load.log` 没落盘（`results/p2d1/` 为空、后台任务 ~1 分钟即"完成"、原会话随即因 API 错误中断，`tail` 该日志报 No such file）。本收尾把 `--out` 补上、路径统一为 `/mnt/d/...` 重跑，结果落 `results/p2d1/s7_fronts3.json` + `s7_idle.json`（WSL 宿主 load 0.00 空闲时跑，避免宿主负载污染）。
+- **验证**：Windows `pytest -q` **412 passed, 12 skipped, 9 deselected**（12 skipped = 前端模式 e2e，需 Linux）；`pytest -q -m slow`（`__main__.py` 改动，必须跑）**9 passed**（114 s）；`docker build --target test`（Python 3.12 全量快测）通过。
+
+### 2026-10-21 支线 P2d-2：快照广播 + 前端直接回答默认窗口查询 + 前端分块解析
+
+- **落地内容**：① 快照广播（`Engine.on_snapshot` 回调，refresh_snapshot 与 async 两处赋值后调用；`ipc.MSG_SNAPSHOT` + `pack_msg` 一次序列化整帧；`hub.SnapshotHub` 只留最新帧、新连接补发；`SharedState` 增 degraded/sample_weight/mem_bytes；前端 `EngineConnection` 读循环收快照存 `FrontState`）；② 前端回答默认窗口查询（`_front_topk`/`_front_stats`，`fresh_snapshot()` 3 秒新鲜性 + `is_snapshot_query`，否则转发；参数解析与引擎同一份 `QueryParams.from_request`；响应用引擎同组的纯函数 `topk_from_snapshot`/`stats_from_snapshot`/`stats_body`/`topk_data` 生成，逐字节一致）；③ 前端分块解析（`parse_chunks` 每 1000 条一块、块间 `await asyncio.sleep(0)`，`concat_parsed` 拼回，与 `parse_body` 逐项等价）；④ `FLOWLENS_TEST_MEM` 只在 `FLOWLENS_DEBUG=1` 时生效（否则警告并忽略）。
+- **AI 方案被修正/否决**：① 参考代码 2.3 要求"降级级别变化时立即写 degraded 与 sample_weight"，但第六节实现里 `on_change` 只写了 `shared.level`——前端回答查询读的 `shared.degraded`/`shared.sample_weight` 只有快照回调（每秒一次）更新，级别变化后最多 1 秒内前端用**陈旧的 degraded** 回答（e2e 第 3 个用例失败的真实根因）。**补**：`on_change` 里补写这两值（从控制器现读，与 on_snapshot 同口径）。② "需要确认"的 sample_weight：确认**不是**只随级别变——`degrade.py` 的 sample_weight 属性为"占用率>0.95→4、第 2 级起→2、其余 1"，同一级别内也会随占用率在 1/2/4 切换，故按参考代码取"每次快照回调写一次（最多晚 1 秒）"+ on_change 立即写。
+- **第六节 3 个 e2e 用例 Linux 首跑失败（前一会话误报"docker 通过"，实为 API 中断后误判）**，全为测试代码问题：① `_body_without_mem` 对 dict 调 `.decode`（AttributeError）+ 一致性对照用 `_unix_http` 直连引擎本身就给引擎计数 +6/+1，致"计数不增"断言结构性不可能成立——改为**先**纯前端查询+计数断言、**再**前端 vs 引擎直连对照（其后重取计数基准）；② 转发对照对 `/v1/stats` 断言 `outf["k"]`（stats 无 k 字段）——改为仅 topk 断言 k/by；③ `test_mem="208037478,268435456"`=0.775×256MB **低于第 3 级进入线 0.78**（209379656 B），引擎进不了第 3 级——改 0.84×256MB（225485784 B）。顺带修既有 flaky `test_fronts_local_default_matches_single_process`：逐 key 断言两独立服务 top-10 相同，但冷键 count=1 并列、名次可不同——改为断言**计数分布**逐项相同 + hot 键（各 300 次无并列）key+count 两边都存在。
+- **第七节性能（512 MB、3 前端、两额度各 16 MB、快速压测）**：**默认窗口 topk+stats 的 p99 目标（<50 ms）达成**——20 万/秒写入下默认 topk p99 **20.3 ms**、默认 stats p99 **15.5 ms**（`tools/exp/p2d2_default_probe.py` 先用 /healthz 增量确认写入确 200000/s 再采样），比 P2c 单进程池的 102 ms 降 ~4 倍。S2 14/20 万 ×120 s：topk_default p99 **29.5/29.5 ms**（P2c 78.1/101.8）；topk_replay 与随机窗口 stats（**转发引擎、本任务不优化**）p99 71/112 与 77/122 ms，与 P2c 同量级（如实报告）。s1 20 万×20 s：us/ev **2.71**（P2d-1 2.99，分块解析不影响引擎）。写入侧全程 0 级 0 拒写。
+- **踩坑（性能测量）**：① WSL 无 buildx（legacy builder），`--target app` 会构建**全部** stage（含 test 的 `RUN pytest -q`），test 失败即 app 建不出来——改用 `docker build .`（app 为最后 stage=默认目标）。② 默认窗口 stats 的专测一开始用 shell 后台 `taskset loadgen &` + 读其 stdout，但 WSL 下 loadgen 输出不落到重定向文件、且快速模式预生成模板要 ~12 s（之前无流量），两次测出"假低值"（实为空转服务）——改为 Python 内 `subprocess` 起 loadgen + **用 /healthz 的 events_ingested 增量确认写入确 200000/s 之后**才采样，否则 ABORT。③ conda 环境 `flowlens_env` 的 editable 安装指向主仓 `D:\dhy\code\flowlens`（非本 worktree），Windows 上 pytest 须 `PYTHONPATH=D:\dhy\code\flowlens-c` 才测到 worktree 代码。
+- **验证**：`docker build --target test`（WSL，Python 3.12 全量快测）**485 passed, 2 skipped, 9 deselected**（修复前 3 failed/483 passed）；Windows `pytest -q` **470 passed, 17 skipped, 9 deselected**（PYTHONHASHSEED=0、PYTHONPATH=worktree）、`pytest -q -m slow` **9 passed**。
+- **用户确认（2026-10-21，P2d-2 审查通过）**：① 回放查询本任务不优化、p99 未降**符合预期**，回放查询 p99 留 **P2d-3** 进一步测量（正常负载 3 万/10 万每秒的 p99 + 写入块 10000 vs 5000 对比）再定文档表述；② 保留"专测默认窗口 stats"的做法（S2 的 stats 行是随机 10~60s 窗口、非默认 stats）；③ 环境坑（conda editable 指向主仓、WSL legacy builder）已知悉。
+
+### 2026-10-21 支线 P2d-3（进行中）：前端进程架构的完整验证
+
+- **零（工具小改动，已随 04d9431 提交）**：FLOWLENS_PARSE_WORKERS/--pool 全部清理为 FLOWLENS_FRONTENDS；每次实验从 docker logs 核对"前端数 N（原因）"；SUST/S2 每分钟行加前端合计 CPU%（沿用 s1_measure 按父进程号识别前端、排除 resource_tracker）；FLOWLENS_TEST_MEM 处同设 FLOWLENS_DEBUG=1；`ingest.py` POOLED_CHUNK_EVENTS 支持 FLOWLENS_POOLED_CHUNK_EVENTS 覆盖（默认 10000，非法值回退并警告，含测试）。
+- **二.3 的探针（第零节"唯一服务代码改动"之外的第二处，二.3 明确授权）**：`flowlens/loop_probe.py`——仅 FLOWLENS_DEBUG=1 时每 100 ms 调度小任务记事件循环延迟、每分钟 p50/p99/max + 最长 5 次；Ticker 把 advance 与 refresh_snapshot_async 各自耗时喂给 `record_tick` 供对齐。未启用时零任务零开销；接线在 `api/app.py`（loop_probe 键、启停）与 `__main__.py`（两种模式都注入）。
+- **一（512 MB、3 前端、20 万/秒 ×10 分钟 + 停发 60s，快速长尾）**：`tools/exp/p2d3_s1_sust.sh`（`--no-build`，镜像 flowlens:p2d3）。**三项判定全部满足**：第 1 级仅 4 s（t≈388-392 s，其余 0 级，≤10 s 标准）、接受率 100%（1.2 亿/1.2 亿）、拒绝可忽略（inflight_rejected 53、raw_rejected 0）。工作集 185.7→379.0 MiB 峰（未过 400 的 L3 线），停发 +1 s 回 317.5。引擎每条 μs 2.8~3.9（P2c 4.4~6.1）：解析搬前端后引擎不再持续饱和（CPU 峰 96.5%、无 128 s 的 L1），**P2c 不达标是主进程 CPU 饱和→在途占用升高的连带效应，前端架构消掉了**。工作集峰比 P2c 高 34 MiB（每前端常驻 ~30 MiB×3，与 P2d-1 一致）。
+- **踩坑**：① SUST 首跑（上一会话）`read_front_count` 用 `_run` 只捕 stdout，容器 stderr 里的"前端数"行读不到——experiments.py 加 `_docker_logs`（stderr=STDOUT 合并）+ 重试 10×0.5 s；② 上一会话在记录第一节时 API 中断，本次续上（数据在 results/p2d3/20261021_101558 完整）。
+- **二.1（四类查询 × 4 写入速率，每档 120 s、新容器）**：`tools/exp/p2d3_query_probe.py`（WSL nohup 脱离会话跑，逐档增量写盘）。**默认窗口（前端本地答）20 万/秒 p99 34.8/34.9 ms < 50 ms**（80 q/s + 20 SSE 混合负载；P2d-2 40/s 专测口径 20.3/15.5）；对照 P2c 单进程池 14/20 万 78/102 ms，降 ~3 倍。**回放 p99 最低档（3 万/秒）即 56.7/58.6 ms，未在任何档位 < 50 ms**——尾不主要来自写入速率（3 万档引擎 CPU 仅 21.7%，p99 与 10 万档差距不大），来自事件循环被定稿/tick/写块占用（二.3 探针直接测）。四档 0 级 0 raw 拒绝。
+- **踩坑（loadgen 孤儿 worker，已修）**：probe 脚本 `lg.terminate()` 只杀 loadgen 主进程，spawn 的 daemon worker 被 reparent 到 init 继续活着、且往读端已死的多进程队列 put() 永不返回 → 4 档共漏 22 个、~10 GB RSS 顶满 WSL swap（CPU 空转不占，用户以 top/ps 查实）。修：loadgen 以 `start_new_session=True` 起，停时对**进程组** killpg SIGTERM→宽限→SIGKILL（`stop_loadgen`，两个 probe 脚本同款）。s1_measure/experiments.py 用 `await proc.wait()` 自然跑完、worker 先退、从不留孤儿，不受影响。
+- **二.2（块 10000 vs 5000，20 万/秒 ×120 s，FLOWLENS_POOLED_CHUNK_EVENTS）**：块 5000 把回放 p99 从 108.4/114.4 ms 降到 94.7/96.6 ms（−12.7%/−15.6%），**未达"降低 20% 以上"**；引擎 CPU 72.3% 略高于 70%（块 10000 70.3%）。**"用块 5000 重跑第一节 10 分钟长测"条件未触发**（降 ≥20% 且 CPU <70% 且全程 0 级），不重跑，默认块 10000 不变。默认窗口 p99 块 5000 也略降（34.8/40.3 → 29.6/25.7 ms，同向、幅度同量级）。
+- **二.3 首跑发现探针测量缺陷（已修、镜像重建中）**：首跑探针 p50=28μs/p99=4.7ms，与 tick 分解（advance 定稿 p50 35ms/拍、快照 p50 50ms/拍）**自相矛盾**——wait_for(timeout) 睡到点的定时器回调在长代码阻塞期间无法返回，"计划时刻"取在解除阻塞之后，最长阻塞段被漏掉。改 `loop.call_at` 把小任务锚定到预定时刻（阻塞期间回调被延后，差值即真实独占延迟）。同批补：record_tick 改传 **tick 开始时刻**（原取在 tick 结束后且解析器丢了时间戳，无法归因）；ingest.py 加 FLOWLENS_DEBUG=1 门控的写入块耗时日志（生产零开销，直接读环境变量避免 api→app→ingest 循环导入）；解析器保留 tick 时间戳 + 写入块行、按时间窗把最长几次延迟归因"tick（定稿/快照）/写入块/其他"。
+- **二.3（事件循环探针重跑，20 万/秒 ×240 s，FLOWLENS_DEBUG=1）**：修正测量缺陷后数据自洽——全程 **p50 1.26 ms / p99 37.3 ms / max 46.7 ms**。归因（tick 开始时刻 + 写入块时刻对齐）：top5 最长延迟 = 3 次 tick（定稿 45~74ms + 快照 50~77ms，合计独占 85~130ms/拍）+ 2 次写入路径区域（块 ingest_parsed p50 9.0 / p99 18.1 / max 38.9ms，~40 块/s）。tick 随保留期填满变长（分钟 max 28.4→46.7ms 递增）。**结论：回放 p99 134.9ms ≈ 2~3 个连续独占段排队（p50 才 25.6ms）；降回放 p99 的大头是 tick 独占段（定稿+快照每秒 85~130ms 同步），不是写入块（块 5000 只降 ~15%）**。
+- **踩坑（WSL2 VM 被宿主回收，2 次）**：构建/实验进行中断了 2 次，journal 显示干净关机（无 OOM/panic），Windows 事件日志无对应关机事件 → 宿主内存压力回收 WSL2 VM（宿主 14.8GB 已提交 18.9GB 吃页文件）。已建议用户在 .wslconfig 加 memory=5GB 钉住 VM。教训已落实：长实验 nohup 在 WSL 内 + 逐档/逐分钟落盘，断掉可重跑不丢数据。
+- **三（精度，512m/3 前端、原压测模式长尾 3 万/秒 ×5 分钟，200 区间抽验）**：200/200 valid、100% 接受、全程 0 级。Top-K 两维召回 1.000、计数误差（均值/区间最大）url 0.028%/0.185%、user 0.042%/0.231%、落界率两维 100%、HLL 去重 0.984%、p95 0.097%——**与 P2c/F1 一致，前端架构不退步**。
+- **四（攻击流量，512m/3 前端、原压测模式全随机 3 万/秒 ×10 分钟）**：工作集随保留期填满涨到平台 **371~391 MiB 后封顶**（m8 391.1，不再随事件数涨），**低于 512 MB 的 L3 线 400 MiB → 全程 0 级、100% 接受**（对比 256 MB 的 P1c 6.7/C3：平台 208~234 MiB 压过 L3/L4 线 → 4 级拒写、接受 10.7%/86.3%）。停发 +1 s 回 333 MiB。**判读：攻击内存"有界"行为 256/512 MB 一致（保留期封顶），差别只在平台位置 vs 降级阈值**。AI 分析未修改：分钟表直接取 experiments.py 的 `per_minute`（官方口径），未手搓。
+- **五（256 MB 自动退回）**：不注入 FLOWLENS_FRONTENDS → docker logs 核对"前端数 0（内存上限 256 MB < 384 MB）"。S1 爬坡 4/6/8/10/12/14 万：4~8 万 L0、10 万起 L3、14 万接受 0.9227。**10 万档首跑工作集 200.7 MiB 恰在 L3 线（0.78×256=200.7）上而进 L3——补跑一档（4→10 万、新容器）10 万 183.5 MiB/L0，确认是单容器串行爬坡"前档数据仍在 600 s 保留期、工作集贴 L3 线"的运行间抖动，非回退**。8 万 ×10 分钟长测：工作集峰 **215.0**（P2c L256-0 @8 万 221.4）、L3（+232 s 起）、100% 接受、0 拒写（inflight 129 全重试成功）——**不退步**。
+- **六（单核 512 MB）**：`--cpuset-cpus=0` → 每档前端进程数 0（s1_measure 自动模式只记录前端进程数、不断言原因；核数=1 走"可用核数 < 2"分支）。4/6 万两档 100% 接受（4 万档 1 次瞬态 inflight 拒、重试成功）、工作集 164/159 MiB 与 P2c 单核同量级。**单核自动退回单进程路径验证通过**。
+- **七（边界用例）**：tools/selftest.py 19 例，在第一节配置（512m/3 前端，logs 核对"前端数 3（FLOWLENS_FRONTENDS=3）"）与第五节配置（256m/自动→0 前端）下各跑一遍，**均 19/19 通过**——前端架构不改变对外 API 边界行为。
+- **八（收尾）**：① 最终结论表（8.2）补了 256 MB 单进程的查询 p99 一行——`p2d3_query_probe.py` 加 `--mem` 与 `--fronts auto`（不注入 FLOWLENS_FRONTENDS，只记录不断言前端数），256m/自动/8 万/秒 ×120 s 实测：前端数 0（日志核对）、四类查询 p99 87.7/87.6/89.1/88.8 ms（单进程无前端本地答，默认窗口与回放同量级，全排在写块后）、accept 99.64%、L3（80 q/s 查询负载叠加）。② `docker build --target test`（最终代码，Python 3.12）**497 passed, 2 skipped, 9 deselected**。③ 提交并推送 lane-c。
+- **P2d-3 总结论**：五项验收全部达成（512 MB 20 万/秒 10 分钟稳定、默认窗口 p99 34.8/34.9 ms < 50、精度与 P2c/F1 一致、256 MB 自动退回不退步、攻击流量内存有界）；回放查询 p99 在任何速率下 ≥56.7 ms，二.3 探针证据指认 tick 独占段（85~130 ms/秒）为降回放 p99 的大头，已列入"需要确认"（P3 方向）。

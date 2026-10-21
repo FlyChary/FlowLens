@@ -31,6 +31,7 @@ _read_raw_body 里 try_reserve、finally release，预算借还是单一 owner�
 
 import asyncio
 import logging
+import os
 from typing import Callable
 
 import orjson
@@ -43,8 +44,9 @@ from ..errors import FlowLensError, Overloaded, PayloadTooLarge
 from ..ingest import Admission, IngestService
 from ..memstat import memory_bytes, memory_current_bytes, memory_limit_bytes
 from ..model import clear_norm_cache
-from ..query import QueryService
-from ..ticker import Ticker
+from ..query import QueryService, StatsAnswer
+from ..ticker import Ticker, malloc_trim
+from ..supervisor import FrontsBudgetView
 from . import debug
 from .params import QueryParams
 from .stream import (DEFAULT_HEARTBEAT_SEC, DEFAULT_MAX_GROUPS,
@@ -56,8 +58,24 @@ log = logging.getLogger(__name__)
 
 # 单个请求体（原始、压缩后）上限：超过直接 413
 MAX_RAW_BODY_BYTES = 4 * 1024 * 1024
-# RawBudget 总上限：所有正在读取/持有的原始请求体字节数之和
-RAW_BUDGET_LIMIT = 8 * 1024 * 1024
+# RawBudget 总上限：所有正在读取/持有的原始请求体字节数之和。P1 诊断：可用
+# FLOWLENS_RAW_BUDGET_BYTES 环境变量覆盖（进程池开启后在途解析增多，需要更大原始额度）；
+# 缺省/非法/非正数退回默认 8 MB。
+DEFAULT_RAW_BUDGET_LIMIT = 8 * 1024 * 1024
+
+
+def _read_raw_budget_limit() -> int:
+    raw = os.environ.get("FLOWLENS_RAW_BUDGET_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_RAW_BUDGET_LIMIT
+    try:
+        v = int(raw)
+    except ValueError:
+        return DEFAULT_RAW_BUDGET_LIMIT
+    return v if v > 0 else DEFAULT_RAW_BUDGET_LIMIT
+
+
+RAW_BUDGET_LIMIT = _read_raw_budget_limit()
 # 第 3 级降级（收紧内存）时的上限：Admission 由 4 MB 降到 2 MB，RawBudget 由 8 MB 降到 4 MB
 TIGHT_ADMISSION_LIMIT = 2 * 1024 * 1024
 TIGHT_RAW_BUDGET_LIMIT = 4 * 1024 * 1024
@@ -74,6 +92,15 @@ ticker_task_key = web.AppKey("ticker_task", asyncio.Task)
 stream_manager_key = web.AppKey("stream_manager", StreamManager)
 degrade_controller_key = web.AppKey("degrade_controller", DegradeController)
 memory_reader_key = web.AppKey("memory_reader", Callable)
+# 引擎侧查询计数（P2d-2 六）：_topk / _stats 每请求 +1，/debug/info 读（验证
+# "前端模式默认窗口查询由前端本地回答、不经过引擎"）。普通 dict 计数，单写者
+# （事件循环），无锁。
+query_counter_key = web.AppKey("query_counter", dict)
+# 事件循环延迟探针（P2d-3 二.3，FLOWLENS_DEBUG=1 时启用；None 表示未启用）
+loop_probe_key = web.AppKey("loop_probe", object)
+# 前端模式下内部 Unix 套接字的路径（/debug/info 报给测试直连引擎用）；
+# 单进程模式没有（不设）
+query_sock_key = web.AppKey("query_sock", str)
 
 
 def _default_memory_reader() -> tuple[int, int | None]:
@@ -88,15 +115,31 @@ def _default_memory_current_reader() -> int:
 
 def create_app(engine: Engine, ingest_service: IngestService,
                query_service: QueryService, *, tick_period: float = 1.0,
-               memory_reader: Callable[[], tuple[int, int | None]] | None = None
+               memory_reader: Callable[[], tuple[int, int | None]] | None = None,
+               fronts=None,
+               loop_probe=None
                ) -> web.Application:
     # client_max_size=0（不限制）：4 MB 上限由 _read_raw_body 自己执行，
     # 否则 aiohttp 会在 handler 之前以自己的 413 拒绝，RawBudget 预留就没机会了
     app = web.Application(client_max_size=0, middlewares=[_error_middleware])
     app[ingest_service_key] = ingest_service
     app[query_service_key] = query_service
-    # RawBudget 由 app 持有（create_app 的参数形式保持不变）
-    app[raw_budget_key] = Admission(limit=RAW_BUDGET_LIMIT)
+    # 额度（在途 admission 与 RawBudget）。单进程模式：各一个本地 Admission。
+    # 前端模式（fronts 非 None）：换成 FrontsBudgetView——把各前端写在共享数组里的
+    # 占用/拒绝汇总成一个"Admission 的样子"。在途视图替换 ingest_service.admission
+    # （Ticker 的 occupancy 与 _healthz 的 ingest_rejected 都读它，即各前端合计）；
+    # RawBudget 视图放 raw_budget_key（_healthz 的 raw_rejected 读它）。两者共用的
+    # 降级副作用（第 3 级收紧）：_make_degrade_change_hook 设 admission.limit 时，
+    # 视图只翻转共享的 tight 标志，实际每前端额度由各前端自行选择。
+    if fronts is not None:
+        app[raw_budget_key] = FrontsBudgetView(
+            fronts, fronts.raw_pending, fronts.raw_rejected,
+            fronts.raw_total, fronts.raw_tight_total)
+        ingest_service.admission = FrontsBudgetView(
+            fronts, fronts.pending, fronts.ingest_rejected,
+            fronts.adm_total, fronts.adm_tight_total)
+    else:
+        app[raw_budget_key] = Admission(limit=RAW_BUDGET_LIMIT)
     # 降级控制器（T8）：挂在 app 上，并与 engine（采样权重）和 query_service
     # （暂停回放）共享同一个实例——否则 engine 的采样与 query 的暂停各看各的级别，
     # 而"占用率触发第 1 级"这类只有 app 层才喂得进来的状态两边会不一致。
@@ -108,6 +151,8 @@ def create_app(engine: Engine, ingest_service: IngestService,
     # memory_limit_bytes 都统一从这一个 reader 读。默认是 memstat 的两个函数；
     # 测试注入假读数（如恒 (0, None)），让测试与运行环境的真实内存解耦。
     app[memory_reader_key] = memory_reader if memory_reader is not None else _default_memory_reader
+    # 引擎侧查询计数（P2d-2 六）：_topk / _stats 每请求 +1
+    app[query_counter_key] = {"topk": 0, "stats": 0}
     # 级别变化副作用（收紧/恢复预算、进入第 3 级清缓存）：只在实际变化时回调一次
     controller.on_change = _make_degrade_change_hook(app)
     # Expect: 100-continue 的超大请求在这一步拒绝，客户端不会发送请求体（见 _ingest_expect）
@@ -116,9 +161,13 @@ def create_app(engine: Engine, ingest_service: IngestService,
     app.router.add_get("/v1/stats", _stats)
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/v1/topk/stream", _stream)
+    # P2d-3 二.3：事件循环延迟探针（FLOWLENS_DEBUG=1 时启用）。None 时不注入，
+    # Ticker 的 record_tick 为 None 判断直接跳过，行为与无探针一致。
+    app[loop_probe_key] = loop_probe
     ticker = Ticker(engine, period=tick_period, controller=controller,
                     admission=ingest_service.admission,
-                    memory_reader=app[memory_reader_key])
+                    memory_reader=app[memory_reader_key],
+                    loop_probe=loop_probe)
     app[ticker_key] = ticker
     # SSE 订阅管理器：参数相同的订阅者共用计算，组数/连接数/计算频率都有上限（T7）
     manager = StreamManager(
@@ -151,14 +200,26 @@ def _make_degrade_change_hook(app: web.Application):
 
     做成工厂、闭包捕获 app，而不是把 app 传进控制器——控制器保持纯逻辑、不依赖
     aiohttp。只在实际变化时调用一次，所以"进入第 3 级清缓存"确实只在进入那一刻发生。
+
+    前端模式下 admission / raw_budget 是 FrontsBudgetView：设 limit 只翻转共享的
+    tight 标志（各前端按标志自行选额度）；并在 on_change 里把新级别发布到
+    shared.level（前端据此 reject_ingest）。单进程模式没有 shared，跳过发布。
     """
     admission = app[ingest_service_key].admission
     raw_budget = app[raw_budget_key]
     query_service = app[query_service_key]
     normal_adm, tight_adm = admission.limit, TIGHT_ADMISSION_LIMIT
     normal_raw, tight_raw = raw_budget.limit, TIGHT_RAW_BUDGET_LIMIT
+    shared = getattr(admission, "_s", None)   # FrontsBudgetView 持有 shared；本地 Admission 没有
 
     def on_change(old: int, new: int) -> None:
+        if shared is not None:
+            shared.level.value = new   # 前端读取（reject_ingest = level >= 4）
+            # P2d-2 二.3：级别变化时立即发布"回答查询用"的降级状态，不等下一次
+            # 快照回调（最多 1 秒）。sample_weight 从控制器现读（与 on_snapshot
+            # 同一口径：占用率 > 0.95 为 4、第 2 级起为 2、其余 1）。
+            shared.degraded.value = 1 if app[degrade_controller_key].degraded else 0
+            shared.sample_weight.value = app[degrade_controller_key].sample_weight
         if new >= 3:
             if old < 3:
                 # 进入第 3 级：收紧两个预算，并清一次结果缓存与 URL 归一化缓存
@@ -172,6 +233,14 @@ def _make_degrade_change_hook(app: web.Application):
                 admission.limit = normal_adm
                 raw_budget.limit = normal_raw
         # 第 1/2/4 级没有需要延迟执行的副作用（暂停回放/采样/拒写都是读属性即得）
+        # 进入第 3 或第 4 级的**那一刻**立即归还一次 glibc 碎片（P1c 一.4，修"降级棘轮"）：
+        # 第 4 级拒写本身不会让内存下降，负载不撤就退不出去（P1b §4）；实测一次
+        # malloc_trim 可回收数十 MB，把内存拉回退出线以下，让降级能自己退出。
+        # 条件是"级别升到 ≥3"（0/1/2→3、→4、3→4 都算进入）；在 3 与 4 之间回落
+        # （4→3）不算进入、不 trim。复用 ticker.py 的 malloc_trim（非 Linux
+        # 什么都不做、不报错）。
+        if new >= 3 and old < new:
+            malloc_trim()
 
     return on_change
 
@@ -179,6 +248,21 @@ def _make_degrade_change_hook(app: web.Application):
 def _fmt_num(x: float):
     """整数输出整数，否则保留两位小数。"""
     return int(x) if float(x).is_integer() else round(float(x), 2)
+
+
+def stats_body(s: StatsAnswer, mem_bytes: int, degraded: bool) -> dict:
+    """/v1/stats 的响应字典。引擎的 _stats 与前端进程（P2d-2）共用，
+    保证两边生成的响应逐字节一致。"""
+    return {
+        "window_ms": s.window_ms,
+        "from": s.from_ms,
+        "to": s.to_ms,
+        "approx_distinct_users": int(round(s.distinct_users)),
+        # 区间内没有数据时 p95 是 NaN：orjson 默认输出 null（不出现 NaN 字面量）
+        "approx_p95_bytes": _fmt_num(s.p95_bytes) if s.p95_bytes == s.p95_bytes else None,
+        "memory_bytes": mem_bytes,
+        "degraded": degraded,
+    }
 
 
 # ---- 中间件：只在这里把异常转成 HTTP 响应，各接口只抛异常 ----
@@ -247,6 +331,7 @@ async def _ingest_expect(request: web.Request) -> web.StreamResponse | None:
         # 分块传输（cl 为 None）在 expect 阶段无法判断预留量，一律先放行发 100，
         # 由 _read_raw_body 边读边核对 4MB 与预算。
         if cl is not None and not budget.can_reserve(cl):
+            budget.rejected += 1  # 原始请求体额度拒绝（与 _read_raw_body 的 try_reserve 同源）
             resp = _json_response({"error": "overloaded"}, status=503)
             resp.headers["Retry-After"] = "1"
             return resp
@@ -313,6 +398,7 @@ async def _ingest(request: web.Request) -> web.Response:
 
 
 async def _topk(request: web.Request) -> web.Response:
+    request.app[query_counter_key]["topk"] += 1   # 引擎侧计数（P2d-2 六）
     ctrl = request.app[degrade_controller_key]
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms)
@@ -322,21 +408,13 @@ async def _topk(request: web.Request) -> web.Response:
 
 
 async def _stats(request: web.Request) -> web.Response:
+    request.app[query_counter_key]["stats"] += 1   # 引擎侧计数（P2d-2 六）
     ctrl = request.app[degrade_controller_key]
     now_ms = request.app[query_service_key].engine.clock.now_ms()
     qp = QueryParams.from_request(request, now_ms, need_k=False, need_by=False)
     s = await request.app[query_service_key].stats(qp.window_ms, qp.at_ms)
     mem_bytes, _ = request.app[memory_reader_key]()
-    return _json_response({
-        "window_ms": s.window_ms,
-        "from": s.from_ms,
-        "to": s.to_ms,
-        "approx_distinct_users": int(round(s.distinct_users)),
-        # 区间内没有数据时 p95 是 NaN：orjson 默认输出 null（不出现 NaN 字面量）
-        "approx_p95_bytes": _fmt_num(s.p95_bytes) if s.p95_bytes == s.p95_bytes else None,
-        "memory_bytes": mem_bytes,
-        "degraded": ctrl.degraded,
-    })
+    return _json_response(stats_body(s, mem_bytes, ctrl.degraded))
 
 
 async def _healthz(request: web.Request) -> web.Response:
@@ -356,6 +434,9 @@ async def _healthz(request: web.Request) -> web.Response:
         "deduped": c.deduped,
         "late": c.late,
         "invalid": c.invalid,
+        # 503 来源计数（P1 诊断用）：在途额度 vs 原始请求体额度分别拒了多少请求
+        "ingest_rejected": request.app[ingest_service_key].admission.rejected,
+        "raw_rejected": request.app[raw_budget_key].rejected,
         "tick_errors": t.error_count,
         "last_tick_ms": t.last_tick_duration_ms,
         # 定期 malloc_trim 统计（C3）：非 Linux 上 enabled 为 False、call_count 恒 0
@@ -418,6 +499,10 @@ async def _stream(request: web.Request) -> web.StreamResponse:
 # ---- 后台 ticker 生命周期 ----
 
 async def _start_ticker(app: web.Application) -> None:
+    # P2d-3 二.3：先起事件循环延迟探针（FLOWLENS_DEBUG=1 时），再起 Ticker
+    probe = app[loop_probe_key]
+    if probe is not None:
+        probe.start()
     app[ticker_task_key] = asyncio.create_task(app[ticker_key].run())
 
 
@@ -427,6 +512,9 @@ async def _stop_ticker(app: web.Application) -> None:
     if not task.done():
         task.cancel()  # 等待窗口最多一个周期，取消让退出即时
     await asyncio.gather(task, return_exceptions=True)
+    probe = app[loop_probe_key]
+    if probe is not None:
+        await probe.close()
 
 
 async def _stop_stream(app: web.Application) -> None:
@@ -435,7 +523,11 @@ async def _stop_stream(app: web.Application) -> None:
 
 
 def make_engine(clock=None) -> tuple[Engine, IngestService, QueryService]:
-    """按默认 Config 组装 engine + 服务（__main__ 用）。"""
+    """按默认 Config 组装 engine + 服务（__main__ 用）。
+
+    在途额度这里先建一个本地 Admission（单进程模式直接用）。前端模式下 create_app
+    会把它替换成 FrontsBudgetView（各前端合计的引擎侧视图），这里不需要知道前端。
+    """
     from ..config import Config
     from ..timewin import Clock
     engine = Engine(Config(), clock or Clock())

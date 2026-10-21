@@ -413,3 +413,55 @@ def test_memory_reader_drives_levels():
         assert hz["degrade"]["memory_bytes"] == 0
         assert hz["memory_bytes"] == 0  # 来自 memory_reader，不是 memstat 真实值
     _serve(run, tick_period=0.1, memory_reader=feed)
+
+
+def test_entering_level3_calls_malloc_trim_once(monkeypatch):
+    """P1c 一.4（修"降级棘轮"）：进入第 3 级的那一刻，on_change 回调里立即调一次
+    malloc_trim 归还 glibc 碎片（第 4 级拒写不降内存，负载不撤就退不出降级）。
+
+    用可控内存读数让控制器进入第 3 级；monkeypatch app 模块里的 malloc_trim
+    计数（生产回调引用的是模块全局名，patch 模块属性即可命中）。验证：
+    进入第 3 级时调用恰好一次、级别不变不重复调、退出后再进再调一次。
+    """
+    import flowlens.api.app as app_mod
+    calls = []
+    monkeypatch.setattr(app_mod, "malloc_trim", lambda: calls.append(1) or True)
+
+    feed = MemFeed(mem=0, limit=256 * MB)
+
+    async def run(client, engine, clock, app):
+        ctrl = app[degrade_controller_key]
+        ticker = app[ticker_key]
+        # Ticker 在跑（周期 0.1s）
+        for _ in range(50):
+            if ticker.tick_count >= 1:
+                break
+            await asyncio.sleep(0.02)
+
+        # 进入第 3 级（0.8 × 256MB > 0.78）
+        feed.mem = int(0.8 * 256 * MB)
+        for _ in range(50):
+            if ctrl.level >= 3:
+                break
+            await asyncio.sleep(0.02)
+        assert ctrl.level == 3, ctrl.level
+        # 等一拍，确认"只在进入那一刻调一次"（后续拍级别不变、不再调）
+        await asyncio.sleep(0.3)
+        assert len(calls) == 1, f"进入第 3 级应恰好 trim 一次，实际 {len(calls)}"
+
+        # 退出（内存回落 0）→ 再进入：再调一次
+        feed.mem = 0
+        for _ in range(50):
+            if ctrl.level == 0:
+                break
+            await asyncio.sleep(0.02)
+        assert ctrl.level == 0
+        feed.mem = int(0.8 * 256 * MB)
+        for _ in range(50):
+            if ctrl.level >= 3:
+                break
+            await asyncio.sleep(0.02)
+        assert ctrl.level == 3
+        await asyncio.sleep(0.3)
+        assert len(calls) == 2, f"再次进入应再 trim 一次，实际 {len(calls)}"
+    _serve(run, tick_period=0.1, memory_reader=feed)
