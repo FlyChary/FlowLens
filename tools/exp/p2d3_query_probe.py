@@ -110,9 +110,9 @@ async def docker_logs(container) -> str:
     return out.decode("utf-8", "replace")
 
 
-async def docker_run(container, port, image, envs) -> None:
+async def docker_run(container, port, image, envs, mem="512m") -> None:
     cmd = ["docker", "run", "-d", "--name", container,
-           "--memory=512m", "--memory-swap=512m", f"--cpuset-cpus={SVC_CP}",
+           f"--memory={mem}", f"--memory-swap={mem}", f"--cpuset-cpus={SVC_CP}",
            *envs, "-p", f"{port}:8080", image]
     proc = await asyncio.create_subprocess_exec(*cmd,
                                                 stdout=asyncio.subprocess.PIPE,
@@ -285,7 +285,12 @@ async def run_rate(port, name, rate, duration, seed) -> dict:
 async def main_async(args) -> dict:
     rates = [int(x) for x in args.rates.split(",") if x]
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    envs = ["-e", "PYTHONHASHSEED=0", "-e", f"FLOWLENS_FRONTENDS={args.fronts}"]
+    # fronts=auto：不注入 FLOWLENS_FRONTENDS，让服务自动判断（P2d-3 八.5 的
+    # 256 MB 单进程行用）；此时只记录前端数，不断言期望值。
+    auto_fronts = (args.fronts == "auto")
+    envs = ["-e", "PYTHONHASHSEED=0"]
+    if not auto_fronts:
+        envs += ["-e", f"FLOWLENS_FRONTENDS={args.fronts}"]
     if args.max_pending_bytes:
         envs += ["-e", f"FLOWLENS_MAX_PENDING_BYTES={args.max_pending_bytes}"]
     if args.raw_budget_bytes:
@@ -297,7 +302,7 @@ async def main_async(args) -> dict:
         port = free_port()
         name = f"p2d3-q21-{rate}-{int(time.time() * 1000)}"
         print(f"### 二.1 写入 {rate}/s（新容器 {name}）###", flush=True)
-        await docker_run(name, port, args.image, envs)
+        await docker_run(name, port, args.image, envs, mem=args.mem)
         try:
             if not await wait_ready(port):
                 raise RuntimeError("服务未就绪：\n" + (await docker_logs(name))[-1500:])
@@ -308,7 +313,7 @@ async def main_async(args) -> dict:
             if n is None:
                 last = log.strip().splitlines()[-1] if log.strip() else ""
                 raise RuntimeError(f"读不到前端数（末行：{last!r}）")
-            if args.fronts is not None and n != args.fronts:
+            if not auto_fronts and n != args.fronts:
                 raise RuntimeError(f"前端数不符：期望 {args.fronts}，实得 {n}（{reason}）")
             print(f"  前端数 {n}（{reason}）", flush=True)
             row = await run_rate(port, name, rate, args.duration, seed=200 + i)
@@ -349,7 +354,9 @@ def main():
     ap.add_argument("--image", required=True)
     ap.add_argument("--rates", default="30000,100000,140000,200000")
     ap.add_argument("--duration", type=float, default=120)
-    ap.add_argument("--fronts", type=int, default=3)
+    ap.add_argument("--fronts", default="3",
+                    help="前端数（整数）或 auto（不注入 FLOWLENS_FRONTENDS，服务自动判断）")
+    ap.add_argument("--mem", default="512m", help="容器内存上限（--memory / --memory-swap）")
     ap.add_argument("--max-pending-bytes", type=int, default=16777216)
     ap.add_argument("--raw-budget-bytes", type=int, default=16777216)
     ap.add_argument("--chunk-events", type=int, default=0,
@@ -357,6 +364,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", default="p2d3-q21")
     a = ap.parse_args()
+    if a.fronts != "auto":
+        a.fronts = int(a.fronts)
     out = asyncio.run(main_async(a))
     save_partial(a.out, out)
     print(f"\n[done] -> {a.out}", flush=True)
