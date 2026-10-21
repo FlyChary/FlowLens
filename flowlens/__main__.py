@@ -24,6 +24,7 @@ from .intern import url_intern, user_intern
 from .errors import FlowLensError
 from .supervisor import FrontSupervisor, resolve_front_count
 from .timewin import Clock
+from .loop_probe import make_loop_probe
 
 log = logging.getLogger("flowlens")
 
@@ -93,8 +94,9 @@ def main() -> None:
 
 def _run_single(args, lingering: float) -> None:
     engine, ingest_service, query_service = make_engine(Clock())
+    probe = make_loop_probe()   # P2d-3 二.3：FLOWLENS_DEBUG=1 时启用
     app = create_app(engine, ingest_service, query_service,
-                     memory_reader=_env_memory_reader)
+                     memory_reader=_env_memory_reader, loop_probe=probe)
 
     async def run():
         # auto_decompress=False：不在传输层自动解压 gzip 请求体。请求体保持压缩，
@@ -189,9 +191,10 @@ def _run_with_fronts(args, n_fronts: int, lingering: float) -> None:
              sup.adm_normal, sup.adm_tight, sup.raw_normal, sup.raw_tight)
     sup.start_all()                       # 先启动前端（spawn，不继承大块内存）
     engine, ingest_service, query_service = make_engine(Clock())
+    probe = make_loop_probe()   # P2d-3 二.3：FLOWLENS_DEBUG=1 时启用
     # memory_reader=_env_memory_reader：支持 FLOWLENS_TEST_MEM 注入（测试进第 4 级用）
     app = create_app(engine, ingest_service, query_service, fronts=sup.shared,
-                     memory_reader=_env_memory_reader)
+                     memory_reader=_env_memory_reader, loop_probe=probe)
     # 内部 Unix 套接字路径报给 /debug/info（P2d-2 六的 e2e 据此直连引擎）
     app[query_sock_key] = query_sock
     # 快照广播（P2d-2 二）：每次替换快照后，把快照与降级/采样/内存状态发给所有前端

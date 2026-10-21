@@ -96,6 +96,8 @@ memory_reader_key = web.AppKey("memory_reader", Callable)
 # "前端模式默认窗口查询由前端本地回答、不经过引擎"）。普通 dict 计数，单写者
 # （事件循环），无锁。
 query_counter_key = web.AppKey("query_counter", dict)
+# 事件循环延迟探针（P2d-3 二.3，FLOWLENS_DEBUG=1 时启用；None 表示未启用）
+loop_probe_key = web.AppKey("loop_probe", object)
 # 前端模式下内部 Unix 套接字的路径（/debug/info 报给测试直连引擎用）；
 # 单进程模式没有（不设）
 query_sock_key = web.AppKey("query_sock", str)
@@ -114,7 +116,8 @@ def _default_memory_current_reader() -> int:
 def create_app(engine: Engine, ingest_service: IngestService,
                query_service: QueryService, *, tick_period: float = 1.0,
                memory_reader: Callable[[], tuple[int, int | None]] | None = None,
-               fronts=None
+               fronts=None,
+               loop_probe=None
                ) -> web.Application:
     # client_max_size=0（不限制）：4 MB 上限由 _read_raw_body 自己执行，
     # 否则 aiohttp 会在 handler 之前以自己的 413 拒绝，RawBudget 预留就没机会了
@@ -158,9 +161,13 @@ def create_app(engine: Engine, ingest_service: IngestService,
     app.router.add_get("/v1/stats", _stats)
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/v1/topk/stream", _stream)
+    # P2d-3 二.3：事件循环延迟探针（FLOWLENS_DEBUG=1 时启用）。None 时不注入，
+    # Ticker 的 record_tick 为 None 判断直接跳过，行为与无探针一致。
+    app[loop_probe_key] = loop_probe
     ticker = Ticker(engine, period=tick_period, controller=controller,
                     admission=ingest_service.admission,
-                    memory_reader=app[memory_reader_key])
+                    memory_reader=app[memory_reader_key],
+                    loop_probe=loop_probe)
     app[ticker_key] = ticker
     # SSE 订阅管理器：参数相同的订阅者共用计算，组数/连接数/计算频率都有上限（T7）
     manager = StreamManager(
@@ -492,6 +499,10 @@ async def _stream(request: web.Request) -> web.StreamResponse:
 # ---- 后台 ticker 生命周期 ----
 
 async def _start_ticker(app: web.Application) -> None:
+    # P2d-3 二.3：先起事件循环延迟探针（FLOWLENS_DEBUG=1 时），再起 Ticker
+    probe = app[loop_probe_key]
+    if probe is not None:
+        probe.start()
     app[ticker_task_key] = asyncio.create_task(app[ticker_key].run())
 
 
@@ -501,6 +512,9 @@ async def _stop_ticker(app: web.Application) -> None:
     if not task.done():
         task.cancel()  # 等待窗口最多一个周期，取消让退出即时
     await asyncio.gather(task, return_exceptions=True)
+    probe = app[loop_probe_key]
+    if probe is not None:
+        await probe.close()
 
 
 async def _stop_stream(app: web.Application) -> None:
