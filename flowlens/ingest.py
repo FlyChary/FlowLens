@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import logging
 import os
 import zlib
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from .errors import BadRequest, Overloaded, PayloadTooLarge, UnsupportedEncoding
 from .engine import Engine, IngestResult
 from .model import load_array, validate
 from .parse_pool import ParsedBatch
+
+log = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 4 * 1024 * 1024             # 请求体（压缩后）上限
 MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024     # 单个请求解压后上限，超过提示拆分
@@ -55,7 +58,32 @@ CHUNK_EVENTS = 2000
 # 约 25 ms），查询最多等一块，仍在 50 ms 内。故已解析路径取 10000。
 # 注意：Top-K 名单是近似结构、堆成员对"逐秒 observe 的分批顺序"敏感——不同块大小会在
 # 名单深尾部产生少量差异（见 test_ingest 的等价性用例说明），这是 sketch 的固有性质，非 bug。
-POOLED_CHUNK_EVENTS = 10000
+DEFAULT_POOLED_CHUNK_EVENTS = 10000
+
+
+def _read_pooled_chunk_events() -> int:
+    """从 FLOWLENS_POOLED_CHUNK_EVENTS 读已解析路径的写入块大小。
+
+    缺省/非法/非正数都退回默认 10000。P2d-3 第二节的对比实验用它把块降到 5000，
+    验证"缩短写块对回放查询 p99 的影响"。生产不设该变量，行为与原来一致。
+    """
+    raw = os.environ.get("FLOWLENS_POOLED_CHUNK_EVENTS", "").strip()
+    if not raw:
+        return DEFAULT_POOLED_CHUNK_EVENTS
+    try:
+        v = int(raw)
+    except ValueError:
+        log.warning("FLOWLENS_POOLED_CHUNK_EVENTS=%r 非法，回退默认 %d",
+                    raw, DEFAULT_POOLED_CHUNK_EVENTS)
+        return DEFAULT_POOLED_CHUNK_EVENTS
+    if v <= 0:
+        log.warning("FLOWLENS_POOLED_CHUNK_EVENTS=%r 非正数，回退默认 %d",
+                    raw, DEFAULT_POOLED_CHUNK_EVENTS)
+        return DEFAULT_POOLED_CHUNK_EVENTS
+    return v
+
+
+POOLED_CHUNK_EVENTS = _read_pooled_chunk_events()
 # "写入引擎"这一步同时进行的请求数上限（用户决定五）：写入引擎是单写者，串行化避免
 # 多个写入块背靠背独占事件循环、拖高查询 p99。
 DEFAULT_ENGINE_WRITE_CONCURRENCY = 1

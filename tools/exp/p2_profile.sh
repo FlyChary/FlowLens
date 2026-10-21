@@ -6,7 +6,7 @@
 # 同时采集主进程 /proc CPU 时间与线程名 → 打汇总行。只剖析主进程，不加 --subprocesses。
 #
 # 用法：P2_PASSWORD=<wsl sudo 密码> bash p2_profile.sh <label> <image> <mem> <rate> <env...>
-#   env... 是传给 docker run -e 的键值（如 FLOWLENS_PARSE_WORKERS=3），可多个。
+#   env... 是传给 docker run -e 的键值（如 FLOWLENS_FRONTENDS=3），可多个。
 #   py-spy 需要 root（SYS_PTRACE），sudo 密码从 P2_PASSWORD 管道传入（-S）。
 set -u
 LABEL="$1"; IMG="$2"; MEM="$3"; RATE="$4"; shift 4

@@ -132,6 +132,32 @@ def test_pending_limit_env_override(monkeypatch):
     assert _read_pending_limit() == DEFAULT_PENDING_BYTES
 
 
+def test_pooled_chunk_env_override(monkeypatch, caplog):
+    """FLOWLENS_POOLED_CHUNK_EVENTS 覆盖已解析路径写入块（P2d-3 五）：合法值生效，
+    非法/非正/空回退默认 10000；非法与非正回退时打印警告。"""
+    from flowlens.ingest import _read_pooled_chunk_events, DEFAULT_POOLED_CHUNK_EVENTS
+    assert DEFAULT_POOLED_CHUNK_EVENTS == 10000
+    # 合法值生效
+    monkeypatch.setenv("FLOWLENS_POOLED_CHUNK_EVENTS", "5000")
+    assert _read_pooled_chunk_events() == 5000
+    # 空 → 默认
+    monkeypatch.delenv("FLOWLENS_POOLED_CHUNK_EVENTS")
+    assert _read_pooled_chunk_events() == DEFAULT_POOLED_CHUNK_EVENTS
+    # 非法值 → 回退默认 + 打印警告
+    monkeypatch.setenv("FLOWLENS_POOLED_CHUNK_EVENTS", "not-a-number")
+    with caplog.at_level("WARNING", logger="flowlens.ingest"):
+        assert _read_pooled_chunk_events() == DEFAULT_POOLED_CHUNK_EVENTS
+    assert any("FLOWLENS_POOLED_CHUNK_EVENTS" in r.message and "not-a-number" in r.message
+               for r in caplog.records)
+    # 非正数 → 回退默认 + 打印警告
+    monkeypatch.setenv("FLOWLENS_POOLED_CHUNK_EVENTS", "0")
+    with caplog.at_level("WARNING", logger="flowlens.ingest"):
+        assert _read_pooled_chunk_events() == DEFAULT_POOLED_CHUNK_EVENTS
+    assert any("FLOWLENS_POOLED_CHUNK_EVENTS" in r.message and "0" in r.message
+               for r in caplog.records)
+    monkeypatch.delenv("FLOWLENS_POOLED_CHUNK_EVENTS")
+
+
 def test_raw_budget_limit_env_override(monkeypatch):
     """FLOWLENS_RAW_BUDGET_BYTES 覆盖原始请求体额度上限：合法值生效，非法/空/非正退回默认 8 MB。"""
     from flowlens.api.app import _read_raw_budget_limit, DEFAULT_RAW_BUDGET_LIMIT

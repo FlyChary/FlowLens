@@ -75,6 +75,9 @@ SVC_MEM = "256m"
 NO_CPUSET = False
 AUX_CORE = "7"
 LOAD_WORKERS = 4
+# P2d-3 第零节第 2 条：预期前端数（--expect-fronts；None = 只记录不核对）。
+# 第五/六节（自动判断、不注入 env）用它强制核对前端数确为 0。
+EXPECT_FRONT: int | None = None
 
 
 def expand_cpus(spec: str) -> list[int]:
@@ -202,6 +205,32 @@ def proc_timeline(samples: list[dict]) -> dict:
             "parse_count": len(by_pid)}
 
 
+def cpu_window_pct(samples: list[dict]) -> dict:
+    """整窗口（一段采样）的引擎（main）与前端合计（parse）CPU%（占单核 %）。
+
+    与 run_sustained 每分钟行的算法同口径：逐秒 cpu_pct × 与上一采样的间隔累加成
+    CPU 秒，再 ÷ 窗口时长。procs 里 name=="main" 是引擎、其余（name=="parse"，
+    父进程号 = 主进程、排除 resource_tracker 与健康检查）是前端（P2d-1 口径）。
+    单进程模式（前端数 0）时 front_cpu_pct 为 0.0。
+    """
+    main_s = front_s = 0.0
+    prev_t = None
+    for s in samples:
+        procs = s.get("procs") or []
+        main_cpu = sum(p["cpu_pct"] for p in procs
+                       if p["name"] == "main" and p.get("cpu_pct") is not None)
+        front_cpu = sum(p["cpu_pct"] for p in procs
+                        if p["name"] != "main" and p.get("cpu_pct") is not None)
+        if prev_t is not None:
+            dt_s = (s["t"] - prev_t) / 1000.0
+            main_s += main_cpu / 100.0 * dt_s
+            front_s += front_cpu / 100.0 * dt_s
+        prev_t = s["t"]
+    span = (samples[-1]["t"] - samples[0]["t"]) / 1000.0 if len(samples) > 1 else 0.0
+    return {"engine_cpu_pct": round(main_s / span * 100.0, 1) if span > 0 else None,
+            "front_cpu_pct": round(front_s / span * 100.0, 1) if span > 0 else None}
+
+
 def parse_loadgen_lines(lines: list[str]) -> tuple[dict | None, list[dict]]:
     """解析 loadgen 的标准输出：逐秒行（type=second）与汇总行（type=summary）。
 
@@ -279,6 +308,9 @@ class Service:
         self.proc = proc
         self.pid = pid              # local 目标的 python 进程 pid（读 /proc CPU 用）
         self._clk_tck = 100
+        # P2d-3 第零节第 2 条：docker 目标启动后从 logs 读到的前端数（local 为 None）
+        self.front_count: int | None = None
+        self.front_reason: str = ""
 
     @property
     def url(self) -> str:
@@ -335,7 +367,12 @@ async def start_service(target: str, port: int, image: str, workdir: str,
             "-p", f"{port}:8080", image,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.wait()
-        return await _wait_ready(Service("docker", port, container=name), env)
+        svc = await _wait_ready(Service("docker", port, container=name), env)
+        # P2d-3 第零节第 2 条：启动后从 docker logs 确认真实前端数（记进 meta、供核对）
+        n, why = await read_front_count(name)
+        svc.front_count, svc.front_reason = n, why
+        print(f"[start] 容器 {name} 前端数 {n}（{why}）", flush=True)
+        return svc
     else:
         # local：taskset 固定到 SVC_CORE；__main__ 监听 --port
         cmd = (["taskset", "-c", SVC_CORE, sys.executable, "-m", "flowlens",
@@ -373,6 +410,49 @@ async def _wait_ready(svc: Service, env: dict, timeout: float = 30.0) -> Service
 
 def _has(cmd: str) -> bool:
     return shutil.which(cmd) is not None
+
+
+def _svc_fronts(svc: Service, extra_env: dict) -> tuple[int | None, str]:
+    """P2d-3 第零节第 2 条：核对真实前端数与预期，返回 (前端数, 原因) 供记进 meta。
+
+    预期优先级：显式 --expect-fronts（EXPECT_FRONT 全局）> FLOWLENS_FRONTENDS
+    环境变量 > 不核对（只记录）。真实数与预期不符、或读不到启动行（None）时，
+    立即抛错停止该实验（并打印原因），避免拿不确定的配置跑实验。自动判断的场景
+    （第五/六节）用 --expect-fronts 0 强制核对"前端数确为 0"。
+    """
+    fc, fr = svc.front_count, svc.front_reason
+    if fc is None:
+        raise RuntimeError(f"启动日志读不到前端数（末行：{fr!r}），停止该实验")
+    exp = EXPECT_FRONT
+    if exp is None:
+        env_exp = (extra_env or {}).get("FLOWLENS_FRONTENDS")
+        if env_exp is not None:
+            exp = int(env_exp)
+    if exp is not None and exp != fc:
+        raise RuntimeError(f"前端数不符：期望 {exp}，实得 {fc}（{fr}），停止该实验")
+    return fc, fr
+
+
+def parse_front_count(log_text: str) -> tuple[int | None, str]:
+    """从启动日志文本解析"前端数 N（原因）"这一行，返回 (N, 原因)。
+
+    纯函数（供单测）。读不到该行时返回 (None, 原文末行)——调用方据此判定"读不到"
+    并停止实验（P2d-3 第零节第 2 条）。
+    """
+    m = re.search(r"前端数\s+(\d+)（(.*?)）", log_text)
+    if not m:
+        return None, (log_text.strip().splitlines() or [""])[-1]
+    return int(m.group(1)), m.group(2)
+
+
+async def read_front_count(container: str) -> tuple[int | None, str]:
+    """从 `docker logs` 读启动日志的前端数，返回 (N, 原因)。
+
+    P2d-3 第零节第 2 条：每次实验启动容器后都要确认真实的前端数，记进结果文件；
+    与预期不符时立即停止该实验并报告。
+    """
+    out = await _run(["docker", "logs", container])
+    return parse_front_count(out)
 
 
 async def sample_service_cpu(svc: Service, last: dict) -> float | None:
@@ -681,12 +761,15 @@ def git_commit() -> str:
 
 
 def write_meta(outdir: str, *, scenario: str, target: str, port: int,
-               cpu_alloc: dict, params: dict, image: str | None = None) -> None:
+               cpu_alloc: dict, params: dict, image: str | None = None,
+               front_count: int | None = None, front_reason: str = "") -> None:
     _write_json(os.path.join(outdir, "meta.json"), {
         "scenario": scenario, "git_commit": git_commit(),
         "machine": machine_info(),
         "service": {"target": target, "port": port,
-                    "cpu_alloc": cpu_alloc, "image": image},
+                    "cpu_alloc": cpu_alloc, "image": image,
+                    # P2d-3 第零节第 2 条：docker 启动日志读到的真实前端数与原因
+                    "front_count": front_count, "front_reason": front_reason},
         "params": params,
         "created_ms": int(time.time() * 1000),
     })
@@ -923,8 +1006,12 @@ async def run_s2(svc: Service, outdir: str, *, base_rate: int, duration: float,
         by_type.setdefault(q["type"], []).append(q["lat_ms"])
     qstats = {t: {"n": len(v), "p50": pctl(v, 50), "p95": pctl(v, 95),
                   "p99": pctl(v, 99)} for t, v in by_type.items()}
+    # P2d-3 二：整窗口的引擎（main）与前端合计 CPU%（占单核 %）
+    cpu = cpu_window_pct(samples)
     summary = {"scenario": "S2", "write_rate": write_rate, "sse": sse,
                "query_stats": qstats, "load": lg_summary,
+               "engine_cpu_pct": cpu["engine_cpu_pct"],
+               "front_cpu_pct": cpu["front_cpu_pct"],
                "memory": mem_timeline(samples)}
     write_summary(outdir, summary)
     return summary
@@ -1096,17 +1183,30 @@ async def run_sustained(svc: Service, outdir: str, *, rate: int,
             lvl = max(lvls) if lvls else 0
             acc = [tl_by_sec[sec]["accepted"] for sec in range(a, b) if sec in tl_by_sec]
             sent = [tl_by_sec[sec]["sent"] for sec in range(a, b) if sec in tl_by_sec]
-            # 主进程 CPU 秒：逐秒 cpu_pct（占单核 %）× 与上一采样的间隔
+            # 主进程（引擎）与前端合计的 CPU 秒：逐秒 cpu_pct（占单核 %）× 与上一
+            # 采样的间隔。procs 里 name=="main" 是引擎（容器主进程），name=="parse"
+            # 是前端（父进程号 = 主进程、排除 resource_tracker 与健康检查，P2d-1
+            # 口径，sample_proc_all 已按此识别）。
             main_cpu_s = 0.0
+            front_cpu_s = 0.0
             prev_t = None
             for s in win:
-                cpu = sum(p["cpu_pct"] for p in (s.get("procs") or [])
-                          if p["name"] == "main" and p.get("cpu_pct") is not None)
+                procs = s.get("procs") or []
+                main_cpu = sum(p["cpu_pct"] for p in procs
+                               if p["name"] == "main" and p.get("cpu_pct") is not None)
+                front_cpu = sum(p["cpu_pct"] for p in procs
+                                if p["name"] != "main" and p.get("cpu_pct") is not None)
                 if prev_t is not None:
-                    main_cpu_s += cpu / 100.0 * (s["t"] - prev_t) / 1000.0
+                    dt_s = (s["t"] - prev_t) / 1000.0
+                    main_cpu_s += main_cpu / 100.0 * dt_s
+                    front_cpu_s += front_cpu / 100.0 * dt_s
                 prev_t = s["t"]
             macc = sum(acc)
             tm = (win[-1].get("healthz") or {}).get("malloc_trim") or {}
+            # 前端合计 CPU%（占单核 %，3 前端可 >100）：本分钟前端 CPU 秒 ÷ 分钟时长
+            win_span = (win[-1]["t"] - win[0]["t"]) / 1000.0
+            front_cpu_pct = (round(front_cpu_s / win_span * 100.0, 1)
+                             if win_span > 0 else None)
             per_minute.append({
                 "minute": m,
                 "ws_peak_mb": mem_mb(max(ws)) if ws else None,
@@ -1116,6 +1216,7 @@ async def run_sustained(svc: Service, outdir: str, *, rate: int,
                 "accept_ratio": round(macc / sum(sent), 4) if sum(sent) else None,
                 "main_cpu_s": round(main_cpu_s, 1),
                 "main_us_ev": round(main_cpu_s / macc * 1e6, 2) if macc else None,
+                "front_cpu_pct": front_cpu_pct,
                 "trim_call_count": tm.get("call_count", 0),
                 "trim_total_ms": tm.get("total_ms", 0.0),
                 "trim_freed_total_mb": tm.get("total_freed_mb", 0.0),
@@ -1237,12 +1338,14 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
             os.makedirs(d, exist_ok=True)
             svc = await start_service(target, port, image, workdir, extra_env=extra_env)
             try:
+                fc, fr = _svc_fronts(svc, extra_env)
                 write_meta(d, scenario="S1", target=target, port=port,
                            cpu_alloc=cpu_alloc,
                            params={"gzip": gz, "rates": rates,
                                    "level_sec": s1_level_sec, "batch": batch,
                                    "mode": mode, "fast": fast},
-                           image=image if target == "docker" else None)
+                           image=image if target == "docker" else None,
+                           front_count=fc, front_reason=fr)
                 r = await run_s1(svc, d, gzip=gz, rates=rates,
                                  level_sec=s1_level_sec, batch=batch, fast=fast)
             finally:
@@ -1259,11 +1362,13 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
         os.makedirs(d, exist_ok=True)
         svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
+            fc, fr = _svc_fronts(svc, extra_env)
             write_meta(d, scenario="S2", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"write_frac": S2_WRITE_FRAC, "duration_s": S2_SEC,
                                "batch": batch, "base_rate": base, "fast": fast,
                                "s2_rate": s2_rate},
-                       image=image if target == "docker" else None)
+                       image=image if target == "docker" else None,
+                       front_count=fc, front_reason=fr)
             r = await run_s2(svc, d, base_rate=base, duration=S2_SEC,
                              batch=batch, rng=rng, write_rate=s2_rate, fast=fast)
         finally:
@@ -1275,10 +1380,12 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
         os.makedirs(d, exist_ok=True)
         svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
+            fc, fr = _svc_fronts(svc, extra_env)
             write_meta(d, scenario="S3", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"rate": S3_RATE, "duration_s": S3_SEC, "batch": batch,
                                "mode": mode, "n_samples": S3_SAMPLES, "k": 10},
-                       image=image if target == "docker" else None)
+                       image=image if target == "docker" else None,
+                       front_count=fc, front_reason=fr)
             r = await run_s3(svc, d, rate=S3_RATE, duration=S3_SEC, batch=batch,
                              mode=mode, n_samples=S3_SAMPLES, k=10, rng=rng)
         finally:
@@ -1290,11 +1397,13 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
         os.makedirs(d, exist_ok=True)
         svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
+            fc, fr = _svc_fronts(svc, extra_env)
             write_meta(d, scenario="S5", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"overload_frac": S5_OVERLOAD_FRAC,
                                "overload_s": S5_OVERLOAD_SEC,
                                "observe_s": S5_OBSERVE_SEC, "base_rate": base},
-                       image=image if target == "docker" else None)
+                       image=image if target == "docker" else None,
+                       front_count=fc, front_reason=fr)
             r = await run_s5(svc, d, base_rate=base,
                              overload_sec=S5_OVERLOAD_SEC,
                              observe_sec=S5_OBSERVE_SEC, batch=batch)
@@ -1307,10 +1416,12 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
         os.makedirs(d, exist_ok=True)
         svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
+            fc, fr = _svc_fronts(svc, extra_env)
             write_meta(d, scenario="S4", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"rate": S4_RATE, "duration_s": S4_SEC, "batch": batch,
                                "mode": "随机", "tail_s": 60},
-                       image=image if target == "docker" else None)
+                       image=image if target == "docker" else None,
+                       front_count=fc, front_reason=fr)
             r = await run_s4(svc, d, rate=S4_RATE, duration=S4_SEC, batch=batch)
         finally:
             await svc.stop()
@@ -1323,12 +1434,14 @@ async def run_scenarios(names: list[str], *, target: str, port: int,
         os.makedirs(d, exist_ok=True)
         svc = await start_service(target, port, image, workdir, extra_env=extra_env)
         try:
+            fc, fr = _svc_fronts(svc, extra_env)
             write_meta(d, scenario="SUST", target=target, port=port, cpu_alloc=cpu_alloc,
                        params={"rate": sust_rate, "duration_s": sust_sec, "batch": batch,
                                "mode": "长尾", "tail_s": SUST_TAIL,
                                "fast": fast,
                                "extra_env": extra_env or {}},
-                       image=image if target == "docker" else None)
+                       image=image if target == "docker" else None,
+                       front_count=fc, front_reason=fr)
             r = await run_sustained(svc, d, rate=sust_rate, duration=sust_sec,
                                     batch=batch, mode="长尾", seed=350,
                                     tail_sec=SUST_TAIL, fast=fast)
@@ -1383,6 +1496,10 @@ def main() -> None:
                         "的推算（P2c：14 万/20 万两档）。")
     p.add_argument("--svc-mem", default=SVC_MEM,
                    help="服务容器内存上限（默认 256m；P2c 的 A512 组用 512m）。")
+    p.add_argument("--expect-fronts", type=int, default=None,
+                   help="P2d-3 第零节第 2 条：预期前端数，启动后从 docker logs 核对，"
+                        "不符立即停止该实验。第五/六节（自动判断）用 0 强制核对；"
+                        "缺省时按注入的 FLOWLENS_FRONTENDS 核对、未注入则只记录。")
     p.add_argument("--sust-rate", type=int, default=SUST_RATE,
                    help="SUST 持续速率（默认 3 万/秒；P2c 第一节用 20 万）。")
     p.add_argument("--sust-sec", type=int, default=SUST_SEC,
@@ -1390,8 +1507,9 @@ def main() -> None:
     args = p.parse_args()
 
     # P1 多核核分配：把命令行覆盖写进全局（start_service/_loadgen_args 在调用时读）
-    global NO_CPUSET
+    global NO_CPUSET, EXPECT_FRONT
     NO_CPUSET = args.no_cpuset
+    EXPECT_FRONT = args.expect_fronts
     SVC_CORE = args.svc_cpus
     LOAD_CORES = args.load_cpus
     if args.load_workers > 0:

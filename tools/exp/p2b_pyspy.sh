@@ -25,7 +25,7 @@ cd /mnt/d/dhy/code/flowlens-c
 docker rm -f "$NAME" >/dev/null 2>&1
 docker run -d --name "$NAME" --cap-add SYS_PTRACE \
   --memory="$MEM" --memory-swap="$MEM" --cpuset-cpus="$SVC_CP" \
-  -e PYTHONHASHSEED=0 -e FLOWLENS_PARSE_WORKERS=3 \
+  -e PYTHONHASHSEED=0 -e FLOWLENS_FRONTENDS=3 \
   -e FLOWLENS_MAX_PENDING_BYTES=16777216 -e FLOWLENS_RAW_BUDGET_BYTES=16777216 \
   -p "$PORT:8080" "$IMG" >/dev/null
 ready=0
