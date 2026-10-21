@@ -237,8 +237,13 @@ async def main_async(args) -> dict:
     # 引擎（容器主进程）+ 命令行不含 resource_tracker"识别——spawn 子进程的
     # cmdline 是 multiprocessing 引导行（不含 flowlens），find_parse_pids 的
     # 现有识别口径（主进程直接子进程、排除 resource_tracker 与健康检查）直接复用。
-    expect = args.fronts
-    env = ["-e", "PYTHONHASHSEED=0", "-e", f"FLOWLENS_FRONTENDS={args.fronts}"]
+    # --auto-fronts：不注入 FLOWLENS_FRONTENDS，让服务按"核数 + cgroup 内存上限"
+    # 自动判断前端数（P2d-3 第五/六节：验证自动退回单进程）。此时无法预知期望值，
+    # expect=None 只记录实际数、不做断言。
+    expect = None if args.auto_fronts else args.fronts
+    env = ["-e", "PYTHONHASHSEED=0"]
+    if not args.auto_fronts:
+        env += ["-e", f"FLOWLENS_FRONTENDS={args.fronts}"]
     if args.max_pending_bytes:
         env += ["-e", f"FLOWLENS_MAX_PENDING_BYTES={args.max_pending_bytes}"]
     if args.raw_budget_bytes:
@@ -252,9 +257,10 @@ async def main_async(args) -> dict:
         await asyncio.sleep(2.0)  # 等前端连上稳定
         main_pid = await container_main_pid(name)
         fronts = find_parse_pids(main_pid)  # 前端模式下即前端进程
-        if len(fronts) != expect:
+        if expect is not None and len(fronts) != expect:
             raise RuntimeError(f"前端进程数不符：期望 {expect}，实得 {len(fronts)}，pids={fronts}")
-        print(f"[setup] 前端进程数={len(fronts)}（期望 {expect}）", flush=True)
+        print(f"[setup] 前端进程数={len(fronts)}（期望 {expect if expect is not None else '自动'}）",
+              flush=True)
         rows = []
         for i, rate in enumerate(args.rates):
             print(f"[level {i + 1}/{len(args.rates)}] rate={rate} ...", flush=True)
@@ -309,6 +315,9 @@ def main() -> None:
                     help="loadgen 用 P2a 快速模式（--fast，模板 + bytes.replace）")
     ap.add_argument("--stop-below", type=float, default=0.0,
                     help="某档接受率低于该值后停止爬坡（P2c 四.1 用 0.90；0=关闭）")
+    ap.add_argument("--auto-fronts", action="store_true",
+                    help="不注入 FLOWLENS_FRONTENDS，让服务自动判断前端数"
+                         "（P2d-3 第五/六节验证自动退回；此时只记录不断言前端数）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", default="")
     args = ap.parse_args()

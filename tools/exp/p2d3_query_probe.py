@@ -23,6 +23,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -44,6 +45,34 @@ LOAD_WORKERS = 8
 BATCH = 5000
 # 每类查询的目标速率（次/秒）。四类合计 ~80 q/s，与 S2 的 rate_per_type=20 同量级。
 Q_RATE = 20.0
+
+
+def stop_loadgen(lg: subprocess.Popen) -> None:
+    """停 loadgen：对整个**进程组**发 SIGTERM（主进程 + 全部 worker），宽限 5 s
+    后 SIGKILL 兜底。
+
+    必须按进程组杀、不能 `lg.terminate()`（只杀主进程）：loadgen 的 worker 是
+    spawn 的 daemon 子进程，主进程被 SIGTERM 后 worker 被 reparent 到 init 继续
+    活着，且它们往读端已死的 multiprocessing 队列 put() 永不返回——永不自然
+    退出，成为占内存的孤儿进程（P2d-3 二.1 首跑 4 档共漏 22 个、~10 GB RSS）。
+    """
+    try:
+        os.killpg(os.getpgid(lg.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        lg.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(os.getpgid(lg.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        lg.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def pct(v, p):
@@ -195,7 +224,9 @@ async def run_rate(port, name, rate, duration, seed) -> dict:
                "--mode", "长尾", "--seed", str(seed), "--fast", "--fast-templates", "32"]
     if shutil.which("taskset"):
         lg_args = ["taskset", "-c", LOAD_CP] + lg_args
-    lg = subprocess.Popen(lg_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # start_new_session：loadgen 自成进程组，停时 killpg 能连 worker 一起带走
+    lg = subprocess.Popen(lg_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          start_new_session=True)
     wr = await wait_write_rate(port, rate)
     if wr < int(rate * 0.80):
         print(f"  [warn] 写入 {wr}/s 偏低（目标 {rate}），本档 p99 仅供参考", flush=True)
@@ -225,11 +256,7 @@ async def run_rate(port, name, rate, duration, seed) -> dict:
     t1 = time.monotonic()
     H1 = healthz(port)
     times1, fronts1 = _proc_times(main_pid)
-    lg.terminate()
-    try:
-        lg.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        lg.kill()
+    stop_loadgen(lg)
 
     wall = t1 - t0
     acc = int(H1.get("events_ingested", 0)) - int(H0.get("events_ingested", 0))
