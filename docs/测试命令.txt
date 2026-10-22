@@ -1,0 +1,65 @@
+1. 启动服务
+
+conda activate flowlens_env
+cd D:\dhy\code\flowlens
+$env:PYTHONHASHSEED="0"
+$env:FLOWLENS_DEBUG="1"
+python -m flowlens
+
+保持这个窗口开着。
+
+2. 持续写入数据（另开一个窗口）
+
+conda activate flowlens_env
+cd D:\dhy\code\flowlens
+python tools/loadgen.py --rate 2000 --batch 200 --duration 300 --fast --mode 长尾 --gzip
+
+跑 5 分钟，每秒 2000 条，足够填满 60 秒窗口。
+
+3. 开一条 SSE 流（第三个窗口）
+
+curl.exe -N "http://127.0.0.1:8080/v1/topk/stream?window=60s&k=5&by=url&interval=1s"
+
+你会看到每行：
+
+retry: 3000
+
+id: 1792698123000
+event: topk
+data: {"window_ms":60000,"from":1792698063000,"to":1792698123000,...}
+
+id: 1792698124000
+...
+
+id 就是帧时刻，相邻差 1000。记下最后收到的那个 id，比如 1792698124000。
+
+4. 验证补帧（关键）
+
+先不要关窗口 3，再开一个窗口（第四个窗口）跑第二次订阅。等它收到几帧后按 Ctrl+C 断掉——这样订阅组还活着（还有窗口 3 的订阅者），缓存是热的。
+
+然后记下它在断掉前收到的最后 id，等 10 秒以上，带 header 重连：
+
+curl.exe -N -H "Last-Event-ID: 换成长窗口3最后看到的id" "http://127.0.0.1:8080/v1/topk/stream?window=60s&k=5&by=url&interval=1s"
+
+你要看的是：第一帧的 id 就等于 Last-Event-ID + 1000，然后一串帧在毫秒内连续吐出来，id 逐格递增、不重不这就是"从缓存补发"。
+
+想确认补的是缓存而不是现场重算，可以对比耗时：窗口 3 一直在跑、组缓存热的时候重连，补 10 帧几乎是瞬间
+
+5. 看 interval 改变后的行为
+
+# 200ms：同一秒内的 4 帧 payload 完全相同，data.to 停在整秒（id 走得更快）
+curl.exe -N "http://127.0.0.1:8080/v1/topk/stream?window=60s&k=5&by=url&interval=200ms"
+
+# 2s：每帧都重算，data.to == id
+curl.exe -N "http://127.0.0.1:8080/v1/topk/stream?window=60s&k=5&by=url&interval=2s"
+
+200ms 那条流里，你会看到 id: ...200、...400、...600、...800 四帧的 data 完全一样（to 都是整秒），下一整秒才换内容。
+
+6. 顺带看的两个数字
+
+# SSE 组数/订阅数/累计丢帧
+curl.exe http://127.0.0.1:8080/healthz
+
+healthz 的 sse 字段里 groups、subscribers、dropped_frames。
+
+一个注意点：如果所有同参数订阅者都断开，组会被删除、缓存随之消失（leave 里 pop 掉并 cancel 生产者）。这时再带 Last-Event-ID 重连，组是新建的空缓存，补帧走现场 topk 重算——结果照样连续，只是慢一些。所以第 4 步要留一条活着的流。
